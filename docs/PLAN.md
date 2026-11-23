@@ -15,7 +15,7 @@
   - *Micro-Check:* Run `powershell -File scripts/init.ps1`.
 - [x] **P0-03** Create `scripts/check.ps1` + `scripts/check.sh` (Phase Gate runner) and `scripts/selftest.ps1` + `scripts/selftest.sh` (plants synthetic bug `delta`, proves `check` fails non-zero, reverts `delta`).
   - *Micro-Check:* Run `powershell -File scripts/selftest.ps1`.
-- [ ] **P0-04** Update `.github/workflows/ci.yml` to run `cargo test --workspace`, `bun test`, and a protected-path guard blocking unauthorized deletions in `tests/`. Export a concise 1-page inventory of existing `meg-rs` and `meg-plane` public APIs into `docs/API_INDEX.md` so Phase 1-5 code fits seamlessly.
+- [x] **P0-04** Update `.github/workflows/ci.yml` to run `cargo test --workspace`, `bun test`, and a protected-path guard blocking unauthorized deletions in `tests/`. Export a concise 1-page inventory of existing `meg-rs` and `meg-plane` public APIs into `docs/API_INDEX.md` so Phase 1-5 code fits seamlessly.
   - *Micro-Check:* Validate YAML syntax and confirm `docs/API_INDEX.md` lists existing exports.
 
 **Phase 0 Gate:** CI green; `docs/STATE.md` points to `P1-01`.

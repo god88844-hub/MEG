@@ -15,6 +15,29 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Protected-path test deletion guard
+        shell: pwsh
+        run: |
+          $baseRef = if ("${{ github.event_name }}" -eq "pull_request") {
+            "origin/${{ github.base_ref }}"
+          } elseif ("${{ github.event.before }}" -and "${{ github.event.before }}" -ne "0000000000000000000000000000000000000000") {
+            "${{ github.event.before }}"
+          } else {
+            ""
+          }
+          if (-not $baseRef) {
+            Write-Host "No base commit for diff; skipping deletion guard."
+            exit 0
+          }
+          $deleted = @(git diff --diff-filter=D --name-only "$baseRef..HEAD")
+          $blocked = @($deleted | Where-Object { $_ -match '(^|/)tests/' -or $_ -match '^meg-plane/test/' })
+          if ($blocked.Count -gt 0) {
+            Write-Error ("Unauthorized deletion of protected test path(s): " + ($blocked -join ", "))
+            exit 1
+          }
+          Write-Host "Protected-path guard passed (0 test deletions)."
       - name: Isolate runtime configuration
         run: '"MEG_CONFIG_DIR=$env:RUNNER_TEMP\meg-test-config" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
       - uses: oven-sh/setup-bun@v2
