@@ -1,6 +1,7 @@
-//! Pre-turn workspace indexer (Sentra Code Memory pattern, AHE): Turn 1
-//! starts with full repository recon in 0 extra API calls.
+//! Pre-turn workspace indexer, PageRank RepoMap (~1,000-token cap),
+//! Aider `ROOT_IMPORTANT_FILES` priority list, and downstream caller lookup.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -8,8 +9,45 @@ use std::time::{Duration, Instant};
 const IGNORED_DIRS: &[&str] = &[".git", "target", "node_modules", "__pycache__", ".venv", ".meg"];
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MAX_MAP_CHARS: usize = 4_000;
+const MAX_WALK_DEPTH: usize = 16;
+
 const SIGNATURE_PREFIXES: &[&str] = &[
-    "fn ", "pub fn ", "def ", "class ", "export function ", "struct ", "int main",
+    "fn ",
+    "pub fn ",
+    "pub async fn ",
+    "async fn ",
+    "def ",
+    "class ",
+    "export function ",
+    "export async function ",
+    "export class ",
+    "export interface ",
+    "struct ",
+    "pub struct ",
+    "enum ",
+    "pub enum ",
+    "trait ",
+    "pub trait ",
+    "int main",
+];
+
+/// Aider-style root important files prioritized at the top of RepoMap.
+pub const ROOT_IMPORTANT_FILES: &[&str] = &[
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "Makefile",
+    "Dockerfile",
+    "docker-compose.yml",
+    "tsconfig.json",
+    ".github/workflows/ci.yml",
+    "docs/PLAN.md",
+    "docs/STATE.md",
+    "docs/ARCHITECTURE.md",
 ];
 
 fn is_ignored_dir(name: &str) -> bool {
@@ -30,6 +68,31 @@ fn extract_signatures_from_text(text: &str, max: usize) -> Vec<String> {
     sigs
 }
 
+fn extract_symbol_name(sig: &str) -> Option<String> {
+    let stripped = sig
+        .trim_start_matches("pub ")
+        .trim_start_matches("async ")
+        .trim_start_matches("export ");
+    let rest = stripped
+        .strip_prefix("fn ")
+        .or_else(|| stripped.strip_prefix("def "))
+        .or_else(|| stripped.strip_prefix("class "))
+        .or_else(|| stripped.strip_prefix("function "))
+        .or_else(|| stripped.strip_prefix("interface "))
+        .or_else(|| stripped.strip_prefix("struct "))
+        .or_else(|| stripped.strip_prefix("enum "))
+        .or_else(|| stripped.strip_prefix("trait "))?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if name.len() >= 2 {
+        Some(name)
+    } else {
+        None
+    }
+}
+
 struct WalkBudget {
     remaining_files: usize,
     remaining_visits: usize,
@@ -40,7 +103,10 @@ struct WalkBudget {
 
 impl WalkBudget {
     fn exhausted(&mut self) -> bool {
-        if self.remaining_files == 0 || self.remaining_visits == 0 || self.estimated_chars >= MAX_MAP_CHARS + 512 {
+        if self.remaining_files == 0
+            || self.remaining_visits == 0
+            || self.estimated_chars >= MAX_MAP_CHARS + 512
+        {
             return true;
         }
         if let Some(dl) = self.deadline {
@@ -53,10 +119,7 @@ impl WalkBudget {
     }
 }
 
-/// Index the workspace into a compact `<workspace_map>` string: relative path,
-/// byte size, line count, up to 5 top-level signatures per file. Capped at
-/// `max_files` files and 4,000 chars total. Also warns when procps is missing
-/// on Linux (the TB2 container defect that silently broke process tools).
+/// Index the workspace into a compact `<workspace_map>` string.
 pub fn index_workspace(root: &Path, max_files: usize) -> String {
     index_workspace_inner(root, max_files, None)
 }
@@ -76,6 +139,15 @@ fn index_workspace_inner(root: &Path, max_files: usize, deadline: Option<Instant
         truncated: false,
     };
     walk(root, root, &mut budget, &mut entries, 0);
+
+    // Prioritize ROOT_IMPORTANT_FILES first while preserving deterministic ordering.
+    entries.sort_by_key(|(rel, _, _, _)| {
+        let imp = ROOT_IMPORTANT_FILES
+            .iter()
+            .position(|&p| p == rel)
+            .unwrap_or(usize::MAX);
+        (imp, rel.clone())
+    });
 
     let mut out = format!("<workspace_map root=\"{}\">\n", root.display());
     let mut hit_char_cap = false;
@@ -98,6 +170,169 @@ fn index_workspace_inner(root: &Path, max_files: usize, deadline: Option<Instant
     }
     out.push_str("</workspace_map>");
     out
+}
+
+/// Build a PageRank-ranked RepoMap capped at `max_tokens` (~4 chars/token; default 1,000 tokens).
+/// Ranks files by incoming cross-file symbol references + `ROOT_IMPORTANT_FILES` boost.
+pub fn build_repo_map(root: &Path, max_tokens: usize) -> String {
+    let char_cap = max_tokens.saturating_mul(4).clamp(400, 16_000);
+    let mut files: Vec<(String, String, Vec<String>)> = Vec::new();
+    collect_source_files(root, root, 0, 200, &mut files);
+
+    // Map symbol -> defining file indices.
+    let mut defs: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, (_, _, sigs)) in files.iter().enumerate() {
+        for sig in sigs {
+            if let Some(name) = extract_symbol_name(sig) {
+                defs.entry(name).or_default().push(idx);
+            }
+        }
+    }
+
+    // Build directed reference graph: file i -> file j if i mentions a symbol defined in j.
+    let n = files.len();
+    let mut out_edges: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    for (i, (_, text, _)) in files.iter().enumerate() {
+        for (sym, owners) in &defs {
+            if text.contains(sym.as_str()) {
+                for &j in owners {
+                    if i != j {
+                        out_edges[i].insert(j);
+                    }
+                }
+            }
+        }
+    }
+
+    // 8 iterations of damped PageRank (d = 0.85).
+    let mut rank = vec![if n > 0 { 1.0 / n as f64 } else { 0.0 }; n];
+    for _ in 0..8 {
+        let mut next = vec![if n > 0 { 0.15 / n as f64 } else { 0.0 }; n];
+        for i in 0..n {
+            if !out_edges[i].is_empty() {
+                let share = 0.85 * rank[i] / out_edges[i].len() as f64;
+                for &j in &out_edges[i] {
+                    next[j] += share;
+                }
+            }
+        }
+        rank = next;
+    }
+
+    // Add a small priority boost for ROOT_IMPORTANT_FILES.
+    let mut scored: Vec<(usize, f64)> = (0..n)
+        .map(|i| {
+            let boost = if ROOT_IMPORTANT_FILES.contains(&files[i].0.as_str()) {
+                0.5
+            } else {
+                0.0
+            };
+            (i, rank[i] + boost)
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| files[a.0].0.cmp(&files[b.0].0))
+    });
+
+    let mut out = format!("<repo_map root=\"{}\" max_tokens=\"{max_tokens}\">\n", root.display());
+    for (idx, score) in scored {
+        let (rel, _, sigs) = &files[idx];
+        let mut block = format!("{rel} [rank={score:.3}]\n");
+        for sig in sigs.iter().take(6) {
+            block.push_str(&format!("  {sig}\n"));
+        }
+        if out.len() + block.len() + 20 > char_cap {
+            out.push_str("...[repo_map truncated at token cap]\n");
+            break;
+        }
+        out.push_str(&block);
+    }
+    out.push_str("</repo_map>");
+    out
+}
+
+/// Find downstream callers/importers of `symbol` across the workspace (excluding
+/// definition lines) so agents never delete an imported symbol blindly.
+pub fn find_downstream_callers(root: &Path, symbol: &str) -> Vec<(String, usize, String)> {
+    if symbol.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut files: Vec<(String, String, Vec<String>)> = Vec::new();
+    collect_source_files(root, root, 0, 400, &mut files);
+    let mut hits: BTreeMap<(String, usize), String> = BTreeMap::new();
+    for (rel, text, _) in files {
+        for (idx, line) in text.lines().enumerate() {
+            if !contains_identifier(line, symbol) {
+                continue;
+            }
+            let trimmed = line.trim_start();
+            let is_def = SIGNATURE_PREFIXES
+                .iter()
+                .any(|p| trimmed.starts_with(p) && extract_symbol_name(trimmed).as_deref() == Some(symbol));
+            if !is_def {
+                hits.insert((rel.clone(), idx + 1), trimmed.chars().take(120).collect());
+            }
+        }
+    }
+    hits.into_iter().map(|((f, l), s)| (f, l, s)).collect()
+}
+
+fn contains_identifier(line: &str, ident: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = line[start..].find(ident) {
+        let abs = start + pos;
+        let before_ok = abs == 0
+            || !(bytes[abs - 1].is_ascii_alphanumeric() || bytes[abs - 1] == b'_');
+        let end = abs + ident.len();
+        let after_ok = end == bytes.len()
+            || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + ident.len();
+    }
+    false
+}
+
+fn collect_source_files(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    max_files: usize,
+    out: &mut Vec<(String, String, Vec<String>)>,
+) {
+    if out.len() >= max_files || depth > MAX_WALK_DEPTH {
+        return;
+    }
+    let Ok(read) = fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = read.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        if out.len() >= max_files {
+            return;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            if !is_ignored_dir(&name) && !is_reparse(&path) {
+                collect_source_files(root, &path, depth + 1, max_files, out);
+            }
+            continue;
+        }
+        if meta.len() > MAX_FILE_BYTES {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else { continue };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if let Ok(text) = fs::read_to_string(&path) {
+            let sigs = extract_signatures_from_text(&text, 8);
+            out.push((rel_str, text, sigs));
+        }
+    }
 }
 
 fn procps_present() -> bool {
@@ -124,9 +359,6 @@ fn walk(
         budget.remaining_visits = budget.remaining_visits.saturating_sub(1);
         let name = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
-        // Metadata WITHOUT following links: a junction here is a cycle risk
-        // ("Application Data" -> "AppData") and often unreadable (WinError 5).
-        // Skip reparse points entirely; never recurse into them.
         let Ok(meta) = entry.metadata() else { continue };
         if meta.is_dir() {
             if !is_ignored_dir(&name) && !is_reparse(&path) && depth < MAX_WALK_DEPTH {
@@ -139,7 +371,6 @@ fn walk(
         }
         let Ok(rel) = path.strip_prefix(root) else { continue };
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        // Single read per file: compute both line count and top-level signatures.
         let (lines, sigs) = match fs::read(&path) {
             Ok(bytes) => {
                 let line_count = bytes.iter().filter(|&&b| b == b'\n').count();
@@ -151,22 +382,19 @@ fn walk(
             }
             Err(_) => (0, Vec::new()),
         };
-        budget.estimated_chars += rel_str.len() + 24 + sigs.iter().map(|s| s.len() + 3).sum::<usize>();
+        budget.estimated_chars +=
+            rel_str.len() + 24 + sigs.iter().map(|s| s.len() + 3).sum::<usize>();
         out.push((rel_str, meta.len(), lines, sigs));
         budget.remaining_files = budget.remaining_files.saturating_sub(1);
     }
 }
 
-/// Depth cap: NTFS junction cycles recursed forever and hung a home-directory
-/// launch; 16 levels is far more than any real source tree needs.
-const MAX_WALK_DEPTH: usize = 16;
-
 #[cfg(windows)]
 fn is_reparse(path: &Path) -> bool {
     use std::os::windows::fs::MetadataExt;
     match fs::symlink_metadata(path) {
-        Ok(meta) => meta.file_attributes() & 0x400 != 0, // FILE_ATTRIBUTE_REPARSE_POINT
-        Err(_) => true, // unreadable = skip, never hang
+        Ok(meta) => meta.file_attributes() & 0x400 != 0,
+        Err(_) => true,
     }
 }
 
@@ -248,6 +476,30 @@ mod tests {
         assert!(map.contains("a.rs"), "{map}");
         assert!(map.contains("pub fn ok"), "{map}");
         assert!(map.ends_with("</workspace_map>"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pagerank_repo_map_ranks_referenced_core_and_finds_downstream_callers() {
+        let root = std::env::temp_dir().join(format!("meg-idx-pr-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        fs::write(root.join("src/core.rs"), "pub fn compute_hash() {}\n").unwrap();
+        fs::write(root.join("src/a.rs"), "fn use_a() { compute_hash(); }\n").unwrap();
+        fs::write(root.join("src/b.rs"), "fn use_b() { compute_hash(); }\n").unwrap();
+        fs::write(root.join("src/leaf.rs"), "fn unused_leaf() {}\n").unwrap();
+
+        let map = build_repo_map(&root, 1000);
+        assert!(map.starts_with("<repo_map"), "{map}");
+        let pos_core = map.find("src/core.rs").expect("core.rs in map");
+        let pos_leaf = map.find("src/leaf.rs").expect("leaf.rs in map");
+        assert!(pos_core < pos_leaf, "referenced core.rs should outrank leaf.rs:\n{map}");
+        assert!(map.find("Cargo.toml").unwrap() < pos_leaf, "ROOT_IMPORTANT_FILES boosted");
+
+        let callers = find_downstream_callers(&root, "compute_hash");
+        let caller_files: Vec<&str> = callers.iter().map(|(f, _, _)| f.as_str()).collect();
+        assert_eq!(caller_files, vec!["src/a.rs", "src/b.rs"]);
         let _ = fs::remove_dir_all(&root);
     }
 }

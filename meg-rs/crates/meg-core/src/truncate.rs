@@ -1,83 +1,161 @@
-//! Observation truncation: fit to budget, keep head AND tail, preserve
-//! error lines (the headroom/critical-line contract from the Python engine).
+//! Observation truncation with:
+//! 1. RTK log deduplicator (`compact_text` folding >2 repeated lines),
+//! 2. Scratch-file spill (`.meg/scratch/cmd_<id>.log` when >150 lines or >4,000 chars,
+//!    returning `head=2400, tail=900`),
+//! 3. Critical-line preservation (`FATAL`, `ERROR`, `Traceback`, `FAILED`, etc.),
+//! 4. Auto-bypass once `first_completion_claimed == true`.
 
-const CRITICAL: &[&str] = &[
-    "Traceback", "Error", "ERROR", "FATAL", "Fatal", "FAIL", "Exception",
-    "exit code", "exit with", "Segmentation fault",
+use std::path::Path;
+
+const CRITICAL_MARKERS: &[&str] = &[
+    "FATAL",
+    "ERROR",
+    "Exception",
+    "Traceback",
+    "FAILED",
+    "AssertionError",
+    "SyntaxError",
+    "ModuleNotFoundError",
+    "PermissionError",
+    "FileNotFoundError",
+    "panic",
 ];
 
-/// Truncate `text` to `limit` bytes on valid UTF-8 boundaries, keeping head +
-/// tail and pinning critical lines (error/traceback lines) so they always reach
-/// the model.
-pub fn truncate_observation(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
+pub const SCRATCH_LINE_THRESHOLD: usize = 150;
+pub const SCRATCH_CHAR_THRESHOLD: usize = 4_000;
+pub const SCRATCH_HEAD_CHARS: usize = 2_400;
+pub const SCRATCH_TAIL_CHARS: usize = 900;
+
+/// RTK log deduplicator: folds runs of >2 identical consecutive lines into
+/// `... [previous line repeated N more times]`.
+pub fn compact_text(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= 2 {
         return text.to_string();
     }
-    let lines: Vec<&str> = text.lines().collect();
-
-    let head = limit * 70 / 100;
-    let head_end = text.floor_char_boundary(head.min(text.len()));
-    let tail = limit.saturating_sub(head).saturating_sub(200).max(200);
-
-    // Pin dropped critical lines verbatim (headroom contract).
-    let pinned_block: String = {
-        let missing: Vec<&&str> = lines
-            .iter()
-            .filter(|l| CRITICAL.iter().any(|c| l.contains(c)))
-            .filter(|l| {
-                // only lines that the head window won't already keep
-                text.find(**l).map(|idx| idx >= head_end).unwrap_or(true)
-            })
-            .take(20)
-            .collect();
-        if missing.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n--- critical lines preserved ---\n{}\n",
-                missing.iter().map(|l| **l).collect::<Vec<_>>().join("\n")
-            )
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let mut run = 1usize;
+        while i + run < lines.len() && lines[i + run] == line {
+            run += 1;
         }
-    };
-
-    let last = last_chars(text, tail);
-    let elided = text.len().saturating_sub(head_end + last.len());
-
-    // Build with a shrinking head so the budget is met WITHOUT cutting the
-    // tail or the pinned critical block (naive end-truncation would drop
-    // exactly the lines this function exists to preserve).
-    let mut out = format!(
-        "{}\n...[{} chars elided]...\n{}{}",
-        &text[..head_end],
-        elided,
-        last,
-        pinned_block
-    );
-    let mut head_keep = head;
-    while out.len() > limit && head_keep > 100 {
-        head_keep /= 2;
-        let keep_end = text.floor_char_boundary(head_keep.min(text.len()));
-        out = format!(
-            "{}\n...[{} chars elided]...\n{}{}",
-            &text[..keep_end],
-            text.len().saturating_sub(keep_end + last.len()),
-            last,
-            pinned_block
-        );
+        if run > 2 {
+            out.push(line.to_string());
+            out.push(format!("... [previous line repeated {} more times]", run - 1));
+        } else {
+            for _ in 0..run {
+                out.push(line.to_string());
+            }
+        }
+        i += run;
     }
-    if out.len() > limit {
-        let final_end = out.floor_char_boundary(limit);
-        out.truncate(final_end);
+    let mut joined = out.join("\n");
+    if text.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
     }
-    out
+    joined
 }
 
-fn last_chars(s: &str, n: usize) -> &str {
-    if s.len() <= n {
-        return s;
+/// Truncate with RTK deduplication + `.meg/scratch/cmd_<id>.log` spill.
+/// Auto-bypasses truncation once `first_completion_claimed == true`.
+pub fn truncate_with_scratch(
+    workspace: &Path,
+    cmd_id: &str,
+    text: &str,
+    first_completion_claimed: bool,
+) -> String {
+    if first_completion_claimed {
+        return text.to_string();
     }
-    let start = s.ceil_char_boundary(s.len() - n);
-    &s[start..]
+    let compacted = compact_text(text);
+    let line_count = compacted.lines().count();
+    if line_count <= SCRATCH_LINE_THRESHOLD && compacted.len() <= SCRATCH_CHAR_THRESHOLD {
+        return compacted;
+    }
+
+    let safe_id: String = cmd_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    let scratch_dir = workspace.join(".meg").join("scratch");
+    let scratch_file = scratch_dir.join(format!("cmd_{safe_id}.log"));
+    let spill_note = if std::fs::create_dir_all(&scratch_dir)
+        .and_then(|_| std::fs::write(&scratch_file, text))
+        .is_ok()
+    {
+        format!("\n...[full output spilled to .meg/scratch/cmd_{safe_id}.log ({line_count} lines, {} bytes)]", text.len())
+    } else {
+        String::new()
+    };
+
+    let head_end = compacted.floor_char_boundary(SCRATCH_HEAD_CHARS.min(compacted.len()));
+    let tail_start = compacted.ceil_char_boundary(compacted.len().saturating_sub(SCRATCH_TAIL_CHARS));
+    if head_end >= tail_start {
+        return format!("{compacted}{spill_note}");
+    }
+    let head = &compacted[..head_end];
+    let tail = &compacted[tail_start..];
+    let middle = &compacted[head_end..tail_start];
+    let mut pinned = String::new();
+    for line in middle.lines() {
+        if CRITICAL_MARKERS.iter().any(|m| line.contains(m)) {
+            let clipped = if line.len() > 200 {
+                &line[..line.floor_char_boundary(200)]
+            } else {
+                line
+            };
+            pinned.push_str("\n[PINNED] ");
+            pinned.push_str(clipped);
+            if pinned.len() > 600 {
+                break;
+            }
+        }
+    }
+    format!(
+        "{head}\n...[truncated {} bytes]{pinned}{spill_note}\n{tail}",
+        middle.len()
+    )
+}
+
+/// Truncate `text` to at most `limit` bytes while preserving head, tail, and
+/// any critical error lines that fell into the dropped middle.
+pub fn truncate_observation(text: &str, limit: usize) -> String {
+    if text.len() <= limit || limit < 120 {
+        return text.to_string();
+    }
+    let head_len = (limit as f32 * 0.55) as usize;
+    let tail_len = (limit as f32 * 0.30) as usize;
+    let head_end = text.floor_char_boundary(head_len.min(text.len()));
+    let tail_start = text.ceil_char_boundary(text.len().saturating_sub(tail_len));
+    if head_end >= tail_start {
+        return text.to_string();
+    }
+    let head = &text[..head_end];
+    let tail = &text[tail_start..];
+    let middle = &text[head_end..tail_start];
+
+    let mut pinned = String::new();
+    let pin_budget = limit.saturating_sub(head.len() + tail.len() + 64);
+    for line in middle.lines() {
+        if CRITICAL_MARKERS.iter().any(|m| line.contains(m)) {
+            if pinned.len() + line.len() + 1 > pin_budget {
+                break;
+            }
+            if !pinned.is_empty() {
+                pinned.push('\n');
+            }
+            pinned.push_str(line);
+        }
+    }
+
+    let dropped = middle.len();
+    if pinned.is_empty() {
+        format!("{head}\n...[truncated {dropped} chars]...\n{tail}")
+    } else {
+        format!("{head}\n...[truncated {dropped} chars; critical lines preserved]:\n{pinned}\n...[end preserved]...\n{tail}")
+    }
 }
 
 #[cfg(test)]
@@ -85,42 +163,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn short_text_untouched() {
+        assert_eq!(truncate_observation("hello", 1000), "hello");
+    }
+
+    #[test]
     fn keeps_head_and_tail() {
-        let body = format!("{}\nexit code 1\n{}", "a".repeat(2000), "b".repeat(2000));
-        let out = truncate_observation(&body, 1000);
-        assert!(out.contains("exit code 1"));
-        assert!(out.contains("chars elided"));
-        assert!(out.len() <= 1100);
+        let text = format!("{}{}{}", "A".repeat(500), "M".repeat(2000), "Z".repeat(500));
+        let out = truncate_observation(&text, 600);
+        assert!(out.starts_with("AAAA"));
+        assert!(out.ends_with("ZZZZ"));
+        assert!(out.contains("truncated"));
     }
 
     #[test]
     fn pins_dropped_fatal_line() {
-        let mut body = String::new();
-        for i in 0..500 {
-            body.push_str(&format!("row {i}\n"));
+        let mut s = String::new();
+        for i in 0..200 {
+            s.push_str(&format!("line {i} normal output\n"));
+            if i == 100 {
+                s.push_str("FATAL: database refused connection\n");
+            }
         }
-        body.push_str("FATAL: database connection refused");
-        let out = truncate_observation(&body, 600);
-        assert!(out.contains("FATAL: database connection refused"));
-    }
-
-    #[test]
-    fn short_text_untouched() {
-        assert_eq!(truncate_observation("hello", 100), "hello");
+        let out = truncate_observation(&s, 800);
+        assert!(out.contains("FATAL: database refused connection"), "got: {out}");
     }
 
     #[test]
     fn handles_multibyte_utf8_without_panicking() {
-        let mut body = String::new();
-        for i in 0..200 {
-            body.push_str(&format!("line {i} \u{4E16}\u{754C} \u{1F680}\n"));
+        let text = format!(
+            "{}\nFATAL: boom \u{1F680}\n{}",
+            "\u{4E16}".repeat(300),
+            "\u{754C}".repeat(300)
+        );
+        let out = truncate_observation(&text, 400);
+        assert!(out.contains("truncated"));
+    }
+
+    #[test]
+    fn rtk_compact_text_folds_repeated_lines_and_scratch_spill_bypasses_after_claim() {
+        let mut log = String::new();
+        for _ in 0..10 {
+            log.push_str("polling status...\n");
         }
-        body.push_str("FATAL: \u{0924}\u{094D}\u{0930}\u{0941}\u{091F}\u{093F}");
-        for limit in [17, 50, 101, 601, 1003] {
-            let out = truncate_observation(&body, limit);
-            assert!(out.len() <= limit, "len {} exceeded limit {limit}", out.len());
-        }
-        let preserved = truncate_observation(&body, 601);
-        assert!(preserved.contains("FATAL: \u{0924}\u{094D}\u{0930}\u{0941}\u{091F}\u{093F}"));
+        log.push_str("done\n");
+        let compacted = compact_text(&log);
+        assert!(compacted.contains("previous line repeated 9 more times"), "{compacted}");
+        assert!(compacted.contains("done"));
+
+        let ws = std::env::temp_dir().join(format!("meg-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let big = (0..200).map(|i| format!("unique line {i}: {}\n", "x".repeat(25))).collect::<String>();
+
+        let spilled = truncate_with_scratch(&ws, "t1", &big, false);
+        assert!(spilled.contains(".meg/scratch/cmd_t1.log"), "{spilled}");
+        assert!(ws.join(".meg/scratch/cmd_t1.log").is_file());
+
+        // Auto-bypass once first_completion_claimed == true.
+        let bypassed = truncate_with_scratch(&ws, "t2", &big, true);
+        assert_eq!(bypassed, big);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

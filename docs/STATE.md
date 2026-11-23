@@ -2,8 +2,8 @@
 
 - **Plan Version:** v1.2 (Micro-Tasked for Single-Builder Agent)
 - **Active Phase:** Phase 1 -- Rust Ring-0 Native Kernel, Tools, Sandbox & Security (`meg-rs/`)
-- **Last Completed TODO:** `P1-03`
-- **Next TODO:** `P1-04` (AST PageRank RepoMap & Important Files in `meg-core/src/indexer.rs`)
+- **Last Completed TODO:** `P1-06`
+- **Next TODO:** `P1-07` (CoW Worktree Manager in `meg-tools/src/worktree.rs`)
 - **Frozen Path:** `meg-rs/crates/meg-tui/` (frozen until Phase 8)
 
 ## Completed Phases
@@ -13,3 +13,6 @@
 - [x] `P1-01` -- Core 6-tool menu (`with_core_six`) + Copy-Constrained argument span validation
 - [x] `P1-02` -- Hashline reader/patcher (`42#f9a`), atomic writes, UTF-8/UTF-16 BOM & CRLF preservation
 - [x] `P1-03` -- 100-line bounded viewer, 50-hit summarized search cap, `ReadCache` repeated-read suppression
+- [x] `P1-04` -- PageRank RepoMap, `ROOT_IMPORTANT_FILES` priority, downstream caller lookup
+- [x] `P1-05` -- RTK log deduplicator (`compact_text`), `.meg/scratch` spill, post-claim bypass
+- [x] `P1-06` -- Out-of-tree `side-git` bare snapshots + local `Keep Rate` tracker

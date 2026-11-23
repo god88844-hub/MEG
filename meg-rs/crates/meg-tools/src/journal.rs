@@ -1,17 +1,22 @@
-//! Multi-step undo journal for mutations made through MEG's file tools.
-//! Undoes only if the file still matches MEG's last recorded output; never
-//! overwrites subsequent manual edits. Backward-compatible with legacy
-//! single-entry `undo.json`.
+//! Multi-step undo journal, out-of-tree `side-git` bare shadow snapshots
+//! (`~/.meg/snapshots/<repo-hash>/`), and local `Keep Rate` tracker.
+//! Never pollutes the workspace's own `.git` directory.
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_UNDO_DEPTH: usize = 20;
 
 fn journal_path(workspace: &Path) -> PathBuf {
     workspace.join(".meg").join("tui").join("undo.json")
+}
+
+fn keep_rate_path(workspace: &Path) -> PathBuf {
+    workspace.join(".meg").join("tui").join("keep_rate.jsonl")
 }
 
 fn load_entries(journal: &Path) -> Result<Vec<Value>> {
@@ -23,7 +28,6 @@ fn load_entries(journal: &Path) -> Result<Vec<Value>> {
     if let Some(arr) = value.get("entries").and_then(Value::as_array) {
         return Ok(arr.clone());
     }
-    // Legacy v1 single-entry object format.
     if value.is_object() && value.get("path").is_some() {
         return Ok(vec![value]);
     }
@@ -107,6 +111,7 @@ pub fn undo(workspace: &Path) -> Result<String> {
     )?;
     let after: Vec<u8> = serde_json::from_value(record["after"].clone())?;
     if std::fs::read(&path)? != after {
+        let _ = record_keep_rate_event(workspace, &path, KeepOutcome::Overwritten);
         bail!("File changed after MEG's edit; undo refused to preserve those changes");
     }
     let before: Option<Vec<u8>> = serde_json::from_value(record["before"].clone())?;
@@ -117,11 +122,194 @@ pub fn undo(workspace: &Path) -> Result<String> {
     }
     entries.pop();
     save_entries_atomic(&journal, &entries)?;
+    let _ = record_keep_rate_event(workspace, &path, KeepOutcome::Reverted);
     Ok(format!(
         "Undid MEG's last file mutation: {} ({} remaining)",
         path.display(),
         entries.len()
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-tree `side-git` bare shadow snapshots (~/.meg/snapshots/<repo-hash>/)
+// ---------------------------------------------------------------------------
+
+fn fnv1a_hex(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in s.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Resolve the out-of-tree bare shadow git directory for `workspace`.
+pub fn side_git_dir(workspace: &Path) -> PathBuf {
+    let base = std::env::var_os("MEG_SNAPSHOTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            home.join(".meg").join("snapshots")
+        });
+    let canon = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    base.join(fnv1a_hex(&canon.to_string_lossy()))
+}
+
+fn run_side_git(git_dir: &Path, workspace: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .env("GIT_DIR", git_dir)
+        .env("GIT_WORK_TREE", workspace)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
+        .output()
+        .context("failed to execute git for side-git snapshot")?;
+    if !out.status.success() {
+        bail!(
+            "side-git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Capture an out-of-tree pre-edit snapshot of `workspace` in `~/.meg/snapshots/<repo-hash>/`.
+/// Returns the snapshot tree/commit SHA without touching `<workspace>/.git`.
+pub fn side_git_snapshot(workspace: &Path, label: &str) -> Result<String> {
+    let git_dir = side_git_dir(workspace);
+    if !git_dir.join("HEAD").exists() {
+        std::fs::create_dir_all(&git_dir)?;
+        let out = Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&git_dir)
+            .output()
+            .context("failed to init bare side-git repo")?;
+        if !out.status.success() {
+            bail!(
+                "side-git init failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    // Stage workspace files excluding .git and .meg.
+    run_side_git(
+        &git_dir,
+        workspace,
+        &["add", "-A", "--", ".", ":!.git", ":!.meg"],
+    )?;
+    let tree = run_side_git(&git_dir, workspace, &["write-tree"])?;
+    let parent = run_side_git(&git_dir, workspace, &["rev-parse", "--verify", "HEAD"]).ok();
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_DIR", &git_dir)
+        .env("GIT_WORK_TREE", workspace)
+        .env("GIT_AUTHOR_NAME", "MEG")
+        .env("GIT_AUTHOR_EMAIL", "meg@local")
+        .env("GIT_COMMITTER_NAME", "MEG")
+        .env("GIT_COMMITTER_EMAIL", "meg@local")
+        .args(["commit-tree", &tree, "-m", label]);
+    if let Some(p) = &parent {
+        cmd.args(["-p", p]);
+    }
+    let out = cmd.output()?;
+    if !out.status.success() {
+        bail!(
+            "side-git commit-tree failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    run_side_git(&git_dir, workspace, &["update-ref", "HEAD", &commit])?;
+    Ok(commit)
+}
+
+/// Restore `workspace` files from a `side-git` snapshot SHA (or `"HEAD"`).
+pub fn side_git_restore(workspace: &Path, rev: &str) -> Result<()> {
+    let git_dir = side_git_dir(workspace);
+    if !git_dir.join("HEAD").exists() {
+        bail!("no side-git snapshots exist for workspace");
+    }
+    run_side_git(&git_dir, workspace, &["checkout", rev, "--", "."])?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Local Keep-Rate Tracker
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeepOutcome {
+    Kept,
+    Reverted,
+    Overwritten,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeepRateSummary {
+    pub kept: usize,
+    pub reverted: usize,
+    pub overwritten: usize,
+    pub keep_rate: f64,
+}
+
+pub fn record_keep_rate_event(workspace: &Path, path: &Path, outcome: KeepOutcome) -> Result<()> {
+    let file = keep_rate_path(workspace);
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let line = json!({
+        "path": path.to_string_lossy(),
+        "outcome": outcome,
+    })
+    .to_string();
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file)?;
+    writeln!(f, "{line}")?;
+    Ok(())
+}
+
+pub fn keep_rate_summary(workspace: &Path) -> KeepRateSummary {
+    let file = keep_rate_path(workspace);
+    let Ok(raw) = std::fs::read_to_string(&file) else {
+        return KeepRateSummary {
+            kept: 0,
+            reverted: 0,
+            overwritten: 0,
+            keep_rate: 1.0,
+        };
+    };
+    let (mut kept, mut reverted, mut overwritten) = (0usize, 0usize, 0usize);
+    for line in raw.lines() {
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            match v["outcome"].as_str() {
+                Some("kept") => kept += 1,
+                Some("reverted") => reverted += 1,
+                Some("overwritten") => overwritten += 1,
+                _ => {}
+            }
+        }
+    }
+    let total = kept + reverted + overwritten;
+    let keep_rate = if total == 0 {
+        1.0
+    } else {
+        kept as f64 / total as f64
+    };
+    KeepRateSummary {
+        kept,
+        reverted,
+        overwritten,
+        keep_rate,
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +339,9 @@ mod tests {
         std::fs::write(&path, "after").unwrap();
         undo(&dir).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "before");
+        let summary = keep_rate_summary(&dir);
+        assert_eq!(summary.overwritten, 1);
+        assert_eq!(summary.reverted, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -199,5 +390,32 @@ mod tests {
         }
         assert_eq!(depth(&dir), MAX_UNDO_DEPTH);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn side_git_snapshot_and_restore_without_polluting_workspace_git() {
+        let dir = tempdir();
+        let snap_root = tempdir();
+        std::env::set_var("MEG_SNAPSHOTS_DIR", &snap_root);
+        let file = dir.join("app.rs");
+        std::fs::write(&file, "fn v1() {}\n").unwrap();
+
+        let sha1 = side_git_snapshot(&dir, "pre-edit").unwrap();
+        assert!(!dir.join(".git").exists(), "workspace .git must not be created");
+        std::fs::write(&file, "fn v2_broken() {}\n").unwrap();
+
+        side_git_restore(&dir, &sha1).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn v1() {}\n");
+
+        record_keep_rate_event(&dir, &file, KeepOutcome::Kept).unwrap();
+        record_keep_rate_event(&dir, &file, KeepOutcome::Reverted).unwrap();
+        let summary = keep_rate_summary(&dir);
+        assert_eq!(summary.kept, 1);
+        assert_eq!(summary.reverted, 1);
+        assert!((summary.keep_rate - 0.5).abs() < 1e-6);
+
+        std::env::remove_var("MEG_SNAPSHOTS_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&snap_root);
     }
 }

@@ -31,11 +31,11 @@
   - *Micro-Check:* `cargo test -p meg-tools edit`
 - [x] **P1-03 SWE-Agent ACI & Repeated-Read Suppression (`meg-tools/src/fs_tools.rs`):** Enforce 100-line bounded file viewer, 50-hit summarized search cap, and repeated unchanged-read suppression returning a short pointer when a file hash hasn't changed.
   - *Micro-Check:* `cargo test -p meg-tools fs_tools`
-- [ ] **P1-04 AST PageRank RepoMap & Important Files (`meg-core/src/indexer.rs`):** Add Tree-Sitter symbol extractor capped at ~1,000 tokens + `Aider` `ROOT_IMPORTANT_FILES` priority list + downstream caller lookup (prevents deleting imported symbols).
+- [x] **P1-04 AST PageRank RepoMap & Important Files (`meg-core/src/indexer.rs`):** Add Tree-Sitter symbol extractor capped at ~1,000 tokens + `Aider` `ROOT_IMPORTANT_FILES` priority list + downstream caller lookup (prevents deleting imported symbols).
   - *Micro-Check:* `cargo test -p meg-core indexer`
-- [ ] **P1-05 RTK Log Deduplicator & Scratch Spill (`meg-core/src/truncate.rs`):** Implement `_compact_text` folding >2 repeated log lines (`... [previous line repeated N more times]`), spilling outputs >150 lines / >4,000 chars to `.meg/scratch/cmd_<id>.log` (`head=2400, tail=900`), and auto-bypassing truncation once `first_completion_claimed == true`.
+- [x] **P1-05 RTK Log Deduplicator & Scratch Spill (`meg-core/src/truncate.rs`):** Implement `_compact_text` folding >2 repeated log lines (`... [previous line repeated N more times]`), spilling outputs >150 lines / >4,000 chars to `.meg/scratch/cmd_<id>.log` (`head=2400, tail=900`), and auto-bypassing truncation once `first_completion_claimed == true`.
   - *Micro-Check:* `cargo test -p meg-core truncate`
-- [ ] **P1-06 Out-of-Tree `side-git` Snapshots & Keep-Rate Tracker (`meg-tools/src/journal.rs`):** Maintain bare shadow git index in `~/.meg/snapshots/<repo-hash>/` for 1-ms pre-edit snapshots and `/undo` without polluting `.git`; log local `Keep Rate` when user reverts or immediately overwrites agent lines.
+- [x] **P1-06 Out-of-Tree `side-git` Snapshots & Keep-Rate Tracker (`meg-tools/src/journal.rs`):** Maintain bare shadow git index in `~/.meg/snapshots/<repo-hash>/` for 1-ms pre-edit snapshots and `/undo` without polluting `.git`; log local `Keep Rate` when user reverts or immediately overwrites agent lines.
   - *Micro-Check:* `cargo test -p meg-tools journal`
 - [ ] **P1-07 CoW Worktree Manager (`meg-tools/src/worktree.rs`):** Create isolated worktrees (`~/.meg/worktrees/`) with 4-state lease log (`requested -> prepared -> lease_active -> scope_activated`, `cleanup: remove_if_clean`), linking `.env` and local caches (`node_modules`, `.venv`, `target/`) with zero reinstall wait.
   - *Micro-Check:* `cargo test -p meg-tools worktree`
