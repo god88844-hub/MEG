@@ -18,29 +18,29 @@ Single source of truth for upgrading MEG's native Rust core (`meg-rs`) and Bun/T
 ## Phase 1 — Correctness, UTF-8 Safety & Hygiene
 Goal: Eliminate crash/panic bugs, UTF-8 corruption, broken recursive globbing, and Windows CRLF edit failures.
 
-- [ ] **1.1 Fix UTF-8 FFI truncation panic** (`meg-rs/crates/meg-ffi/src/lib.rs`)
+- [x] **1.1 Fix UTF-8 FFI truncation panic** (`meg-rs/crates/meg-ffi/src/lib.rs`)
   - Use `floor_char_boundary(cap)` in `meg_read_file` so slicing never panics across `extern "C"`.
   - Add multi-byte UTF-8 boundary regression test.
-- [ ] **1.2 Fix UTF-8 truncation panic in observation trimmer** (`meg-rs/crates/meg-core/src/truncate.rs`)
+- [x] **1.2 Fix UTF-8 truncation panic in observation trimmer** (`meg-rs/crates/meg-core/src/truncate.rs`)
   - Snap head slice and final `out.truncate(limit)` to valid UTF-8 char boundaries.
   - Add Unicode/multi-byte truncation regression test.
-- [ ] **1.3 Fix UTF-8 mojibake & regex recompilation in JSON repair** (`meg-rs/crates/meg-core/src/json_repair.rs`)
+- [x] **1.3 Fix UTF-8 mojibake & regex recompilation in JSON repair** (`meg-rs/crates/meg-core/src/json_repair.rs`)
   - Iterate `raw.chars()` instead of raw bytes (`b as char`) in `repair_json` so non-ASCII text survives intact.
   - Cache compiled regexes with `std::sync::OnceLock` in `strip_think`, `recover_tool_call_markup`, and `recover_fenced_json`.
   - Add non-ASCII JSON repair regression test.
-- [ ] **1.4 Fix recursive `**` globbing** (`meg-rs/crates/meg-tools/src/fs_tools.rs`)
+- [x] **1.4 Fix recursive `**` globbing** (`meg-rs/crates/meg-tools/src/fs_tools.rs`)
   - Rewrite `globset_lite` so `**/` matches zero or more directory segments (`a/b/c.rs` and root-level files both match `**/*.rs`).
   - Add shallow, deep-nested, and root-level glob tests.
-- [ ] **1.5 Windows CRLF-safe `edit_file` + compact diff output** (`meg-rs/crates/meg-tools/src/edit.rs`)
+- [x] **1.5 Windows CRLF-safe `edit_file` + compact diff output** (`meg-rs/crates/meg-tools/src/edit.rs`)
   - Try exact byte match first; if not found and file uses `\r\n`, retry normalized LF match while preserving original `\r\n` endings on write.
   - Include concise before/after line summary in tool output.
   - Add CRLF preservation and uniqueness tests.
-- [ ] **1.6 Fix `daemon_alive_probe`** (`meg-rs/crates/meg-core/src/finish_hook.rs`)
+- [x] **1.6 Fix `daemon_alive_probe`** (`meg-rs/crates/meg-core/src/finish_hook.rs`)
   - Check all `DAEMON_PROC_PATTERNS` (not only `.first()`).
   - Add unit test covering pattern matching helper.
-- [ ] **1.7 Drop unused `winapi` dependency** (`meg-rs/crates/meg-tools/Cargo.toml`, `meg-rs/Cargo.lock`)
+- [x] **1.7 Drop unused `winapi` dependency** (`meg-rs/crates/meg-tools/Cargo.toml`, `meg-rs/Cargo.lock`)
   - Remove unused `winapi` crate (all Windows Job Object code uses `windows-sys`) and refresh `Cargo.lock`.
-- [ ] **1.8 Phase 1 Gate**: Full Rust + Bun tests and release build green; commit & push.
+- [x] **1.8 Phase 1 Gate**: Full Rust + Bun tests and release build green; commit & push.
 
 ---
 

@@ -1,9 +1,30 @@
-//! edit_file — exact str_replace with uniqueness law (Claude Code style):
+//! edit_file -- exact str_replace with uniqueness law (Claude Code style):
 //! old_string must match exactly and be unique; helpful errors when not.
+//! Tolerates CRLF/LF mismatch on Windows while preserving the file's original
+//! line endings.
 
 use anyhow::{bail, Result};
 use serde_json::Value;
 use std::path::Path;
+
+fn compact_preview(prefix: char, text: &str) -> String {
+    const MAX_PREVIEW_LINES: usize = 6;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::new();
+    for line in lines.iter().take(MAX_PREVIEW_LINES) {
+        out.push(prefix);
+        out.push(' ');
+        out.push_str(line);
+        out.push('\n');
+    }
+    if lines.len() > MAX_PREVIEW_LINES {
+        out.push_str(&format!(
+            "{prefix} ... ({} more line(s))\n",
+            lines.len() - MAX_PREVIEW_LINES
+        ));
+    }
+    out
+}
 
 pub fn str_replace(workspace: &Path, args: &Value) -> Result<String> {
     let path = args
@@ -29,7 +50,38 @@ pub fn str_replace(workspace: &Path, args: &Value) -> Result<String> {
     if old.is_empty() {
         bail!("old_string cannot be empty; use write_file for intentional full replacement");
     }
-    let count = content.matches(old).count();
+
+    // Prefer exact byte match; fall back to adapting line endings (LF <-> CRLF)
+    // while preserving the file's original line-ending style.
+    let exact = content.matches(old).count();
+    let (effective_old, effective_new, count) = if exact > 0 {
+        (old.to_string(), new.to_string(), exact)
+    } else {
+        let crlf_old = old.replace("\r\n", "\n").replace('\n', "\r\n");
+        let crlf_count = if crlf_old != old {
+            content.matches(&crlf_old).count()
+        } else {
+            0
+        };
+        if crlf_count > 0 {
+            let crlf_new = new.replace("\r\n", "\n").replace('\n', "\r\n");
+            (crlf_old, crlf_new, crlf_count)
+        } else {
+            let lf_old = old.replace("\r\n", "\n");
+            let lf_count = if lf_old != old {
+                content.matches(&lf_old).count()
+            } else {
+                0
+            };
+            if lf_count > 0 {
+                let lf_new = new.replace("\r\n", "\n");
+                (lf_old, lf_new, lf_count)
+            } else {
+                (old.to_string(), new.to_string(), 0)
+            }
+        }
+    };
+
     if count == 0 {
         bail!(
             "old_string not found in {path}. It must match exactly, including whitespace and line endings."
@@ -41,16 +93,24 @@ pub fn str_replace(workspace: &Path, args: &Value) -> Result<String> {
         );
     }
     let updated = if replace_all {
-        content.replace(old, new)
+        content.replace(&effective_old, &effective_new)
     } else {
-        content.replacen(old, new, 1)
+        content.replacen(&effective_old, &effective_new, 1)
     };
     std::fs::write(&full, &updated)?;
     let lines_new = new.lines().count();
     let lines_old = old.lines().count();
-    Ok(format!(
+    let mut summary = format!(
         "edited {path}: {lines_old} line(s) replaced with {lines_new} line(s)"
-    ))
+    );
+    let removed = compact_preview('-', &effective_old);
+    let added = compact_preview('+', &effective_new);
+    if !removed.is_empty() || !added.is_empty() {
+        summary.push('\n');
+        summary.push_str(&removed);
+        summary.push_str(&added);
+    }
+    Ok(summary.trim_end().to_string())
 }
 
 #[cfg(test)]
@@ -79,8 +139,47 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("1 line"));
+        assert!(out.contains("- return a - b"));
+        assert!(out.contains("+ return a + b"));
         let text = std::fs::read_to_string(ws.join("calc.py")).unwrap();
         assert!(text.contains("return a + b"));
+    }
+
+    #[test]
+    fn crlf_file_accepts_lf_edit_and_preserves_crlf() {
+        let ws = setup();
+        std::fs::write(
+            ws.join("win.py"),
+            "def add(a, b):\r\n    return a - b\r\n",
+        )
+        .unwrap();
+        let out = str_replace(
+            &ws,
+            &json!({
+                "path": "win.py",
+                "old_string": "def add(a, b):\n    return a - b",
+                "new_string": "def add(a, b):\n    return a + b"
+            }),
+        )
+        .unwrap();
+        assert!(out.contains("edited win.py"), "{out}");
+        let raw = std::fs::read_to_string(ws.join("win.py")).unwrap();
+        assert_eq!(raw, "def add(a, b):\r\n    return a + b\r\n");
+    }
+
+    #[test]
+    fn crlf_uniqueness_still_enforced() {
+        let ws = setup();
+        std::fs::write(ws.join("dup.py"), "x = 1\r\ny = 2\r\nx = 1\r\ny = 2\r\n").unwrap();
+        let err = str_replace(
+            &ws,
+            &json!({
+                "path": "dup.py",
+                "old_string": "x = 1\ny = 2",
+                "new_string": "x = 3\ny = 4"
+            }),
+        );
+        assert!(err.unwrap_err().to_string().contains("matches 2 times"));
     }
 
     #[test]

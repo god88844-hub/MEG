@@ -944,7 +944,6 @@ dependencies = [
  "regex",
  "serde_json",
  "walkdir",
- "winapi",
  "windows-sys 0.61.2",
 ]
 

@@ -155,19 +155,34 @@ fn is_ignored(entry: &walkdir::DirEntry) -> bool {
         .unwrap_or(false)
 }
 
-/// Tiny glob: `*` within a segment, `**` across segments, `?` single char.
+/// Glob matcher: `*` within a segment, `**` across zero or more segments, `?` single non-slash char.
 fn globset_lite(pattern: &str) -> Result<impl Fn(&str) -> bool> {
+    let normalized = pattern.replace('\\', "/");
+    let chars: Vec<char> = normalized.chars().collect();
     let mut regex = String::from("^");
-    for ch in pattern.chars() {
-        match ch {
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            if i + 2 < chars.len() && chars[i + 2] == '/' {
+                // `**/` matches zero or more directory segments.
+                regex.push_str("(?:.*/)?");
+                i += 3;
+            } else {
+                regex.push_str(".*");
+                i += 2;
+            }
+            continue;
+        }
+        match chars[i] {
             '*' => regex.push_str("[^/]*"),
-            '?' => regex.push('.'),
+            '?' => regex.push_str("[^/]"),
             '.' | '(' | ')' | '+' | '|' | '^' | '$' | '[' | ']' | '{' | '}' | '\\' => {
                 regex.push('\\');
-                regex.push(ch);
+                regex.push(chars[i]);
             }
-            _ => regex.push(ch),
+            ch => regex.push(ch),
         }
+        i += 1;
     }
     regex.push('$');
     let re = regex::Regex::new(&regex)?;
@@ -206,12 +221,35 @@ mod tests {
         assert!(out.contains("src/main.rs"));
     }
 
+    #[test]
+    fn recursive_glob_matches_root_shallow_and_deep_paths() {
+        let ws = tempdir();
+        write_file(&ws, &json!({"path": "root.rs", "content": ""})).unwrap();
+        write_file(&ws, &json!({"path": "src/lib.rs", "content": ""})).unwrap();
+        write_file(&ws, &json!({"path": "src/a/b/c/deep.rs", "content": ""})).unwrap();
+        write_file(&ws, &json!({"path": "src/a/b/c/notes.txt", "content": ""})).unwrap();
+
+        let all_rs = search(&ws, &json!({"pattern": "**/*.rs"})).unwrap();
+        assert!(all_rs.contains("root.rs"), "missing root.rs: {all_rs}");
+        assert!(all_rs.contains("src/lib.rs"), "missing src/lib.rs: {all_rs}");
+        assert!(all_rs.contains("src/a/b/c/deep.rs"), "missing deep.rs: {all_rs}");
+        assert!(!all_rs.contains("notes.txt"), "unexpected txt: {all_rs}");
+
+        let src_only = search(&ws, &json!({"pattern": "src/**/*.rs"})).unwrap();
+        assert!(!src_only.contains("root.rs"), "root.rs should not match src/**/*.rs: {src_only}");
+        assert!(src_only.contains("src/lib.rs"));
+        assert!(src_only.contains("src/a/b/c/deep.rs"));
+
+        let root_only = search(&ws, &json!({"pattern": "*.rs"})).unwrap();
+        assert!(root_only.contains("root.rs"));
+        assert!(!root_only.contains("src/lib.rs"), "single * must not cross /: {root_only}");
+    }
+
     fn tempdir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("meg-tools-{}", std::process::id()));
-        let dir = dir.join(format!(
-            "{:?}",
-            std::time::SystemTime::now().elapsed().unwrap().as_nanos()
-        ));
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("meg-tools-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

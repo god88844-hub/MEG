@@ -6,20 +6,17 @@ const CRITICAL: &[&str] = &[
     "exit code", "exit with", "Segmentation fault",
 ];
 
-/// Truncate `text` to `limit` chars keeping head + tail and pinning critical
-/// lines (error/traceback lines) so they always reach the model.
+/// Truncate `text` to `limit` bytes on valid UTF-8 boundaries, keeping head +
+/// tail and pinning critical lines (error/traceback lines) so they always reach
+/// the model.
 pub fn truncate_observation(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
     }
     let lines: Vec<&str> = text.lines().collect();
-    let _critical: Vec<&str> = lines
-        .iter()
-        .filter(|l| CRITICAL.iter().any(|c| l.contains(c)))
-        .copied()
-        .collect();
 
     let head = limit * 70 / 100;
+    let head_end = text.floor_char_boundary(head.min(text.len()));
     let tail = limit.saturating_sub(head).saturating_sub(200).max(200);
 
     // Pin dropped critical lines verbatim (headroom contract).
@@ -28,8 +25,8 @@ pub fn truncate_observation(text: &str, limit: usize) -> String {
             .iter()
             .filter(|l| CRITICAL.iter().any(|c| l.contains(c)))
             .filter(|l| {
-                // only lines that head/tail windows won't already keep
-                text.find(**l).map(|idx| idx >= head).unwrap_or(true)
+                // only lines that the head window won't already keep
+                text.find(**l).map(|idx| idx >= head_end).unwrap_or(true)
             })
             .take(20)
             .collect();
@@ -44,14 +41,14 @@ pub fn truncate_observation(text: &str, limit: usize) -> String {
     };
 
     let last = last_chars(text, tail);
-    let elided = text.len().saturating_sub(head.min(text.len()) + last.len());
+    let elided = text.len().saturating_sub(head_end + last.len());
 
     // Build with a shrinking head so the budget is met WITHOUT cutting the
     // tail or the pinned critical block (naive end-truncation would drop
     // exactly the lines this function exists to preserve).
     let mut out = format!(
         "{}\n...[{} chars elided]...\n{}{}",
-        &text[..head.min(text.len())],
+        &text[..head_end],
         elided,
         last,
         pinned_block
@@ -59,16 +56,18 @@ pub fn truncate_observation(text: &str, limit: usize) -> String {
     let mut head_keep = head;
     while out.len() > limit && head_keep > 100 {
         head_keep /= 2;
+        let keep_end = text.floor_char_boundary(head_keep.min(text.len()));
         out = format!(
             "{}\n...[{} chars elided]...\n{}{}",
-            &text[..head_keep.min(text.len())],
-            text.len().saturating_sub(head_keep.min(text.len()) + last.len()),
+            &text[..keep_end],
+            text.len().saturating_sub(keep_end + last.len()),
             last,
             pinned_block
         );
     }
     if out.len() > limit {
-        out.truncate(limit);
+        let final_end = out.floor_char_boundary(limit);
+        out.truncate(final_end);
     }
     out
 }
@@ -77,12 +76,7 @@ fn last_chars(s: &str, n: usize) -> &str {
     if s.len() <= n {
         return s;
     }
-    let start = s.len() - n;
-    // Snap to a char boundary.
-    let mut start = start;
-    while !s.is_char_boundary(start) {
-        start += 1;
-    }
+    let start = s.ceil_char_boundary(s.len() - n);
     &s[start..]
 }
 
@@ -113,5 +107,20 @@ mod tests {
     #[test]
     fn short_text_untouched() {
         assert_eq!(truncate_observation("hello", 100), "hello");
+    }
+
+    #[test]
+    fn handles_multibyte_utf8_without_panicking() {
+        let mut body = String::new();
+        for i in 0..200 {
+            body.push_str(&format!("line {i} \u{4E16}\u{754C} \u{1F680}\n"));
+        }
+        body.push_str("FATAL: \u{0924}\u{094D}\u{0930}\u{0941}\u{091F}\u{093F}");
+        for limit in [17, 50, 101, 601, 1003] {
+            let out = truncate_observation(&body, limit);
+            assert!(out.len() <= limit, "len {} exceeded limit {limit}", out.len());
+        }
+        let preserved = truncate_observation(&body, 601);
+        assert!(preserved.contains("FATAL: \u{0924}\u{094D}\u{0930}\u{0941}\u{091F}\u{093F}"));
     }
 }

@@ -5,17 +5,18 @@
 //! The Python harness shipped this in commit 261af92 (repairJson +
 //! _recover_tool_calls_from_markup); this is the Rust clean-room port.
 
+use regex::Regex;
 use serde_json::Value;
+use std::sync::OnceLock;
 
 /// Escape raw unescaped control characters (newline, tab, CR, ...) that appear
-/// INSIDE JSON string literals so serde_json can parse the object.
+/// INSIDE JSON string literals so serde_json can parse the object, while
+/// preserving multi-byte UTF-8 characters intact.
 pub fn repair_json(raw: &str) -> String {
-    let bytes = raw.as_bytes();
     let mut out = String::with_capacity(raw.len() + 16);
     let mut in_string = false;
     let mut escaped = false;
-    for &b in bytes {
-        let ch = b as char;
+    for ch in raw.chars() {
         if escaped {
             out.push(ch);
             escaped = false;
@@ -31,8 +32,9 @@ pub fn repair_json(raw: &str) -> String {
             out.push(ch);
             continue;
         }
-        if in_string && matches!(b, b'\n' | b'\r' | b'\t' | 0x00..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f) {
-            out.push_str(&format!("\\u{:04x}", b));
+        let code = ch as u32;
+        if in_string && code <= 0x1f {
+            out.push_str(&format!("\\u{code:04x}"));
             continue;
         }
         out.push(ch);
@@ -43,13 +45,11 @@ pub fn repair_json(raw: &str) -> String {
 /// Extract the first balanced JSON object from arbitrary model text (skips
 /// prose, markdown fences, `<think>` blocks). Returns the substring.
 pub fn extract_json_object(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
     let mut start: Option<usize> = None;
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        let ch = b as char;
+    for (i, ch) in text.char_indices() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -86,7 +86,8 @@ pub fn extract_json_object(text: &str) -> Option<&str> {
 
 /// Strip `<think>...</think>` reasoning blocks (OpenRouter free models).
 pub fn strip_think(text: &str) -> String {
-    let re = regex::Regex::new(r"(?is)<think>.*?</think>").unwrap();
+    static THINK_RE: OnceLock<Regex> = OnceLock::new();
+    let re = THINK_RE.get_or_init(|| Regex::new(r"(?is)<think>.*?</think>").unwrap());
     let mut out = re.replace_all(text, "").to_string();
     // Unclosed think block: drop everything from <think> on.
     if let Some(idx) = out.find("<think>") {
@@ -98,14 +99,19 @@ pub fn strip_think(text: &str) -> String {
 /// Recover `<tool_call><function=name><parameter=key>value</parameter>...`
 /// markup (duck-harness pattern) into a JSON object {name, args}.
 pub fn recover_tool_call_markup(text: &str) -> Vec<(String, serde_json::Map<String, Value>)> {
+    static CALL_RE: OnceLock<Regex> = OnceLock::new();
+    static PARAM_RE: OnceLock<Regex> = OnceLock::new();
     // Rust regex has no backreferences: match any </function...> closer (models
     // emit `</function=name>` too) and take the name from the opening tag.
-    let re = regex::Regex::new(
-        r"(?is)<tool_call>\s*<function\s*=\s*([A-Za-z0-9_\-\.]+)\s*>(.*?)</function[^>]*>",
-    )
-    .unwrap();
-    let param_re =
-        regex::Regex::new(r"(?is)<parameter\s*=\s*([A-Za-z0-9_\-\.]+)\s*>(.*?)</parameter>").unwrap();
+    let re = CALL_RE.get_or_init(|| {
+        Regex::new(
+            r"(?is)<tool_call>\s*<function\s*=\s*([A-Za-z0-9_\-\.]+)\s*>(.*?)</function[^>]*>",
+        )
+        .unwrap()
+    });
+    let param_re = PARAM_RE.get_or_init(|| {
+        Regex::new(r"(?is)<parameter\s*=\s*([A-Za-z0-9_\-\.]+)\s*>(.*?)</parameter>").unwrap()
+    });
     let mut calls = Vec::new();
     for cap in re.captures_iter(text) {
         let name = cap[1].trim().to_string();
@@ -127,7 +133,10 @@ pub fn recover_tool_call_markup(text: &str) -> Vec<(String, serde_json::Map<Stri
 /// Recover fenced ```json blocks from content (some models answer in fences
 /// even when told not to).
 pub fn recover_fenced_json(text: &str) -> Vec<Value> {
-    let re = regex::Regex::new(r"(?is)```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```").unwrap();
+    static FENCED_RE: OnceLock<Regex> = OnceLock::new();
+    let re = FENCED_RE.get_or_init(|| {
+        Regex::new(r"(?is)```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```").unwrap()
+    });
     let mut out = Vec::new();
     for cap in re.captures_iter(text) {
         if let Ok(v) = serde_json::from_str::<Value>(&repair_json(&cap[1])) {
@@ -187,6 +196,17 @@ line2","tool":"read"}"#;
         let v: Value = serde_json::from_str(&repair_json(raw)).unwrap();
         assert_eq!(v["tool"], "read");
         assert!(v["thought"].as_str().unwrap().contains('\n'));
+    }
+
+    #[test]
+    fn preserves_multibyte_utf8_during_repair() {
+        let raw = "{\"thought\":\"\u{4E16}\u{754C}\n\u{0928}\u{092E}\u{0938}\u{094D}\u{0924}\u{0947} \u{1F680}\",\"final\":\"ok\"}";
+        let v: Value = serde_json::from_str(&repair_json(raw)).unwrap();
+        assert_eq!(
+            v["thought"].as_str().unwrap(),
+            "\u{4E16}\u{754C}\n\u{0928}\u{092E}\u{0938}\u{094D}\u{0924}\u{0947} \u{1F680}"
+        );
+        assert_eq!(v["final"], "ok");
     }
 
     #[test]

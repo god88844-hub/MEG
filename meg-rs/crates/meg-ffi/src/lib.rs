@@ -1,6 +1,6 @@
-//! meg-ffi — Bridge 1: the meg-rs hot path as a C-ABI cdylib, loaded
+//! meg-ffi -- Bridge 1: the meg-rs hot path as a C-ABI cdylib, loaded
 //! in-process by Bun's `bun:ffi` (dlopen). Zero fork, zero subprocess:
-//! the control plane calls grep/edit/truncate/parse in ~µs.
+//! the control plane calls grep/edit/truncate/parse in ~us.
 //!
 //! Memory contract: every returned char* is heap-allocated with CString and
 //! MUST be released by the caller via meg_free after copying. All functions
@@ -46,7 +46,7 @@ pub extern "C" fn meg_search_files(workspace: *const c_char, pattern: *const c_c
     put_str(if result.ok { result.output } else { format!("error: {}", result.output) })
 }
 
-/// Read a file (workspace-confined), capped at `cap` bytes.
+/// Read a file (workspace-confined), capped at `cap` bytes on a valid UTF-8 boundary.
 #[no_mangle]
 pub extern "C" fn meg_read_file(workspace: *const c_char, path: *const c_char, cap: u32) -> *mut c_char {
     let args = serde_json::json!({ "path": take_str(path) });
@@ -57,10 +57,11 @@ pub extern "C" fn meg_read_file(workspace: *const c_char, path: *const c_char, c
     }
     let cap = cap as usize;
     if result.output.len() > cap {
+        let end = result.output.floor_char_boundary(cap);
         let truncated = format!(
             "{}\n...[truncated {} chars]",
-            &result.output[..cap],
-            result.output.len() - cap
+            &result.output[..end],
+            result.output.len() - end
         );
         put_str(truncated)
     } else {
@@ -112,6 +113,13 @@ pub extern "C" fn meg_parse_action_variant(raw: *const c_char) -> *mut c_char {
     }
 }
 
+/// Pre-turn workspace indexer: compact <workspace_map> for Turn 1 context.
+#[no_mangle]
+pub extern "C" fn meg_index_workspace(root_ptr: *const c_char) -> *mut c_char {
+    let root = take_str(root_ptr);
+    put_str(meg_core::indexer::index_workspace(std::path::Path::new(&root), 200))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,11 +147,20 @@ mod tests {
         meg_free(ptr);
         assert!(out.contains("FATAL: refused"));
     }
-}
 
-/// Pre-turn workspace indexer: compact <workspace_map> for Turn 1 context.
-#[no_mangle]
-pub extern "C" fn meg_index_workspace(root_ptr: *const c_char) -> *mut c_char {
-    let root = take_str(root_ptr);
-    put_str(meg_core::indexer::index_workspace(std::path::Path::new(&root), 200))
+    #[test]
+    fn read_file_truncates_safely_on_multibyte_utf8_boundary() {
+        let dir = std::env::temp_dir().join(format!("meg-ffi-utf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Four 4-byte UTF-8 characters (16 bytes total); cap=5 lands mid-char.
+        std::fs::write(dir.join("u.txt"), "\u{1F680}\u{1F525}\u{1F31F}\u{2728}").unwrap();
+        let ws_c = CString::new(dir.to_string_lossy().to_string()).unwrap();
+        let path_c = CString::new("u.txt").unwrap();
+        let ptr = meg_read_file(ws_c.as_ptr(), path_c.as_ptr(), 5);
+        let out = take_str(ptr);
+        meg_free(ptr);
+        assert!(out.starts_with("\u{1F680}\n...[truncated"), "got: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

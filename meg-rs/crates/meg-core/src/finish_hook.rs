@@ -382,13 +382,23 @@ pub fn goal_wants_live_daemon(goal: &str) -> bool {
 /// Probe whether any daemon family process is alive (pgrep), POSIX only.
 /// Unavailable probes count as ALIVE: a missing pgrep must never block a
 /// genuine finish.
+/// Combined extended-regex alternation covering every daemon family in `DAEMON_PROC_PATTERNS`.
+pub fn daemon_pgrep_pattern() -> String {
+    DAEMON_PROC_PATTERNS
+        .iter()
+        .map(|p| p.replace('.', r"\."))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 pub fn daemon_alive_probe() -> Result<bool, String> {
-    let pattern = DAEMON_PROC_PATTERNS
-        .first()
-        .ok_or_else(|| "no patterns".to_string())?;
+    if DAEMON_PROC_PATTERNS.is_empty() {
+        return Err("no patterns".to_string());
+    }
+    let pattern = daemon_pgrep_pattern();
     match std::process::Command::new("pgrep")
         .arg("-f")
-        .arg(pattern)
+        .arg(&pattern)
         .output()
     {
         Ok(out) => Ok(out.status.success()),
@@ -424,5 +434,20 @@ mod closure_guard_tests {
         for required in ["GIT_TERMINAL_PROMPT", "GIT_EDITOR", "GIT_MERGE_AUTOEDIT", "GCM_INTERACTIVE"] {
             assert!(names.contains(&required), "{required} must be present");
         }
+    }
+
+    #[test]
+    fn daemon_pgrep_pattern_covers_all_daemon_families() {
+        let re = regex::Regex::new(&daemon_pgrep_pattern()).unwrap();
+        for sample in [
+            "qemu-system-x86_64 -nographic",
+            "/usr/sbin/nginx -g daemon off;",
+            "uvicorn app:main --port 8000",
+            "redis-server *:6379",
+            "python3 -m http.server 8080",
+        ] {
+            assert!(re.is_match(sample), "pattern missed daemon: {sample}");
+        }
+        assert!(!re.is_match("cargo test --workspace"));
     }
 }
