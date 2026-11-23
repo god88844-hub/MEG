@@ -113,11 +113,11 @@ Goal: Make Bun control plane state durable and Windows worker lifecycle leak-fre
 ## Phase 6 — End-to-End Offline Harness Benchmark & Verification Suite
 Goal: Lock in measurable reliability gains with deterministic offline tests.
 
-- [ ] **6.1 Multi-turn offline harness test suite** (`meg-rs/crates/meg-cli/tests/`, `meg-rs/crates/meg-core/tests/`)
+- [x] **6.1 Multi-turn offline harness test suite** (`meg-rs/crates/meg-cli/tests/`, `meg-rs/crates/meg-core/tests/`)
   - Wiremock-driven E2E tests covering: Turn 1 workspace map, `grep_files` -> `read_file` -> CRLF `edit_file`, native tool calling + fallback, `429` retry, doom-loop recovery, parallel read-only batching, `finish_hook` recovery, and multi-step `/undo`.
-- [ ] **6.2 Bun control-plane integration tests** (`meg-plane/`)
+- [x] **6.2 Bun control-plane integration tests** (`meg-plane/`)
   - Verify `meg_grep_files` & `meg_index_workspace` via `bun:ffi`, persistent `SessionTree` fork/reload, and worker cancellation cleanup.
-- [ ] **6.3 Phase 6 Gate**: Full Rust + Bun tests and release build green; commit & push.
+- [x] **6.3 Phase 6 Gate**: Full Rust + Bun tests and release build green; commit & push.
 
 ---
 
