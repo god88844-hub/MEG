@@ -13,7 +13,7 @@
   - *Micro-Check:* `git status` clean; files readable at repo root and `docs/`.
 - [x] **P0-02** Create `scripts/init.ps1` (Windows 10 PowerShell 5.1) + `scripts/init.sh` (POSIX) verifying `cargo`, `bun`, `git`, `python`, and clean working tree.
   - *Micro-Check:* Run `powershell -File scripts/init.ps1`.
-- [ ] **P0-03** Create `scripts/check.ps1` + `scripts/check.sh` (Phase Gate runner) and `scripts/selftest.ps1` + `scripts/selftest.sh` (plants synthetic bug `delta`, proves `check` fails non-zero, reverts `delta`).
+- [x] **P0-03** Create `scripts/check.ps1` + `scripts/check.sh` (Phase Gate runner) and `scripts/selftest.ps1` + `scripts/selftest.sh` (plants synthetic bug `delta`, proves `check` fails non-zero, reverts `delta`).
   - *Micro-Check:* Run `powershell -File scripts/selftest.ps1`.
 - [ ] **P0-04** Update `.github/workflows/ci.yml` to run `cargo test --workspace`, `bun test`, and a protected-path guard blocking unauthorized deletions in `tests/`. Export a concise 1-page inventory of existing `meg-rs` and `meg-plane` public APIs into `docs/API_INDEX.md` so Phase 1-5 code fits seamlessly.
   - *Micro-Check:* Validate YAML syntax and confirm `docs/API_INDEX.md` lists existing exports.
