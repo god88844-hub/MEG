@@ -11,7 +11,7 @@
 
 - [x] **P0-01** Commit `AGENTS.md`, `CLAUDE.md`, `docs/ARCHITECTURE.md`, `docs/PLAN.md`, and `docs/STATE.md`.
   - *Micro-Check:* `git status` clean; files readable at repo root and `docs/`.
-- [ ] **P0-02** Create `scripts/init.ps1` (Windows 10 PowerShell 5.1) + `scripts/init.sh` (POSIX) verifying `cargo`, `bun`, `git`, `python`, and clean working tree.
+- [x] **P0-02** Create `scripts/init.ps1` (Windows 10 PowerShell 5.1) + `scripts/init.sh` (POSIX) verifying `cargo`, `bun`, `git`, `python`, and clean working tree.
   - *Micro-Check:* Run `powershell -File scripts/init.ps1`.
 - [ ] **P0-03** Create `scripts/check.ps1` + `scripts/check.sh` (Phase Gate runner) and `scripts/selftest.ps1` + `scripts/selftest.sh` (plants synthetic bug `delta`, proves `check` fails non-zero, reverts `delta`).
   - *Micro-Check:* Run `powershell -File scripts/selftest.ps1`.
