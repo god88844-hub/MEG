@@ -1,4 +1,4 @@
-//! Tool registry — name → executor dispatch with schema stubs for the prompt.
+//! Tool registry -- name -> executor dispatch with schema stubs for the prompt.
 
 use anyhow::Result;
 use serde_json::Value;
@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use crate::bash;
 use crate::edit;
 use crate::fs_tools;
+use crate::grep;
 
 pub struct ToolResult {
     pub ok: bool,
@@ -30,10 +31,14 @@ impl ToolRegistry {
 
     pub fn with_core_tools(workspace: &std::path::Path) -> Self {
         let mut reg = Self::new();
-        reg.register("read_file", "Read a text file from the workspace.", {
-            let ws = workspace.to_path_buf();
-            move |args| fs_tools::read_file(&ws, args)
-        });
+        reg.register(
+            "read_file",
+            "Read a text file from the workspace: {path, offset?, limit?, line_numbers?}.",
+            {
+                let ws = workspace.to_path_buf();
+                move |args| fs_tools::read_file(&ws, args)
+            },
+        );
         reg.register(
             "write_file",
             "Write (create/overwrite) a text file in the workspace.",
@@ -44,7 +49,7 @@ impl ToolRegistry {
         );
         reg.register(
             "edit_file",
-            "Exact str_replace edit: {path, old_string, new_string}. old_string must be unique.",
+            "Exact str_replace edit: {path, old_string, new_string, replace_all?}. old_string must be unique.",
             {
                 let ws = workspace.to_path_buf();
                 move |args| edit::str_replace(&ws, args)
@@ -66,6 +71,22 @@ impl ToolRegistry {
                 move |args| fs_tools::search(&ws, args)
             },
         );
+        reg.register(
+            "grep_files",
+            "Regex content search: {pattern, path?, glob?, case_insensitive?, context_lines?, max_results?}.",
+            {
+                let ws = workspace.to_path_buf();
+                move |args| grep::grep_files(&ws, args)
+            },
+        );
+        reg.register(
+            "list_dir",
+            "List directory entries in workspace: {path?, include_ignored?, max_entries?}.",
+            {
+                let ws = workspace.to_path_buf();
+                move |args| fs_tools::list_dir(&ws, args)
+            },
+        );
         reg
     }
 
@@ -80,6 +101,13 @@ impl ToolRegistry {
             "search_files",
             "Glob search: {pattern} with cancellation.",
             move |args| fs_tools::search_cancellable(&search_ws, args, &search_cancel),
+        );
+        let grep_ws = workspace.to_path_buf();
+        let grep_cancel = cancel.clone();
+        registry.register(
+            "grep_files",
+            "Regex content search: {pattern, path?, glob?, case_insensitive?, context_lines?, max_results?}.",
+            move |args| grep::grep_files_cancellable(&grep_ws, args, &grep_cancel),
         );
         let ws = workspace.to_path_buf();
         registry.register(
@@ -143,6 +171,8 @@ mod tests {
             "edit_file",
             "bash",
             "search_files",
+            "grep_files",
+            "list_dir",
         ] {
             assert!(reg.stubs.contains_key(name), "missing {name}");
         }

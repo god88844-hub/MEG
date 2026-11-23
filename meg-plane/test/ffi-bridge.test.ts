@@ -92,4 +92,21 @@ describe("FfiBridge (Bridge 1, real meg_ffi.dll)", () => {
     ).toBe("tool");
     expect(ffi.parseActionVariant("no action here at all")).toBeNull();
   });
+
+  test("grepFiles searches content with optional glob", () => {
+    const out = ffi.grepFiles(ws, "Offline native FFI", "**/*.rs", 20);
+    expect(out).toContain("src/fixture.rs:1:");
+  });
+
+  test("listDir lists workspace directories and files", () => {
+    const out = ffi.listDir(ws, ".");
+    expect(out).toContain("dir  src/");
+  });
+
+  test("indexWorkspace returns a workspace_map", () => {
+    const map = ffi.indexWorkspace(ws);
+    expect(map).toContain("<workspace_map");
+    expect(map).toContain("src/fixture.rs");
+    expect(map).toContain("</workspace_map>");
+  });
 });

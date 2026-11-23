@@ -1,8 +1,11 @@
-//! Filesystem tools: read, write, search (glob). Workspace-confined.
+//! Filesystem tools: read (raw or line-numbered slice), write, list_dir, search (glob).
+//! Strictly workspace-confined.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+
+const MAX_READ_BYTES: usize = 50_000;
 
 pub fn resolve(workspace: &Path, candidate: &str) -> Result<PathBuf> {
     resolve_inner(workspace, candidate)
@@ -58,6 +61,9 @@ fn resolve_inner(workspace: &Path, candidate: &str) -> Result<PathBuf> {
     Ok(full)
 }
 
+/// Read a workspace file. When `offset`, `limit`, or `line_numbers: true` is
+/// supplied, returns a 1-based line-numbered slice (`N | line`). Otherwise
+/// returns raw text capped at 50 KB on a valid UTF-8 boundary.
 pub fn read_file(workspace: &Path, args: &Value) -> Result<String> {
     let path = args
         .get("path")
@@ -65,16 +71,48 @@ pub fn read_file(workspace: &Path, args: &Value) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing 'path'"))?;
     let full = resolve(workspace, path)?;
     let text = std::fs::read_to_string(&full)?;
-    if text.len() > 50_000 {
-        let end = text.floor_char_boundary(50_000);
-        let out = format!(
-            "{}\n...[truncated {} bytes]",
-            &text[..end],
-            text.len() - end
-        );
-        return Ok(out);
+
+    let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as usize);
+    let limit = args.get("limit").and_then(Value::as_u64).map(|n| n as usize);
+    let numbered = args
+        .get("line_numbers")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || offset.is_some()
+        || limit.is_some();
+
+    if numbered {
+        let lines: Vec<&str> = text.lines().collect();
+        let total = lines.len();
+        if total == 0 {
+            return Ok(format!("[{path}: empty file (0 lines)]"));
+        }
+        let start = offset.unwrap_or(1).max(1);
+        if start > total {
+            return Ok(format!(
+                "[{path}: offset {start} is past end of file ({total} lines)]"
+            ));
+        }
+        let count = limit.unwrap_or(200).clamp(1, 2_000);
+        let end = (start - 1 + count).min(total);
+        let mut out = format!("[{path}: lines {start}-{end} of {total}]\n");
+        for (idx, line) in lines[(start - 1)..end].iter().enumerate() {
+            out.push_str(&format!("{:>4} | {line}\n", start + idx));
+        }
+        let out = out.trim_end_matches('\n').to_string();
+        return Ok(cap_utf8(out, MAX_READ_BYTES));
     }
-    Ok(text)
+
+    Ok(cap_utf8(text, MAX_READ_BYTES))
+}
+
+fn cap_utf8(text: String, max_bytes: usize) -> String {
+    if text.len() > max_bytes {
+        let end = text.floor_char_boundary(max_bytes);
+        format!("{}\n...[truncated {} bytes]", &text[..end], text.len() - end)
+    } else {
+        text
+    }
 }
 
 pub fn write_file(workspace: &Path, args: &Value) -> Result<String> {
@@ -92,6 +130,53 @@ pub fn write_file(workspace: &Path, args: &Value) -> Result<String> {
     }
     std::fs::write(&full, content)?;
     Ok(format!("wrote {} bytes to {}", content.len(), path))
+}
+
+/// Bounded directory listing confined to the workspace.
+pub fn list_dir(workspace: &Path, args: &Value) -> Result<String> {
+    let rel_path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let include_ignored = args
+        .get("include_ignored")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let max_entries = args
+        .get("max_entries")
+        .and_then(Value::as_u64)
+        .unwrap_or(200)
+        .clamp(1, 500) as usize;
+
+    let full = resolve(workspace, rel_path)?;
+    ensure!(full.is_dir(), "not a directory: {rel_path}");
+
+    let mut items: Vec<(bool, String, u64)> = Vec::new();
+    for entry in std::fs::read_dir(&full)?.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !include_ignored && is_ignored_name(&name) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        items.push((!meta.is_dir(), name, meta.len()));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase())));
+
+    if items.is_empty() {
+        return Ok("(empty directory)".into());
+    }
+    let total = items.len();
+    let mut lines = Vec::new();
+    for (is_file, name, size) in items.into_iter().take(max_entries) {
+        if is_file {
+            lines.push(format!("file {name} ({size}B)"));
+        } else {
+            lines.push(format!("dir  {name}/"));
+        }
+    }
+    if total > max_entries {
+        lines.push(format!("...[truncated {} more entries]", total - max_entries));
+    }
+    Ok(lines.join("\n"))
 }
 
 pub fn search(workspace: &Path, args: &Value) -> Result<String> {
@@ -135,28 +220,26 @@ pub fn search_cancellable(
     Ok(matches.join("\n"))
 }
 
-fn is_ignored(entry: &walkdir::DirEntry) -> bool {
-    entry
-        .file_name()
-        .to_str()
-        .map(|n| {
-            matches!(
-                n,
-                ".git"
-                    | "target"
-                    | "node_modules"
-                    | "__pycache__"
-                    | ".venv"
-                    | "venv"
-                    | ".meg"
-                    | ".cache"
-            )
-        })
-        .unwrap_or(false)
+pub(crate) fn is_ignored_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "target"
+            | "node_modules"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | ".meg"
+            | ".cache"
+    )
+}
+
+pub(crate) fn is_ignored(entry: &walkdir::DirEntry) -> bool {
+    entry.file_name().to_str().map(is_ignored_name).unwrap_or(false)
 }
 
 /// Glob matcher: `*` within a segment, `**` across zero or more segments, `?` single non-slash char.
-fn globset_lite(pattern: &str) -> Result<impl Fn(&str) -> bool> {
+pub(crate) fn globset_lite(pattern: &str) -> Result<impl Fn(&str) -> bool> {
     let normalized = pattern.replace('\\', "/");
     let chars: Vec<char> = normalized.chars().collect();
     let mut regex = String::from("^");
@@ -203,10 +286,43 @@ mod tests {
     }
 
     #[test]
+    fn read_file_supports_line_numbered_pagination() {
+        let ws = tempdir();
+        write_file(
+            &ws,
+            &json!({"path": "nums.txt", "content": "one\ntwo\nthree\nfour\nfive\n"}),
+        )
+        .unwrap();
+        let slice = read_file(&ws, &json!({"path": "nums.txt", "offset": 2, "limit": 2})).unwrap();
+        assert!(slice.starts_with("[nums.txt: lines 2-3 of 5]"), "{slice}");
+        assert!(slice.contains("   2 | two"), "{slice}");
+        assert!(slice.contains("   3 | three"), "{slice}");
+        assert!(!slice.contains("four"), "{slice}");
+
+        let past = read_file(&ws, &json!({"path": "nums.txt", "offset": 99})).unwrap();
+        assert!(past.contains("past end of file"), "{past}");
+    }
+
+    #[test]
+    fn list_dir_sorts_dirs_first_and_skips_ignored() {
+        let ws = tempdir();
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(ws.join("target")).unwrap();
+        std::fs::write(ws.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let out = list_dir(&ws, &json!({})).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert_eq!(lines[0], "dir  src/");
+        assert!(lines[1].starts_with("file Cargo.toml ("), "{out}");
+        assert!(!out.contains("target"), "{out}");
+    }
+
+    #[test]
     fn workspace_escape_rejected() {
         let ws = tempdir();
         let err = read_file(&ws, &json!({"path": "../outside.txt"}));
         assert!(err.is_err());
+        assert!(list_dir(&ws, &json!({"path": ".."})).is_err());
     }
 
     #[test]

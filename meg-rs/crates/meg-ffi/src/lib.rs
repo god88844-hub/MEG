@@ -46,6 +46,38 @@ pub extern "C" fn meg_search_files(workspace: *const c_char, pattern: *const c_c
     put_str(if result.ok { result.output } else { format!("error: {}", result.output) })
 }
 
+/// Regex content search confined to the workspace.
+#[no_mangle]
+pub extern "C" fn meg_grep_files(
+    workspace: *const c_char,
+    pattern: *const c_char,
+    glob: *const c_char,
+    max_results: u32,
+) -> *mut c_char {
+    let glob_str = take_str(glob);
+    let mut args = serde_json::json!({
+        "pattern": take_str(pattern),
+        "max_results": if max_results == 0 { 50 } else { max_results },
+    });
+    if !glob_str.trim().is_empty() {
+        args["glob"] = serde_json::Value::String(glob_str);
+    }
+    let result = meg_tools::ToolRegistry::with_core_tools(&ws(workspace))
+        .execute("grep_files", &args);
+    put_str(if result.ok { result.output } else { format!("error: {}", result.output) })
+}
+
+/// Bounded directory listing confined to the workspace.
+#[no_mangle]
+pub extern "C" fn meg_list_dir(workspace: *const c_char, rel_path: *const c_char) -> *mut c_char {
+    let rel = take_str(rel_path);
+    let path_arg = if rel.trim().is_empty() { ".".to_string() } else { rel };
+    let args = serde_json::json!({ "path": path_arg });
+    let result = meg_tools::ToolRegistry::with_core_tools(&ws(workspace))
+        .execute("list_dir", &args);
+    put_str(if result.ok { result.output } else { format!("error: {}", result.output) })
+}
+
 /// Read a file (workspace-confined), capped at `cap` bytes on a valid UTF-8 boundary.
 #[no_mangle]
 pub extern "C" fn meg_read_file(workspace: *const c_char, path: *const c_char, cap: u32) -> *mut c_char {
@@ -153,7 +185,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("meg-ffi-utf8-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // Four 4-byte UTF-8 characters (16 bytes total); cap=5 lands mid-char.
         std::fs::write(dir.join("u.txt"), "\u{1F680}\u{1F525}\u{1F31F}\u{2728}").unwrap();
         let ws_c = CString::new(dir.to_string_lossy().to_string()).unwrap();
         let path_c = CString::new("u.txt").unwrap();
@@ -161,6 +192,30 @@ mod tests {
         let out = take_str(ptr);
         meg_free(ptr);
         assert!(out.starts_with("\u{1F680}\n...[truncated"), "got: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_and_list_dir_round_trip() {
+        let dir = std::env::temp_dir().join(format!("meg-ffi-grep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/app.rs"), "pub fn hello_ffi() {}\n").unwrap();
+
+        let ws_c = CString::new(dir.to_string_lossy().to_string()).unwrap();
+        let pat_c = CString::new("hello_ffi").unwrap();
+        let glob_c = CString::new("**/*.rs").unwrap();
+        let ptr = meg_grep_files(ws_c.as_ptr(), pat_c.as_ptr(), glob_c.as_ptr(), 20);
+        let grep_out = take_str(ptr);
+        meg_free(ptr);
+        assert!(grep_out.contains("src/app.rs:1:pub fn hello_ffi()"), "{grep_out}");
+
+        let rel_c = CString::new(".").unwrap();
+        let ptr2 = meg_list_dir(ws_c.as_ptr(), rel_c.as_ptr());
+        let ls_out = take_str(ptr2);
+        meg_free(ptr2);
+        assert!(ls_out.contains("dir  src/"), "{ls_out}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -47,18 +47,18 @@ Goal: Eliminate crash/panic bugs, UTF-8 corruption, broken recursive globbing, a
 ## Phase 2 — SOTA Coding Toolset & Multi-Step Undo
 Goal: Give the agent fast, surgical workspace inspection and safe multi-step rollback.
 
-- [ ] **2.1 Add `grep_files` content search tool** (`meg-rs/crates/meg-tools/src/grep.rs`, `lib.rs`, `registry.rs`)
+- [x] **2.1 Add `grep_files` content search tool** (`meg-rs/crates/meg-tools/src/grep.rs`, `lib.rs`, `registry.rs`)
   - Regex content search across workspace (skipping ignored dirs & binary/oversized files), optional `glob` filter, `max_results`, `context_lines`, cancellable via `AtomicBool`, returns `path:line:text`.
-- [ ] **2.2 Add `list_dir` tool** (`meg-rs/crates/meg-tools/src/fs_tools.rs`, `registry.rs`)
+- [x] **2.2 Add `list_dir` tool** (`meg-rs/crates/meg-tools/src/fs_tools.rs`, `registry.rs`)
   - Bounded directory listing with entry type (`dir`/`file`), byte sizes, and ignored-dir filtering.
-- [ ] **2.3 Upgrade `read_file` with line numbers & `offset`/`limit`** (`meg-rs/crates/meg-tools/src/fs_tools.rs`)
+- [x] **2.3 Upgrade `read_file` with line numbers & `offset`/`limit`** (`meg-rs/crates/meg-tools/src/fs_tools.rs`)
   - Support optional 1-based `offset` and `limit` parameters with `N | line` formatting (preserving backward compatibility when omitted or needed).
-- [ ] **2.4 Multi-step undo journal stack** (`meg-rs/crates/meg-tools/src/journal.rs`)
+- [x] **2.4 Multi-step undo journal stack** (`meg-rs/crates/meg-tools/src/journal.rs`)
   - Replace single-slot `undo.json` with a bounded append/pop stack (e.g., last 20 edits) while keeping the strict "refuse if manually modified after MEG's edit" safety check.
-- [ ] **2.5 Expand FFI bridge exports** (`meg-rs/crates/meg-ffi/src/lib.rs`, `meg-plane/src/ffi-bridge.ts`)
+- [x] **2.5 Expand FFI bridge exports** (`meg-rs/crates/meg-ffi/src/lib.rs`, `meg-plane/src/ffi-bridge.ts`)
   - Expose `meg_grep_files` and bind both `meg_index_workspace` and `meg_grep_files` in `ffi-bridge.ts`.
   - Add Bun FFI tests for both.
-- [ ] **2.6 Phase 2 Gate**: Full Rust + Bun tests and release build green; commit & push.
+- [x] **2.6 Phase 2 Gate**: Full Rust + Bun tests and release build green; commit & push.
 
 ---
 

@@ -49,7 +49,13 @@ impl LoopEngine for ShimEngine {
             self.mode != meg_tui::Mode::Plan
                 || matches!(
                     tool,
-                    "read_file" | "search_files" | "todo" | "read_skill" | "delegate"
+                    "read_file"
+                        | "search_files"
+                        | "grep_files"
+                        | "list_dir"
+                        | "todo"
+                        | "read_skill"
+                        | "delegate"
                 )
                 || tool.starts_with("mcp:"),
             "{tool} is disabled in Plan mode; switch to Act with /code"
@@ -146,7 +152,7 @@ impl LoopEngine for ShimEngine {
         self.emit(RunnerMsg::StreamStart);
         let mut messages = transcript.to_vec();
         let tools = if self.mode == meg_tui::Mode::Plan {
-            "read_file {path}; search_files {pattern}; todo {items:[{text,done}]}".into()
+            "read_file {path, offset?, limit?, line_numbers?}; search_files {pattern}; grep_files {pattern, path?, glob?, case_insensitive?, context_lines?, max_results?}; list_dir {path?}; todo {items:[{text,done}]}".into()
         } else {
             format!(
                 "{}; todo {{items:[{{text,done}}]}}",
