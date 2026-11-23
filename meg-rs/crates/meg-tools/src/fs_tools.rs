@@ -1,11 +1,38 @@
-//! Filesystem tools: read (raw or line-numbered slice), write, list_dir, search (glob).
-//! Strictly workspace-confined.
+//! Filesystem tools: read (raw, 100-line bounded viewer, or hashline-tagged),
+//! repeated unchanged-read suppression (`ReadCache`), write, list_dir, and
+//! 50-hit capped glob search. Strictly workspace-confined.
 
 use anyhow::{bail, ensure, Result};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const MAX_READ_BYTES: usize = 50_000;
+pub const DEFAULT_VIEW_LINES: usize = 100;
+pub const MAX_SEARCH_HITS: usize = 50;
+
+/// Tracks content hashes of previously read file slices to suppress wasteful
+/// repeated identical reads while always returning full content on change or `force: true`.
+#[derive(Default)]
+pub struct ReadCache {
+    seen: Mutex<HashMap<(PathBuf, usize, usize, bool), (u64, usize, usize)>>,
+}
+
+impl ReadCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
 
 pub fn resolve(workspace: &Path, candidate: &str) -> Result<PathBuf> {
     resolve_inner(workspace, candidate)
@@ -23,8 +50,6 @@ fn resolve_inner(workspace: &Path, candidate: &str) -> Result<PathBuf> {
     } else {
         workspace.join(p)
     };
-    // Windows canonicalize() returns \\?\-prefixed paths for existing files
-    // while non-existent paths stay plain - normalize both before comparing.
     fn strip_unc(p: PathBuf) -> PathBuf {
         let s = p.as_os_str().to_string_lossy().to_string();
         match s.strip_prefix(r"\\?\") {
@@ -61,10 +86,18 @@ fn resolve_inner(workspace: &Path, candidate: &str) -> Result<PathBuf> {
     Ok(full)
 }
 
-/// Read a workspace file. When `offset`, `limit`, or `line_numbers: true` is
-/// supplied, returns a 1-based line-numbered slice (`N | line`). Otherwise
-/// returns raw text capped at 50 KB on a valid UTF-8 boundary.
+/// Read a workspace file. Supports `offset`, `limit` (default 100 lines when paginated),
+/// `line_numbers: true`, and `hashlines: true` (`42#f9a | line`).
 pub fn read_file(workspace: &Path, args: &Value) -> Result<String> {
+    read_file_cached(workspace, args, None)
+}
+
+/// Same as `read_file`, plus repeated unchanged-read suppression via `ReadCache`.
+pub fn read_file_cached(
+    workspace: &Path,
+    args: &Value,
+    cache: Option<&ReadCache>,
+) -> Result<String> {
     let path = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -74,12 +107,46 @@ pub fn read_file(workspace: &Path, args: &Value) -> Result<String> {
 
     let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as usize);
     let limit = args.get("limit").and_then(Value::as_u64).map(|n| n as usize);
-    let numbered = args
-        .get("line_numbers")
+    let hashlines = args
+        .get("hashlines")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+    let numbered = hashlines
+        || args
+            .get("line_numbers")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
         || offset.is_some()
         || limit.is_some();
+
+    let content_hash = fnv1a_64(text.as_bytes());
+    let total_lines = text.lines().count();
+    let cache_key = (
+        full.clone(),
+        offset.unwrap_or(0),
+        limit.unwrap_or(if numbered { DEFAULT_VIEW_LINES } else { 0 }),
+        hashlines,
+    );
+    if !force {
+        if let Some(c) = cache {
+            let map = c.seen.lock().unwrap();
+            if let Some(&(prev_hash, prev_lines, prev_bytes)) = map.get(&cache_key) {
+                if prev_hash == content_hash {
+                    return Ok(format!(
+                        "[unchanged since last read: {path} (hash #{:06x}, {prev_lines} lines, {prev_bytes}B); pass force: true to re-read]",
+                        content_hash & 0xffffff
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(c) = cache {
+        c.seen
+            .lock()
+            .unwrap()
+            .insert(cache_key, (content_hash, total_lines, text.len()));
+    }
 
     if numbered {
         let lines: Vec<&str> = text.lines().collect();
@@ -93,11 +160,15 @@ pub fn read_file(workspace: &Path, args: &Value) -> Result<String> {
                 "[{path}: offset {start} is past end of file ({total} lines)]"
             ));
         }
-        let count = limit.unwrap_or(200).clamp(1, 2_000);
+        let count = limit.unwrap_or(DEFAULT_VIEW_LINES).clamp(1, 2_000);
         let end = (start - 1 + count).min(total);
         let mut out = format!("[{path}: lines {start}-{end} of {total}]\n");
-        for (idx, line) in lines[(start - 1)..end].iter().enumerate() {
-            out.push_str(&format!("{:>4} | {line}\n", start + idx));
+        if hashlines {
+            out.push_str(&crate::edit::format_hashlines(&lines[(start - 1)..end], start));
+        } else {
+            for (idx, line) in lines[(start - 1)..end].iter().enumerate() {
+                out.push_str(&format!("{:>4} | {line}\n", start + idx));
+            }
         }
         let out = out.trim_end_matches('\n').to_string();
         return Ok(cap_utf8(out, MAX_READ_BYTES));
@@ -192,9 +263,16 @@ pub fn search_cancellable(
         .get("pattern")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'pattern'"))?;
+    let max_hits = args
+        .get("max_results")
+        .and_then(Value::as_u64)
+        .map(|n| (n as usize).clamp(1, 200))
+        .unwrap_or(MAX_SEARCH_HITS);
     let mut matches = Vec::new();
+    let mut overflow = 0usize;
     let glob_set = globset_lite(pattern)?;
     for entry in walkdir::WalkDir::new(workspace)
+        .sort_by_file_name()
         .into_iter()
         .filter_entry(|e| !is_ignored(e))
         .filter_map(|e| e.ok())
@@ -207,15 +285,21 @@ pub fn search_cancellable(
             let rel = entry.path().strip_prefix(workspace).unwrap_or(entry.path());
             let rel_str = rel.to_string_lossy().replace('\\', "/");
             if glob_set(&rel_str) {
-                matches.push(rel_str);
-                if matches.len() >= 100 {
-                    break;
+                if matches.len() < max_hits {
+                    matches.push(rel_str);
+                } else {
+                    overflow += 1;
                 }
             }
         }
     }
     if matches.is_empty() {
         return Ok("no matches".into());
+    }
+    if overflow > 0 {
+        matches.push(format!(
+            "...[capped at {max_hits} hits (+{overflow} more); narrow your pattern]"
+        ));
     }
     Ok(matches.join("\n"))
 }
@@ -247,7 +331,6 @@ pub(crate) fn globset_lite(pattern: &str) -> Result<impl Fn(&str) -> bool> {
     while i < chars.len() {
         if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
             if i + 2 < chars.len() && chars[i + 2] == '/' {
-                // `**/` matches zero or more directory segments.
                 regex.push_str("(?:.*/)?");
                 i += 3;
             } else {
@@ -301,6 +384,52 @@ mod tests {
 
         let past = read_file(&ws, &json!({"path": "nums.txt", "offset": 99})).unwrap();
         assert!(past.contains("past end of file"), "{past}");
+    }
+
+    #[test]
+    fn aci_100_line_default_hashlines_and_repeated_read_suppression() {
+        let ws = tempdir();
+        let body: String = (1..=140).map(|i| format!("line-{i}\n")).collect();
+        write_file(&ws, &json!({"path": "big.txt", "content": body})).unwrap();
+
+        let cache = ReadCache::new();
+        let first = read_file_cached(
+            &ws,
+            &json!({"path": "big.txt", "offset": 1, "hashlines": true}),
+            Some(&cache),
+        )
+        .unwrap();
+        assert!(first.starts_with("[big.txt: lines 1-100 of 140]"), "{first}");
+        assert!(first.contains("1#"), "{first}");
+        assert!(!first.contains("101#"), "default view must cap at 100 lines");
+
+        // Second identical read is suppressed with a short pointer.
+        let second = read_file_cached(
+            &ws,
+            &json!({"path": "big.txt", "offset": 1, "hashlines": true}),
+            Some(&cache),
+        )
+        .unwrap();
+        assert!(second.starts_with("[unchanged since last read: big.txt"), "{second}");
+
+        // Force bypasses suppression.
+        let forced = read_file_cached(
+            &ws,
+            &json!({"path": "big.txt", "offset": 1, "hashlines": true, "force": true}),
+            Some(&cache),
+        )
+        .unwrap();
+        assert!(forced.starts_with("[big.txt: lines 1-100 of 140]"));
+    }
+
+    #[test]
+    fn search_summarizes_at_50_hits() {
+        let ws = tempdir();
+        for i in 0..60 {
+            write_file(&ws, &json!({"path": format!("f{i:02}.rs"), "content": ""})).unwrap();
+        }
+        let out = search(&ws, &json!({"pattern": "**/*.rs"})).unwrap();
+        assert!(out.contains("capped at 50 hits (+10 more)"), "{out}");
     }
 
     #[test]

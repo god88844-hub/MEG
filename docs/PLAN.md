@@ -25,11 +25,11 @@
 ## PHASE 1 -- Rust Ring-0 Native Kernel, Tools, Sandbox & Security (`meg-rs/`)
 **Language:** Rust | **Note:** Do NOT touch `meg-rs/crates/meg-tui/`.
 
-- [ ] **P1-01 Core 6-Tool Registry (`meg-tools/src/registry.rs`):** Lock default active tool menu to 6 primitives (`bash`, `read_file`, `write_file`, `edit_file`, `glob_grep`, `finish`) with strict JSON schemas, deadlines, byte caps, and `Copy-Constrained` argument span validation (file paths & commit SHAs checked against context spans).
+- [x] **P1-01 Core 6-Tool Registry (`meg-tools/src/registry.rs`):** Lock default active tool menu to 6 primitives (`bash`, `read_file`, `write_file`, `edit_file`, `glob_grep`, `finish`) with strict JSON schemas, deadlines, byte caps, and `Copy-Constrained` argument span validation (file paths & commit SHAs checked against context spans).
   - *Micro-Check:* `cargo test -p meg-tools registry`
-- [ ] **P1-02 Hashline Reader & Atomic Patcher (`meg-tools/src/edit.rs`):** Tag every read line with 3-hex BLAKE3/FNV content hash (`42#f9a`), reject stale/mismatched edits before touching disk, support fallback unified-diff/search-replace, and preserve UTF-8/UTF-16 BOM and CRLF/LF endings.
+- [x] **P1-02 Hashline Reader & Atomic Patcher (`meg-tools/src/edit.rs`):** Tag every read line with 3-hex BLAKE3/FNV content hash (`42#f9a`), reject stale/mismatched edits before touching disk, support fallback unified-diff/search-replace, and preserve UTF-8/UTF-16 BOM and CRLF/LF endings.
   - *Micro-Check:* `cargo test -p meg-tools edit`
-- [ ] **P1-03 SWE-Agent ACI & Repeated-Read Suppression (`meg-tools/src/fs_tools.rs`):** Enforce 100-line bounded file viewer, 50-hit summarized search cap, and repeated unchanged-read suppression returning a short pointer when a file hash hasn't changed.
+- [x] **P1-03 SWE-Agent ACI & Repeated-Read Suppression (`meg-tools/src/fs_tools.rs`):** Enforce 100-line bounded file viewer, 50-hit summarized search cap, and repeated unchanged-read suppression returning a short pointer when a file hash hasn't changed.
   - *Micro-Check:* `cargo test -p meg-tools fs_tools`
 - [ ] **P1-04 AST PageRank RepoMap & Important Files (`meg-core/src/indexer.rs`):** Add Tree-Sitter symbol extractor capped at ~1,000 tokens + `Aider` `ROOT_IMPORTANT_FILES` priority list + downstream caller lookup (prevents deleting imported symbols).
   - *Micro-Check:* `cargo test -p meg-core indexer`

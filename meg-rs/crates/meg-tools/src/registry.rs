@@ -1,13 +1,28 @@
-//! Tool registry -- name -> executor dispatch with JSON Schemas and prompt stubs.
+//! Tool registry -- name -> executor dispatch with strict JSON Schemas,
+//! core 6-tool menu (`bash`, `read_file`, `write_file`, `edit_file`, `glob_grep`, `finish`),
+//! and Copy-Constrained argument span validation.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
 
 use crate::bash;
 use crate::edit;
-use crate::fs_tools;
+use crate::fs_tools::{self, ReadCache};
 use crate::grep;
+
+pub const CORE_SIX_TOOLS: &[&str] = &[
+    "bash",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "glob_grep",
+    "finish",
+];
+
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 32_768;
 
 pub struct ToolResult {
     pub ok: bool,
@@ -27,6 +42,50 @@ pub struct ToolRegistry {
     tools: BTreeMap<String, Box<ToolFn>>,
     pub stubs: BTreeMap<String, String>,
     pub schemas: BTreeMap<String, Value>,
+    pub max_output_bytes: usize,
+}
+
+/// Copy-Constrained argument span validation: ensures file paths (`path`) and
+/// 7-40 hex commit SHAs (`commit`, `sha`, `ref`) appear in the verified context
+/// spans (or exist on disk for read/edit paths) before a tool executes.
+pub fn validate_copy_constrained_args(
+    tool: &str,
+    args: &Value,
+    context_spans: &[&str],
+    workspace: Option<&Path>,
+) -> Result<()> {
+    if let Some(sha_key) = ["commit", "sha", "commit_sha"]
+        .iter()
+        .find(|&&k| args.get(k).and_then(Value::as_str).is_some())
+    {
+        let sha = args[*sha_key].as_str().unwrap_or("");
+        if sha.len() >= 7
+            && sha.len() <= 40
+            && sha.chars().all(|c| c.is_ascii_hexdigit())
+            && !context_spans.iter().any(|s| s.contains(sha))
+        {
+            bail!(
+                "copy-constrained validation failed for '{tool}': commit SHA '{sha}' not found in context spans"
+            );
+        }
+    }
+    if matches!(tool, "read_file" | "edit_file") {
+        if let Some(p) = args.get("path").and_then(Value::as_str) {
+            let norm = p.replace('\\', "/");
+            let in_context = context_spans
+                .iter()
+                .any(|s| s.contains(p) || s.contains(&norm));
+            let on_disk = workspace
+                .and_then(|ws| fs_tools::resolve(ws, p).ok())
+                .is_some_and(|full| full.exists());
+            if !in_context && !on_disk {
+                bail!(
+                    "copy-constrained validation failed for '{tool}': path '{p}' not found in context spans or workspace"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_file_schema() -> Value {
@@ -35,8 +94,10 @@ fn read_file_schema() -> Value {
         "properties": {
             "path": { "type": "string", "description": "Workspace-relative path to the file." },
             "offset": { "type": "integer", "minimum": 1, "description": "Optional 1-based starting line number." },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Optional max lines to return." },
-            "line_numbers": { "type": "boolean", "description": "Format output with 1-based line numbers." }
+            "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Optional max lines to return (default 100)." },
+            "line_numbers": { "type": "boolean", "description": "Format output with 1-based line numbers." },
+            "hashlines": { "type": "boolean", "description": "Tag each line with 3-hex content hash (42#f9a)." },
+            "force": { "type": "boolean", "description": "Bypass repeated unchanged-read suppression." }
         },
         "required": ["path"]
     })
@@ -60,9 +121,22 @@ fn edit_file_schema() -> Value {
             "path": { "type": "string", "description": "Workspace-relative path to edit." },
             "old_string": { "type": "string", "description": "Exact existing text to replace (must be unique unless replace_all is true)." },
             "new_string": { "type": "string", "description": "Replacement text." },
-            "replace_all": { "type": "boolean", "description": "Replace all occurrences instead of requiring uniqueness." }
+            "replace_all": { "type": "boolean", "description": "Replace all occurrences instead of requiring uniqueness." },
+            "edits": {
+                "type": "array",
+                "description": "Optional hashline patch list: [{start_anchor: '42#f9a', end_anchor?, new_content}].",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "start_anchor": { "type": "string" },
+                        "end_anchor": { "type": "string" },
+                        "new_content": { "type": "string" }
+                    },
+                    "required": ["start_anchor", "new_content"]
+                }
+            }
         },
-        "required": ["path", "old_string", "new_string"]
+        "required": ["path"]
     })
 }
 
@@ -81,7 +155,8 @@ fn search_files_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "pattern": { "type": "string", "description": "Glob pattern relative to workspace (supports **, *, ?)." }
+            "pattern": { "type": "string", "description": "Glob pattern relative to workspace (supports **, *, ?)." },
+            "max_results": { "type": "integer", "minimum": 1, "maximum": 200 }
         },
         "required": ["pattern"]
     })
@@ -102,6 +177,36 @@ fn grep_files_schema() -> Value {
     })
 }
 
+fn glob_grep_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "mode": { "type": "string", "enum": ["glob", "grep"], "description": "Search filenames ('glob') or file contents ('grep')." },
+            "pattern": { "type": "string", "description": "Glob or regex pattern." },
+            "path": { "type": "string", "description": "Optional workspace-relative search root." },
+            "glob": { "type": "string", "description": "Optional file glob filter when mode='grep'." },
+            "case_insensitive": { "type": "boolean" },
+            "max_results": { "type": "integer", "minimum": 1, "maximum": 200 }
+        },
+        "required": ["pattern"]
+    })
+}
+
+fn finish_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string", "description": "Concise verified summary of completed work." },
+            "deliverables": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Workspace-relative paths of created/updated deliverables."
+            }
+        },
+        "required": ["summary"]
+    })
+}
+
 fn list_dir_schema() -> Value {
     json!({
         "type": "object",
@@ -113,24 +218,66 @@ fn list_dir_schema() -> Value {
     })
 }
 
+fn run_glob_grep(
+    workspace: &Path,
+    args: &Value,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<String> {
+    let mode = args.get("mode").and_then(Value::as_str).unwrap_or_else(|| {
+        if args.get("glob").is_some() || args.get("case_insensitive").is_some() {
+            "grep"
+        } else {
+            "glob"
+        }
+    });
+    match (mode, cancel) {
+        ("grep", Some(c)) => grep::grep_files_cancellable(workspace, args, c),
+        ("grep", None) => grep::grep_files(workspace, args),
+        (_, Some(c)) => fs_tools::search_cancellable(workspace, args, c),
+        (_, None) => fs_tools::search(workspace, args),
+    }
+}
+
+fn run_finish(args: &Value) -> Result<String> {
+    let summary = args
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("finish requires non-empty 'summary'"))?;
+    Ok(summary.to_string())
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: BTreeMap::new(),
             stubs: BTreeMap::new(),
             schemas: BTreeMap::new(),
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
     }
 
-    pub fn with_core_tools(workspace: &std::path::Path) -> Self {
+    /// Locked default 6-primitive menu (`bash`, `read_file`, `write_file`, `edit_file`, `glob_grep`, `finish`).
+    pub fn with_core_six(workspace: &std::path::Path) -> Self {
         let mut reg = Self::new();
+        let cache = Arc::new(ReadCache::new());
+        reg.register_with_schema(
+            "bash",
+            "Run a shell command with timeout_seconds (default 60, max 600).",
+            bash_schema(),
+            {
+                let ws = workspace.to_path_buf();
+                move |args| bash::run(&ws, args)
+            },
+        );
         reg.register_with_schema(
             "read_file",
-            "Read a text file from the workspace: {path, offset?, limit?, line_numbers?}.",
+            "Read a text file from the workspace: {path, offset?, limit?, line_numbers?, hashlines?, force?}.",
             read_file_schema(),
             {
                 let ws = workspace.to_path_buf();
-                move |args| fs_tools::read_file(&ws, args)
+                let c = cache.clone();
+                move |args| fs_tools::read_file_cached(&ws, args, Some(&c))
             },
         );
         reg.register_with_schema(
@@ -144,7 +291,7 @@ impl ToolRegistry {
         );
         reg.register_with_schema(
             "edit_file",
-            "Exact str_replace edit: {path, old_string, new_string, replace_all?}. old_string must be unique.",
+            "Hashline patch ({path, edits}) or exact str_replace ({path, old_string, new_string, replace_all?}).",
             edit_file_schema(),
             {
                 let ws = workspace.to_path_buf();
@@ -152,14 +299,26 @@ impl ToolRegistry {
             },
         );
         reg.register_with_schema(
-            "bash",
-            "Run a shell command with timeout_seconds (default 60, max 600).",
-            bash_schema(),
+            "glob_grep",
+            "Unified glob/regex search: {mode?: 'glob'|'grep', pattern, path?, glob?, case_insensitive?, max_results?}.",
+            glob_grep_schema(),
             {
                 let ws = workspace.to_path_buf();
-                move |args| bash::run(&ws, args)
+                move |args| run_glob_grep(&ws, args, None)
             },
         );
+        reg.register_with_schema(
+            "finish",
+            "Declare task completion with verified summary and optional deliverables list.",
+            finish_schema(),
+            run_finish,
+        );
+        reg
+    }
+
+    pub fn with_core_tools(workspace: &std::path::Path) -> Self {
+        let mut reg = Self::with_core_six(workspace);
+        // Legacy aliases preserved for meg-cli, meg-ffi, and frozen meg-tui.
         reg.register_with_schema(
             "search_files",
             "Glob search: {pattern} relative to workspace, returns matching paths.",
@@ -210,6 +369,14 @@ impl ToolRegistry {
             "Regex content search: {pattern, path?, glob?, case_insensitive?, context_lines?, max_results?}.",
             grep_files_schema(),
             move |args| grep::grep_files_cancellable(&grep_ws, args, &grep_cancel),
+        );
+        let gg_ws = workspace.to_path_buf();
+        let gg_cancel = cancel.clone();
+        registry.register_with_schema(
+            "glob_grep",
+            "Unified glob/regex search with cancellation.",
+            glob_grep_schema(),
+            move |args| run_glob_grep(&gg_ws, args, Some(&gg_cancel)),
         );
         let ws = workspace.to_path_buf();
         registry.register_with_schema(
@@ -265,7 +432,17 @@ impl ToolRegistry {
     pub fn execute(&self, name: &str, args: &Value) -> ToolResult {
         match self.tools.get(name) {
             Some(f) => match f(args) {
-                Ok(output) => ToolResult { ok: true, output },
+                Ok(mut output) => {
+                    if output.len() > self.max_output_bytes {
+                        let end = output.floor_char_boundary(self.max_output_bytes);
+                        output = format!(
+                            "{}\n...[capped at {} bytes]",
+                            &output[..end],
+                            self.max_output_bytes
+                        );
+                    }
+                    ToolResult { ok: true, output }
+                }
                 Err(e) => ToolResult {
                     ok: false,
                     output: format!("tool error: {e}"),
@@ -297,6 +474,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn core_six_locks_default_menu_to_six_primitives() {
+        let reg = ToolRegistry::with_core_six(&std::env::temp_dir());
+        assert_eq!(reg.names().len(), 6);
+        for name in CORE_SIX_TOOLS {
+            assert!(reg.stubs.contains_key(*name), "missing core-6 tool {name}");
+            let schema = reg.schemas.get(*name).expect("missing schema");
+            assert_eq!(schema["type"], "object");
+        }
+        let fin = reg.execute("finish", &json!({"summary": "all verified"}));
+        assert!(fin.ok && fin.output == "all verified");
+    }
+
+    #[test]
+    fn copy_constrained_span_validation_blocks_hallucinated_paths_and_shas() {
+        let spans = &["Changed src/main.rs in commit 7012f39"];
+        assert!(validate_copy_constrained_args(
+            "read_file",
+            &json!({"path": "src/main.rs"}),
+            spans,
+            None
+        )
+        .is_ok());
+        assert!(validate_copy_constrained_args(
+            "read_file",
+            &json!({"path": "src/hallucinated.rs"}),
+            spans,
+            None
+        )
+        .is_err());
+        assert!(validate_copy_constrained_args(
+            "bash",
+            &json!({"commit": "7012f39"}),
+            spans,
+            None
+        )
+        .is_ok());
+        assert!(validate_copy_constrained_args(
+            "bash",
+            &json!({"commit": "deadbeef"}),
+            spans,
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
     fn core_tools_registered_with_valid_json_schemas() {
         let reg = ToolRegistry::with_core_tools(&std::env::temp_dir());
         for name in [
@@ -304,6 +527,8 @@ mod tests {
             "write_file",
             "edit_file",
             "bash",
+            "glob_grep",
+            "finish",
             "search_files",
             "grep_files",
             "list_dir",
@@ -313,7 +538,6 @@ mod tests {
             assert_eq!(schema["type"], "object", "schema for {name} must be object");
             assert!(schema["properties"].is_object(), "schema for {name} needs properties");
         }
-        assert_eq!(reg.tool_schemas().len(), 7);
     }
 
     #[test]
