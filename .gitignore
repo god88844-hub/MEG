@@ -1,0 +1,12 @@
+/meg-rs/target/
+/meg-plane/node_modules/
+/meg-plane/dist/
+/dist/
+**/.meg/
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

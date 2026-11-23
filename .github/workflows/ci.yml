@@ -1,0 +1,48 @@
+name: Native CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolate runtime configuration
+        run: '"MEG_CONFIG_DIR=$env:RUNNER_TEMP\meg-test-config" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+      - name: Export GNU linker
+        shell: msys2 {0}
+        run: cygpath -w /mingw64/bin >> "$GITHUB_PATH"
+      - name: Install native Rust toolchain
+        run: rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+      - name: Rust tests
+        working-directory: meg-rs
+        run: cargo test --locked --workspace
+      - name: Native release build
+        working-directory: meg-rs
+        run: cargo build --locked --release --workspace
+      - name: Install control-plane dependencies
+        working-directory: meg-plane
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Bun tests and real native bridge
+        working-directory: meg-plane
+        run: bun test --timeout 20000
+      - name: Bundle control plane
+        working-directory: meg-plane
+        run: bun build src/index.ts --target=bun --outfile=dist/plane.js
+      - name: Check native command
+        run: ./meg-rs/target/release/meg.exe --version

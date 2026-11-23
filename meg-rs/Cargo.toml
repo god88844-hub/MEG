@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/meg-core",
+    "crates/meg-tools",
+    "crates/meg-tui",
+    "crates/meg-cli",
+    "crates/meg-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+ratatui = "0.29"
+crossterm = "0.28"
+tracing = "0.1"
+walkdir = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = true
