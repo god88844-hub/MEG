@@ -82,18 +82,18 @@ Goal: Upgrade model protocol from prompt-hacked JSON to native structured tool c
 ## Phase 4 — Wire Unwired Harness Guards & Upgrade Agent Loop
 Goal: Connect existing built-in harness modules (`indexer`, `truncate`, `finish_hook`, `DeliverableGuard`) into the live loop and harden long-horizon execution.
 
-- [ ] **4.1 Auto-inject Turn 1 `<workspace_map>`** (`meg-rs/crates/meg-core/src/lib.rs`, `meg-cli/src/main.rs`)
+- [x] **4.1 Auto-inject Turn 1 `<workspace_map>`** (`meg-rs/crates/meg-core/src/lib.rs`, `meg-cli/src/main.rs`)
   - Pass workspace root cleanly into the loop (instead of relying on unset `MEG_INDEX_DIR`) so Turn 1 always starts with repo recon.
-- [ ] **4.2 Enforce `truncate_observation` on all tool outputs** (`meg-rs/crates/meg-core/src/lib.rs`)
+- [x] **4.2 Enforce `truncate_observation` on all tool outputs** (`meg-rs/crates/meg-core/src/lib.rs`)
   - Bound every single tool, batch, MCP, skill, and delegate observation while preserving critical error lines.
-- [ ] **4.3 Wire `DeliverableGuard` & `finish_hook`** (`meg-rs/crates/meg-core/src/lib.rs`, `meg-cli/src/main.rs`)
+- [x] **4.3 Wire `DeliverableGuard` & `finish_hook`** (`meg-rs/crates/meg-core/src/lib.rs`, `meg-cli/src/main.rs`)
   - Guard verified deliverables against accidental overwrite/destructive bash and run conditioned `evaluate_finish` before accepting `Action::Final`.
-- [ ] **4.4 Concurrent read-only `Action::Batch` execution** (`meg-rs/crates/meg-core/src/lib.rs`)
+- [x] **4.4 Concurrent read-only `Action::Batch` execution** (`meg-rs/crates/meg-core/src/lib.rs`)
   - Execute read-only tools (`read_file`, `search_files`, `grep_files`, `list_dir`, `read_skill`) in parallel inside a batch; keep mutating tools (`write_file`, `edit_file`, `bash`) strictly sequential.
-- [ ] **4.5 Doom-loop detection & auto-compaction** (`meg-rs/crates/meg-core/src/lib.rs`, `meg-cli/src/main.rs`)
+- [x] **4.5 Doom-loop detection & auto-compaction** (`meg-rs/crates/meg-core/src/lib.rs`, `meg-cli/src/main.rs`)
   - Detect repeated identical failing tool calls and inject a corrective nudge instead of burning turns.
   - Add configurable `max_steps` (default 40 instead of hardcoded 20) and automatic mid-run transcript trimming/compaction when message char budget exceeds threshold.
-- [ ] **4.6 Phase 4 Gate**: Full Rust + Bun tests and release build green; commit & push.
+- [x] **4.6 Phase 4 Gate**: Full Rust + Bun tests and release build green; commit & push.
 
 ---
 

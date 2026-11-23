@@ -29,6 +29,7 @@ struct ShimEngine {
     cancel: meg_core::CancellationToken,
     mode: meg_tui::Mode,
     next_tool: std::sync::atomic::AtomicUsize,
+    guard: Arc<std::sync::Mutex<meg_tools::deliverable_guard::DeliverableGuard>>,
 }
 impl ShimEngine {
     fn emit(&self, msg: RunnerMsg) {
@@ -98,6 +99,7 @@ impl LoopEngine for ShimEngine {
         let worker = self.worker.clone();
         let read_only = self.mode == meg_tui::Mode::Plan;
         let events = self.tx.clone();
+        let guard = self.guard.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<meg_tools::ToolResult> {
             anyhow::ensure!(!cancel.is_cancelled(), "Run cancelled");
             if connected{
@@ -106,6 +108,26 @@ impl LoopEngine for ShimEngine {
                 let value=plane.call_with_events(method,params,&cancel,|event|forward_agent_event(&events,event))?;
                 if name=="delegate"{if let Some(tx)=&events{let _=tx.send(RunnerMsg::DelegatedUsage(value["usage"].clone()));}}
                 return Ok(meg_tools::ToolResult{ok:true,output:if let Some(answer)=value["answer"].as_str(){answer.to_string()}else{serde_json::to_string(&value)?}});
+            }
+            let unlock = args["unlock_deliverable"].as_bool().unwrap_or(false);
+            if matches!(name.as_str(), "write_file" | "edit_file") {
+                if let Some(raw_path) = args["path"].as_str() {
+                    if let Ok(resolved) = meg_tools::fs_tools::resolve(&workspace, raw_path) {
+                        let mut g = guard.lock().unwrap();
+                        if unlock {
+                            g.unlock_deliverable(&resolved);
+                        } else if let Some(blocked) = g.check_write(&resolved) {
+                            return Ok(meg_tools::ToolResult { ok: false, output: blocked });
+                        }
+                    }
+                }
+            } else if name == "bash" && !unlock {
+                if let Some(cmd) = args.get("command").or_else(|| args.get("cmd")).and_then(|v| v.as_str()) {
+                    let g = guard.lock().unwrap();
+                    if let Some(blocked) = g.check_bash(cmd) {
+                        return Ok(meg_tools::ToolResult { ok: false, output: blocked });
+                    }
+                }
             }
             let checkpoint = if matches!(name.as_str(), "write_file" | "edit_file") {
                 Some(meg_tools::journal::FileCheckpoint::capture(
@@ -120,6 +142,25 @@ impl LoopEngine for ShimEngine {
                     checkpoint.commit(&workspace).map_err(|e| {
                         anyhow::anyhow!("File changed but undo journal could not be saved: {e}")
                     })?;
+                }
+                if name == "bash" {
+                    let cmd = args
+                        .get("command")
+                        .or_else(|| args.get("cmd"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if is_verification_command(cmd) {
+                        let mut g = guard.lock().unwrap();
+                        let targets: Vec<std::path::PathBuf> = g.target_paths.iter().cloned().collect();
+                        for target in targets {
+                            if target.is_file()
+                                && meg_core::finish_hook::local_deliverable_check(std::slice::from_ref(&target)).is_empty()
+                                && meg_tools::deliverable_guard::deep_artifact_sanity(&workspace, std::slice::from_ref(&target)).is_ok()
+                            {
+                                g.lock_verified_deliverable(&target);
+                            }
+                        }
+                    }
                 }
             }
             Ok(result)
@@ -610,6 +651,27 @@ async fn run_request_with_plane(
         request.cancel.0.clone(),
     ));
     shim.tools = build_tool_specs(&registry, request.mode, &catalog, plane.is_some());
+    let max_steps = default_max_steps();
+    let targets = extract_finish_deliverables(&request.workspace, &request.goal, request.mode);
+    let mut deliverable_guard =
+        meg_tools::deliverable_guard::DeliverableGuard::from_goal(&request.workspace, &request.goal);
+    deliverable_guard.target_paths = targets.iter().cloned().collect();
+    let finish_hook = if targets.is_empty() {
+        None
+    } else {
+        Some(meg_core::finish_hook::FinishHookConfig {
+            timeout_budget_secs: 300,
+            max_turns: max_steps as u64,
+            simulated_elapsed_secs: None,
+            target_deliverables: targets,
+        })
+    };
+    let loop_config = meg_core::LoopConfig {
+        max_steps,
+        workspace: Some(request.workspace.clone()),
+        finish_hook,
+        ..meg_core::LoopConfig::default()
+    };
     let engine = ShimEngine {
         plane,
         catalog,
@@ -621,14 +683,95 @@ async fn run_request_with_plane(
         cancel: request.cancel,
         mode: request.mode,
         next_tool: std::sync::atomic::AtomicUsize::new(1),
+        guard: Arc::new(std::sync::Mutex::new(deliverable_guard)),
     };
-    let result =
-        meg_core::run_loop_with_history(&engine, &request.goal, 20, &request.history).await?;
+    let result = meg_core::run_loop_with_config(
+        &engine,
+        &request.goal,
+        &request.history,
+        &loop_config,
+    )
+    .await?;
     anyhow::ensure!(
         result.1.is_some(),
-        "Turn budget exhausted after 20 steps; no final answer was produced"
+        "Turn budget exhausted after {max_steps} steps; no final answer was produced"
     );
     Ok(result)
+}
+
+fn default_max_steps() -> usize {
+    std::env::var("MEG_MAX_STEPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(1, 200))
+        .unwrap_or(40)
+}
+
+fn is_verification_command(cmd: &str) -> bool {
+    let low = cmd.to_ascii_lowercase();
+    [
+        "test", "check", "verify", "pytest", "cargo ", "bun ", "npm ", "gcc ", "clang ",
+        "rustc ", "python", "node ", "go test",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+}
+
+/// Extract explicit deliverable paths only when the goal in Act mode expresses
+/// file creation/editing intent, avoiding false positives on casual prose.
+fn extract_finish_deliverables(
+    workspace: &Path,
+    goal: &str,
+    mode: meg_tui::Mode,
+) -> Vec<std::path::PathBuf> {
+    if mode == meg_tui::Mode::Plan {
+        return Vec::new();
+    }
+    let low = goal.to_ascii_lowercase();
+    let has_write_intent = [
+        "write ", "create ", "save ", "generate ", "produce ", "output ", "implement ",
+        "build ", "edit ", "fix ", "update ", "/app/",
+    ]
+    .iter()
+    .any(|k| low.contains(k));
+    if !has_write_intent {
+        return Vec::new();
+    }
+    const KNOWN_EXTS: &[&str] = &[
+        "rs", "py", "ts", "tsx", "js", "jsx", "c", "h", "cpp", "hpp", "go", "java", "rb",
+        "sh", "ps1", "bat", "cmd", "json", "toml", "yaml", "yml", "md", "txt", "csv",
+        "html", "css", "sql", "scm", "xml", "png", "bmp", "bin", "pt", "pth", "pkl",
+    ];
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in goal.split(|c: char| c.is_whitespace() || c == ',' || c == '"') {
+        let token = raw
+            .trim_matches(|c: char| matches!(c, '`' | '\'' | '(' | ')' | '[' | ']' | ':' | ';' | '?' | '!'))
+            .trim_end_matches('.');
+        if token.is_empty() || token.contains("://") {
+            continue;
+        }
+        let candidate = if let Some(rest) = token.strip_prefix("/app/") {
+            rest
+        } else {
+            token
+        };
+        if candidate.is_empty() || !candidate.contains('.') {
+            continue;
+        }
+        let Some(ext) = candidate.rsplit('.').next() else {
+            continue;
+        };
+        if !KNOWN_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        if let Ok(resolved) = meg_tools::fs_tools::resolve(workspace, candidate) {
+            if seen.insert(resolved.clone()) {
+                out.push(resolved);
+            }
+        }
+    }
+    out
 }
 fn build_tool_specs(
     registry: &ToolRegistry,
@@ -1209,6 +1352,9 @@ mod native_integration {
     async fn plan_mode_enforces_read_only_tools_at_execution_boundary() {
         let server = fixture().await;
         let request = request(&server);
+        let guard = Arc::new(std::sync::Mutex::new(
+            meg_tools::deliverable_guard::DeliverableGuard::from_goal(&request.workspace, "plan"),
+        ));
         let engine = ShimEngine {
             plane: None,
             catalog: serde_json::json!({}),
@@ -1220,6 +1366,7 @@ mod native_integration {
             cancel: request.cancel,
             mode: meg_tui::Mode::Plan,
             next_tool: std::sync::atomic::AtomicUsize::new(1),
+            guard,
         };
         for name in ["bash", "write_file", "edit_file"] {
             assert!(engine
@@ -1308,6 +1455,145 @@ mod native_integration {
                     && m["tool_call_id"] == "call_read_1"
                     && m["content"].as_str().unwrap_or("").contains("secret-value-42")),
             "second request must include tool_call_id result: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn turn_one_injects_workspace_map_and_finish_hook_recovers_missing_deliverable() {
+        let server = fixture().await;
+        let ws = std::env::temp_dir().join(format!("meg-cli-p4-fh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("seed.rs"), "pub fn seed_fn() {}\n").unwrap();
+
+        // Turn 0: model prematurely claims final without writing output.txt.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"final\":\"done early\"}" } }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Turn 1 (after finish_hook reprompt): model writes output.txt.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_w1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"path\":\"output.txt\",\"content\":\"verified deliverable\"}"
+                            }
+                        }]
+                    }
+                }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Turn 2: model finishes cleanly.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "output.txt created and verified" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let state = WorkstationState {
+            cwd: ws.to_string_lossy().into_owned(),
+            model: "fixture".into(),
+            ..Default::default()
+        };
+        let mut req = state.run_request("Create output.txt with verified deliverable".into());
+        req.base_url = format!("{}/v1", server.uri());
+
+        let (_outcomes, answer) = run_request(req, None).await.unwrap();
+        assert_eq!(answer.as_deref(), Some("output.txt created and verified"));
+        assert_eq!(
+            std::fs::read_to_string(ws.join("output.txt")).unwrap(),
+            "verified deliverable"
+        );
+
+        let posts: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == "POST")
+            .collect();
+        assert_eq!(posts.len(), 3);
+        let first_body: serde_json::Value = posts[0].body_json().unwrap();
+        let goal_msg = first_body["messages"][1]["content"].as_str().unwrap_or("");
+        assert!(goal_msg.contains("<workspace_map"), "missing workspace map: {goal_msg}");
+        assert!(goal_msg.contains("seed.rs"), "missing seed.rs in map: {goal_msg}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn deliverable_guard_locks_verified_file_and_allows_explicit_unlock() {
+        let server = fixture().await;
+        let ws = std::env::temp_dir().join(format!("meg-cli-p4-dg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        let target = meg_tools::fs_tools::resolve(&ws, "deliverable.txt").unwrap();
+        let mut guard =
+            meg_tools::deliverable_guard::DeliverableGuard::from_goal(&ws, "Create deliverable.txt");
+        guard.target_paths = [target.clone()].into_iter().collect();
+
+        let engine = ShimEngine {
+            plane: None,
+            catalog: serde_json::json!({}),
+            worker: serde_json::json!({}),
+            shim: ShimClient::with(format!("{}/v1", server.uri()), "fixture".into()),
+            registry: Arc::new(ToolRegistry::with_core_tools(&ws)),
+            tx: None,
+            workspace: ws.clone(),
+            cancel: meg_core::CancellationToken::default(),
+            mode: meg_tui::Mode::default(),
+            next_tool: std::sync::atomic::AtomicUsize::new(1),
+            guard: Arc::new(std::sync::Mutex::new(guard)),
+        };
+
+        engine
+            .execute_tool(
+                "write_file",
+                &json!({"path": "deliverable.txt", "content": "v1 valid content"}),
+            )
+            .await
+            .unwrap();
+        // Passing verification command locks verified deliverable.
+        engine
+            .execute_tool("bash", &json!({"command": "echo verify ok"}))
+            .await
+            .unwrap();
+        // Subsequent overwrite without unlock_deliverable is blocked.
+        let blocked = engine
+            .execute_tool(
+                "write_file",
+                &json!({"path": "deliverable.txt", "content": "accidental clobber"}),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(blocked.contains("LOCKED"), "{blocked}");
+        // Explicit unlock allows modification.
+        engine
+            .execute_tool(
+                "write_file",
+                &json!({"path": "deliverable.txt", "content": "v2 intentional", "unlock_deliverable": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "v2 intentional"
         );
         let _ = std::fs::remove_dir_all(&ws);
     }
