@@ -100,13 +100,13 @@ Goal: Connect existing built-in harness modules (`indexer`, `truncate`, `finish_
 ## Phase 5 — Control Plane & Delegation Hardening
 Goal: Make Bun control plane state durable and Windows worker lifecycle leak-free.
 
-- [ ] **5.1 Persistent `SessionTree` storage** (`meg-plane/src/session-tree.ts`, `index.ts`)
+- [x] **5.1 Persistent `SessionTree` storage** (`meg-plane/src/session-tree.ts`, `index.ts`)
   - Persist session tree nodes/branches atomically under `.meg/sessions/` and reload on resume/fork.
-- [ ] **5.2 Windows process-tree cleanup in `AgentManager`** (`meg-plane/src/agents.ts`)
+- [x] **5.2 Windows process-tree cleanup in `AgentManager`** (`meg-plane/src/agents.ts`)
   - Ensure worker timeout/abort kills the full child process tree on Windows (`taskkill /PID <pid> /T /F`) so no orphan workers survive.
-- [ ] **5.3 Structured delegate progress & router sync** (`meg-plane/src/agents.ts`, `router.ts`, `index.ts`)
+- [x] **5.3 Structured delegate progress & router sync** (`meg-plane/src/agents.ts`, `router.ts`, `index.ts`)
   - Emit structured worker turn/elapsed updates and allow `ModelRouter` to sync configured profiles without inventing fake cloud availability.
-- [ ] **5.4 Phase 5 Gate**: Full Rust + Bun tests and release build green; commit & push.
+- [x] **5.4 Phase 5 Gate**: Full Rust + Bun tests and release build green; commit & push.
 
 ---
 
