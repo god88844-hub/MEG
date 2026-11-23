@@ -10,6 +10,7 @@ pub mod provider_catalog;
 pub mod providers;
 pub mod shim_client;
 pub use cancel::CancellationToken;
+pub use shim_client::{NativeToolCall, ToolSpec};
 pub mod finish_hook;
 pub mod indexer;
 pub mod json_repair;
@@ -357,25 +358,46 @@ pub async fn run_loop_with_history(
                 });
             }
             Action::Batch { calls, .. } => {
+                let native = crate::shim_client::extract_native_tool_calls(&raw);
                 let mut collected = String::new();
                 let mut ok = true;
+                let mut per_call_results: Vec<(bool, String)> = Vec::with_capacity(calls.len());
                 for (tool, args) in &calls {
                     if engine.is_cancelled() {
                         anyhow::bail!("Run cancelled");
                     }
                     let result = engine.execute_tool(tool, args).await;
-                    ok &= result.is_ok();
+                    let call_ok = result.is_ok();
+                    ok &= call_ok;
                     let observation = result.unwrap_or_else(|e| format!("tool error: {e}"));
                     collected.push_str(&format!("[{tool}] {observation}\n"));
+                    per_call_results.push((call_ok, observation));
                 }
-                messages.push(ChatMessage {
-                    role: "assistant".into(),
-                    content: raw.clone(),
-                });
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: format!("Observations:\n{collected}\nContinue the original goal and its requested final-answer format."),
-                });
+                if let Some((thought, native_calls)) = native {
+                    messages.push(crate::shim_client::encode_native_tool_calls(
+                        &thought,
+                        &native_calls,
+                    ));
+                    for (call, (call_ok, obs)) in
+                        native_calls.iter().zip(per_call_results.iter())
+                    {
+                        messages.push(crate::shim_client::encode_native_tool_result(
+                            &call.id,
+                            &call.tool,
+                            *call_ok,
+                            obs,
+                        ));
+                    }
+                } else {
+                    messages.push(ChatMessage {
+                        role: "assistant".into(),
+                        content: raw.clone(),
+                    });
+                    messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: format!("Observations:\n{collected}\nContinue the original goal and its requested final-answer format."),
+                    });
+                }
                 outcomes.push(TurnOutcome {
                     action: Action::Batch {
                         thought: String::new(),

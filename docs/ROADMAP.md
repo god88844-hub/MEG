@@ -65,17 +65,17 @@ Goal: Give the agent fast, surgical workspace inspection and safe multi-step rol
 ## Phase 3 — Native Tool Calling, Prompt Caching & Network Resilience
 Goal: Upgrade model protocol from prompt-hacked JSON to native structured tool calling with prompt caching and retry backoff.
 
-- [ ] **3.1 Tool JSON Schema definitions** (`meg-rs/crates/meg-tools/src/registry.rs`, `meg-core/src/lib.rs`)
+- [x] **3.1 Tool JSON Schema definitions** (`meg-rs/crates/meg-tools/src/registry.rs`, `meg-core/src/lib.rs`)
   - Attach structured JSON Schema definitions alongside each tool in `ToolRegistry` (plus MCP/builtin schemas).
-- [ ] **3.2 Native tool-calling payloads in `ShimClient`** (`meg-rs/crates/meg-core/src/shim_client.rs`)
+- [x] **3.2 Native tool-calling payloads in `ShimClient`** (`meg-rs/crates/meg-core/src/shim_client.rs`)
   - Send OpenAI `tools` (`type: "function"`) and Anthropic `tools` (`input_schema`) when enabled, preserving `tool_call_id` / `tool_use_id` in message history.
   - Keep automatic text-JSON protocol fallback for local/smaller models or endpoints that reject `tools`.
-- [ ] **3.3 Anthropic prompt caching (`cache_control`)** (`meg-rs/crates/meg-core/src/shim_client.rs`)
+- [x] **3.3 Anthropic prompt caching (`cache_control`)** (`meg-rs/crates/meg-core/src/shim_client.rs`)
   - Emit structured `system` blocks and last-turn breakpoint with `cache_control: {"type": "ephemeral"}` on Anthropic requests so cached token savings actually activate.
-- [ ] **3.4 Retry & backoff on `429` / transient `5xx`** (`meg-rs/crates/meg-core/src/shim_client.rs`)
+- [x] **3.4 Retry & backoff on `429` / transient `5xx`** (`meg-rs/crates/meg-core/src/shim_client.rs`)
   - Respect `Retry-After` header (capped), exponential backoff with jitter, and immediate cancellation via `CancellationToken`.
   - Add `wiremock` regression tests for native tool schemas, Anthropic `cache_control`, and `429` retry + cancellation.
-- [ ] **3.5 Phase 3 Gate**: Full Rust + Bun tests and release build green; commit & push.
+- [x] **3.5 Phase 3 Gate**: Full Rust + Bun tests and release build green; commit & push.
 
 ---
 

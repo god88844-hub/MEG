@@ -8,4 +8,4 @@ pub mod grep;
 pub mod journal;
 pub mod registry;
 
-pub use registry::{ToolRegistry, ToolResult};
+pub use registry::{ToolRegistry, ToolResult, ToolSchema};

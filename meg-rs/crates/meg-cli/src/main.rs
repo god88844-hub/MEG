@@ -237,7 +237,7 @@ impl LoopEngine for ShimEngine {
                 cached,
             }),
         };
-        let result = tokio::select! {result=self.shim.chat_stream(&messages,&mut callback)=>result,_=self.cancel.cancelled()=>anyhow::bail!("Run cancelled")};
+        let result = self.shim.chat_stream_cancellable(&messages, Some(&self.cancel), &mut callback).await;
         self.emit(RunnerMsg::Online(result.is_ok()));
         result
     }
@@ -605,15 +605,17 @@ async fn run_request_with_plane(
             }
         }
     }
+    let registry = Arc::new(ToolRegistry::with_cancellation(
+        &request.workspace,
+        request.cancel.0.clone(),
+    ));
+    shim.tools = build_tool_specs(&registry, request.mode, &catalog, plane.is_some());
     let engine = ShimEngine {
         plane,
         catalog,
         worker,
         shim,
-        registry: Arc::new(ToolRegistry::with_cancellation(
-            &request.workspace,
-            request.cancel.0.clone(),
-        )),
+        registry,
         tx,
         workspace: request.workspace,
         cancel: request.cancel,
@@ -628,6 +630,94 @@ async fn run_request_with_plane(
     );
     Ok(result)
 }
+fn build_tool_specs(
+    registry: &ToolRegistry,
+    mode: meg_tui::Mode,
+    catalog: &serde_json::Value,
+    has_plane: bool,
+) -> Vec<meg_core::ToolSpec> {
+    let mut specs: Vec<meg_core::ToolSpec> = registry
+        .tool_schemas()
+        .into_iter()
+        .filter(|s| {
+            mode != meg_tui::Mode::Plan
+                || matches!(
+                    s.name.as_str(),
+                    "read_file" | "search_files" | "grep_files" | "list_dir"
+                )
+        })
+        .map(|s| meg_core::ToolSpec {
+            name: s.name,
+            description: s.description,
+            parameters: s.parameters,
+        })
+        .collect();
+    specs.push(meg_core::ToolSpec {
+        name: "todo".into(),
+        description: "Update the task checklist: {items: [{text, done}]}.".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": { "type": "string" },
+                            "done": { "type": "boolean" }
+                        },
+                        "required": ["text", "done"]
+                    }
+                }
+            },
+            "required": ["items"]
+        }),
+    });
+    if has_plane {
+        specs.push(meg_core::ToolSpec {
+            name: "read_skill".into(),
+            description: "Load full SKILL.md instructions for an installed skill.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": ["name"]
+            }),
+        });
+        specs.push(meg_core::ToolSpec {
+            name: "delegate".into(),
+            description: "Run a read-only planner, researcher or reviewer in a separate native worker.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role": { "type": "string", "enum": ["planner", "researcher", "reviewer"] },
+                    "task": { "type": "string" }
+                },
+                "required": ["role", "task"]
+            }),
+        });
+        if let Some(mcp_tools) = catalog["tools"].as_array() {
+            for t in mcp_tools {
+                if mode == meg_tui::Mode::Plan && t["readOnly"].as_bool() != Some(true) {
+                    continue;
+                }
+                if let Some(alias) = t["alias"].as_str() {
+                    let params = if t["inputSchema"].is_object() {
+                        t["inputSchema"].clone()
+                    } else {
+                        serde_json::json!({ "type": "object", "properties": {} })
+                    };
+                    specs.push(meg_core::ToolSpec {
+                        name: alias.to_string(),
+                        description: t["description"].as_str().unwrap_or(alias).to_string(),
+                        parameters: params,
+                    });
+                }
+            }
+        }
+    }
+    specs
+}
+
 fn forward_agent_event(tx: &Option<Sender<RunnerMsg>>, value: serde_json::Value) {
     if let Some(tx) = tx {
         if let (Some(id), Some(status)) = (value["id"].as_str(), value["status"].as_str()) {
@@ -1150,6 +1240,78 @@ mod native_integration {
             "Task checklist updated"
         );
     }
+    #[tokio::test]
+    async fn native_tool_call_round_trip_preserves_tool_call_id() {
+        let server = fixture().await;
+        let ws = std::env::temp_dir().join(format!("meg-cli-native-tc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("hello.txt"), "secret-value-42").unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_read_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"hello.txt\"}"
+                            }
+                        }]
+                    }
+                }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": { "content": "The file contains secret-value-42" }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let state = WorkstationState {
+            cwd: ws.to_string_lossy().into_owned(),
+            model: "fixture".into(),
+            ..Default::default()
+        };
+        let mut req = state.run_request("Read hello.txt".into());
+        req.base_url = format!("{}/v1", server.uri());
+
+        let (outcomes, answer) = run_request(req, None).await.unwrap();
+        assert_eq!(answer.as_deref(), Some("The file contains secret-value-42"));
+        assert_eq!(outcomes.len(), 2);
+
+        let posts: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.method == "POST")
+            .collect();
+        assert_eq!(posts.len(), 2);
+        let first_body: serde_json::Value = posts[0].body_json().unwrap();
+        assert!(first_body["tools"].is_array(), "tools schema must be sent");
+        let second_body: serde_json::Value = posts[1].body_json().unwrap();
+        let msgs = second_body["messages"].as_array().unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m["role"] == "tool"
+                    && m["tool_call_id"] == "call_read_1"
+                    && m["content"].as_str().unwrap_or("").contains("secret-value-42")),
+            "second request must include tool_call_id result: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
     #[test]
     fn protocol_wrapper_is_not_shown_as_chat_text() {
         assert_eq!(
@@ -1157,6 +1319,6 @@ mod native_integration {
             "Hello"
         );
         assert_eq!(visible_preview("{\"tool\":\"bash\",\"args\":"), "");
-        assert_eq!(visible_preview("Hello, 世界"), "Hello, 世界");
+        assert_eq!(visible_preview("Hello, \u{4E16}\u{754C}"), "Hello, \u{4E16}\u{754C}");
     }
 }
