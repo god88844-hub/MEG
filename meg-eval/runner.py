@@ -221,7 +221,7 @@ def validate_public_adapter_invocation(inv: AdapterInvocation) -> Dict[str, obje
     }
 
 # ===========================================================================
-# Batch 7.5D: Real `meg.exe` Subprocess Benchmark Runner (Strictly Offline)
+# Batch 7.5D + 7.7C: Real `meg.exe` Subprocess Benchmark Runner (run + loop)
 # ===========================================================================
 
 import json as _json
@@ -242,6 +242,17 @@ def find_meg_binary(repo_root: Optional[_Path] = None) -> _Path:
     raise FileNotFoundError(f"Compiled MEG binary not found under {root / 'meg-rs' / 'target'}")
 
 
+def _extract_last_json_line(stdout: str) -> Optional[Dict[str, object]]:
+    for line in reversed(stdout.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                return _json.loads(stripped)
+            except Exception:
+                pass
+    return None
+
+
 def run_meg_binary_task(
     workspace: _Path,
     goal: str,
@@ -253,16 +264,103 @@ def run_meg_binary_task(
     timeout_s: float = 60.0,
     no_plane: bool = True,
     meg_bin: Optional[_Path] = None,
+    verify_cmd: Optional[str] = None,
+    require_verify: bool = False,
+    core_six: bool = False,
+    pair_mode: Optional[str] = None,
+    executor_model: Optional[str] = None,
+    reviewer_model: Optional[str] = None,
 ) -> Dict[str, object]:
-    """Execute the real compiled `meg` binary headlessly in `--pinned-model --json` mode."""
+    """Execute the real compiled `meg` binary headlessly in `--json` mode."""
     binary = meg_bin or find_meg_binary()
+    model_flag = "-m" if (executor_model or reviewer_model) else "--pinned-model"
     cmd = [
         str(binary),
         "run",
         "-C",
         str(workspace),
+        model_flag,
+        pinned_model,
+        "--max-steps",
+        str(max_steps),
+        "--json",
+    ]
+    if verify_cmd:
+        cmd.extend(["--verify-cmd", verify_cmd])
+    if require_verify:
+        cmd.append("--require-verify")
+    if core_six:
+        cmd.append("--core-six")
+    if pair_mode:
+        cmd.extend(["--pair-mode", pair_mode])
+    if executor_model:
+        cmd.extend(["--executor-model", executor_model])
+    if reviewer_model:
+        cmd.extend(["--reviewer-model", reviewer_model])
+    cmd.extend(["--", goal])
+
+    env = dict(_os.environ)
+    env["MEG_TUI_BASE_URL"] = base_url
+    env["MEG_TUI_MODEL"] = pinned_model
+    env["MEG_TUI_API_KEY"] = api_key
+    env["MEG_OFFLINE"] = "0"
+    if no_plane:
+        env["MEG_NO_PLANE"] = "1"
+
+    t0 = time.perf_counter()
+    proc = _subprocess.run(
+        cmd,
+        cwd=str(workspace),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+    elapsed_s = time.perf_counter() - t0
+    parsed = _extract_last_json_line(proc.stdout)
+    receipt_file = workspace / ".meg" / "receipt.json"
+    receipt = _json.loads(receipt_file.read_text(encoding="utf-8")) if receipt_file.is_file() else None
+    return {
+        "returncode": proc.returncode,
+        "ok": proc.returncode == 0 and bool(parsed and parsed.get("ok")),
+        "elapsed_s": round(elapsed_s, 3),
+        "json": parsed,
+        "receipt": receipt,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+
+
+def run_meg_loop_task(
+    workspace: _Path,
+    goal: str,
+    *,
+    check_cmd: str,
+    base_url: str,
+    pinned_model: str,
+    api_key: str = "offline-eval-key",
+    max_runs: int = 5,
+    max_same: int = 2,
+    max_steps: int = 8,
+    timeout_s: float = 90.0,
+    no_plane: bool = True,
+    meg_bin: Optional[_Path] = None,
+) -> Dict[str, object]:
+    """Execute the real compiled `meg loop` (Loop-2) outer work loop."""
+    binary = meg_bin or find_meg_binary()
+    cmd = [
+        str(binary),
+        "loop",
+        "-C",
+        str(workspace),
+        "--check",
+        check_cmd,
         "--pinned-model",
         pinned_model,
+        "--max-runs",
+        str(max_runs),
+        "--max-same",
+        str(max_same),
         "--max-steps",
         str(max_steps),
         "--json",
@@ -277,6 +375,7 @@ def run_meg_binary_task(
     if no_plane:
         env["MEG_NO_PLANE"] = "1"
 
+    t0 = time.perf_counter()
     proc = _subprocess.run(
         cmd,
         cwd=str(workspace),
@@ -285,22 +384,18 @@ def run_meg_binary_task(
         text=True,
         timeout=timeout_s,
     )
-    parsed: Optional[Dict[str, object]] = None
-    for line in reversed(proc.stdout.splitlines()):
-        stripped = line.strip()
-        if stripped.startswith("{") and stripped.endswith("}"):
-            try:
-                parsed = _json.loads(stripped)
-                break
-            except Exception:
-                pass
-
+    elapsed_s = time.perf_counter() - t0
+    parsed = _extract_last_json_line(proc.stdout)
+    state_file = workspace / ".loop" / "state.json"
+    loop_state = _json.loads(state_file.read_text(encoding="utf-8")) if state_file.is_file() else None
     receipt_file = workspace / ".meg" / "receipt.json"
     receipt = _json.loads(receipt_file.read_text(encoding="utf-8")) if receipt_file.is_file() else None
     return {
         "returncode": proc.returncode,
         "ok": proc.returncode == 0 and bool(parsed and parsed.get("ok")),
+        "elapsed_s": round(elapsed_s, 3),
         "json": parsed,
+        "loop_state": loop_state,
         "receipt": receipt,
         "stdout": proc.stdout,
         "stderr": proc.stderr,

@@ -1,4 +1,4 @@
-"""Batch 7.6C: Multi-Task Real `meg.exe` Aegis-Tier Offline Benchmark Suite."""
+"""Batch 7.7C: 8-Task Real `meg.exe` Aegis-Tier Offline Benchmark Suite."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, Dict, List
 
-from runner import run_meg_binary_task
+from runner import run_meg_binary_task, run_meg_loop_task
 
 
 def _serve_scripted_openai(script_fn: Callable[[int, str], str]):
@@ -160,6 +160,191 @@ def run_aegis_benchmark_suite(root_tmp: Path) -> Dict[str, object]:
         false_completions += 1
     t5_ok = (not r5["ok"]) and (r5["receipt"] is None) and ("SEALED_MANIFEST_VIOLATION" in r5["stderr"])
     results.append({"task": "t5_sealed_manifest_anti_tamper", "passed": bool(t5_ok)})
+
+    # --- Task 6: Live Poteto Anti-Stub Withhold + Out-of-Band --verify-cmd (+OO) ---
+    ws6 = root_tmp / "t6_anti_stub_verify"
+    ws6.mkdir(parents=True)
+    (ws6 / "app.py").write_text("def compute():\n    return 0\n", encoding="utf-8")
+
+    def s6(turn: int, _req: str) -> str:
+        if turn == 1:
+            return json.dumps({"thought": "stub", "tool": "edit_file", "args": {"path": "app.py", "old_string": "return 0", "new_string": "raise NotImplementedError()"}})
+        if turn == 2:
+            return json.dumps({"thought": "claim done early", "final": "Implemented compute()"})
+        if turn == 3:
+            return json.dumps({"thought": "replace stub", "tool": "edit_file", "args": {"path": "app.py", "old_string": "raise NotImplementedError()", "new_string": "return 99"}})
+        return json.dumps({"thought": "done", "final": "Implemented and verified compute() == 99"})
+
+    srv, st = _serve_scripted_openai(s6)
+    try:
+        r6 = run_meg_binary_task(
+            ws6,
+            "Implement compute() returning 99 in app.py",
+            base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+            pinned_model="aegis-eval-v1",
+            max_steps=8,
+            verify_cmd='python -c "import app; assert app.compute() == 99"',
+            require_verify=True,
+            core_six=True,
+        )
+    finally:
+        srv.shutdown(); srv.server_close()
+    t6_ok = (
+        r6["ok"]
+        and r6["receipt"] is not None
+        and any("ANTI_STUB_GATE" in req for req in st["requests"])
+    )
+    results.append({"task": "t6_anti_stub_and_verify_cmd", "passed": bool(t6_ok)})
+
+    # --- Task 7: Live `meg.exe loop` (check_cannot_fail + stalled + green) ---
+    ws7a = root_tmp / "t7a_loop_cannot_fail"
+    ws7a.mkdir(parents=True)
+    srv, _ = _serve_scripted_openai(lambda _t, _r: json.dumps({"final": "should never run"}))
+    try:
+        r7a = run_meg_loop_task(
+            ws7a,
+            "Fix bug",
+            check_cmd='python -c "assert 1 == 1"',
+            base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+            pinned_model="aegis-eval-v1",
+            max_runs=3,
+        )
+    finally:
+        srv.shutdown(); srv.server_close()
+    ok7a = (not r7a["ok"]) and (r7a["loop_state"] or {}).get("status") == "check_cannot_fail" and r7a["receipt"] is None
+
+    ws7b = root_tmp / "t7b_loop_stall"
+    ws7b.mkdir(parents=True)
+    (ws7b / "broken.py").write_text("VALUE = 1\n", encoding="utf-8")
+    srv, _ = _serve_scripted_openai(lambda _t, _r: json.dumps({"thought": "noop", "final": "tried nothing"}))
+    try:
+        r7b = run_meg_loop_task(
+            ws7b,
+            "Make VALUE equal 10",
+            check_cmd='python -c "import broken; assert broken.VALUE == 10"',
+            base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+            pinned_model="aegis-eval-v1",
+            max_runs=5,
+            max_same=2,
+        )
+    finally:
+        srv.shutdown(); srv.server_close()
+    ok7b = (
+        (not r7b["ok"])
+        and (r7b["loop_state"] or {}).get("status") == "stalled"
+        and len((r7b["loop_state"] or {}).get("runs", [])) == 2
+        and r7b["receipt"] is None
+    )
+
+    ws7c = root_tmp / "t7c_loop_green"
+    ws7c.mkdir(parents=True)
+    (ws7c / "math_mod.py").write_text("def double(x):\n    return x\n", encoding="utf-8")
+
+    def s7c(turn: int, req: str) -> str:
+        if "run 1:" not in req:
+            if turn == 1:
+                return json.dumps({"thought": "wrong fix", "tool": "edit_file", "args": {"path": "math_mod.py", "old_string": "return x", "new_string": "return x + 1"}})
+            return json.dumps({"thought": "done r1", "final": "tried x + 1"})
+        if "return x * 2" not in (ws7c / "math_mod.py").read_text(encoding="utf-8"):
+            return json.dumps({"thought": "real fix", "tool": "edit_file", "args": {"path": "math_mod.py", "old_string": "return x + 1", "new_string": "return x * 2"}})
+        return json.dumps({"thought": "done r2", "final": "changed to x * 2"})
+
+    srv, st7c = _serve_scripted_openai(s7c)
+    try:
+        r7c = run_meg_loop_task(
+            ws7c,
+            "Fix double(x) in math_mod.py",
+            check_cmd='python -c "import math_mod; assert math_mod.double(7) == 14"',
+            base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+            pinned_model="aegis-eval-v1",
+            max_runs=4,
+            max_same=2,
+        )
+    finally:
+        srv.shutdown(); srv.server_close()
+    ok7c = (
+        r7c["ok"]
+        and (r7c["loop_state"] or {}).get("status") == "green"
+        and len((r7c["loop_state"] or {}).get("runs", [])) == 2
+        and r7c["receipt"] is not None
+        and any("Already tried (DO NOT REPEAT):" in req and "tried x + 1" in req for req in st7c["requests"])
+    )
+    if (not ok7a) or (not ok7b):
+        false_completions += 1
+    results.append({"task": "t7_meg_loop_lifecycle", "passed": bool(ok7a and ok7b and ok7c)})
+
+    # --- Task 8: Live Dual-Model Antigravity Orchestrator + Cold L3 Reviewer (PASS & REJECT) ---
+    ws8a = root_tmp / "t8a_dual_pass"
+    ws8a.mkdir(parents=True)
+    (ws8a / "calc.py").write_text("def sub(a, b):\n    return a + b\n", encoding="utf-8")
+    t8a_counts = {"planner": 0, "exec": 0}
+
+    def s8a(_turn: int, raw_req: str) -> str:
+        model = json.loads(raw_req).get("model", "")
+        if model == "opus-reviewer":
+            return json.dumps({"verdict": "PASS", "reason": "Verified sub(a, b) returns a - b."})
+        if model == "neon-planner":
+            t8a_counts["planner"] += 1
+            if t8a_counts["planner"] == 1:
+                return json.dumps({"thought": "inspect", "tool": "read_file", "args": {"path": "calc.py"}})
+            return json.dumps({"thought": "reintervene", "tool": "edit_file", "args": {"path": "calc.py", "old_string": "return a + b", "new_string": "return a - b"}})
+        t8a_counts["exec"] += 1
+        if t8a_counts["exec"] == 1:
+            return json.dumps({"thought": "friction", "tool": "edit_file", "args": {"path": "calc.py", "old_string": "MISSING_LINE", "new_string": "return a - b"}})
+        return json.dumps({"thought": "done", "final": "Fixed sub(a, b)."})
+
+    srv, _ = _serve_scripted_openai(s8a)
+    try:
+        r8a = run_meg_binary_task(
+            ws8a,
+            "Fix sub(a, b) in calc.py",
+            base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+            pinned_model="neon-planner",
+            max_steps=8,
+            verify_cmd='python -c "import calc; assert calc.sub(9, 4) == 5"',
+            pair_mode="antigravity_orchestrator",
+            executor_model="hydrogen-exec",
+            reviewer_model="opus-reviewer",
+        )
+    finally:
+        srv.shutdown(); srv.server_close()
+    j8a = r8a["json"] or {}
+    ok8a = (
+        r8a["ok"]
+        and j8a.get("planner_turns") == 2
+        and j8a.get("executor_turns") == 2
+        and j8a.get("reviewer_verdict") == "PASS"
+        and r8a["receipt"] is not None
+    )
+
+    ws8b = root_tmp / "t8b_l3_reject"
+    ws8b.mkdir(parents=True)
+    (ws8b / "calc.py").write_text("def sub(a, b):\n    return a + b\n", encoding="utf-8")
+
+    def s8b(turn: int, raw_req: str) -> str:
+        model = json.loads(raw_req).get("model", "")
+        if model == "strict-reviewer":
+            return json.dumps({"verdict": "REJECT", "reason": "Missing type annotations"})
+        if turn == 1:
+            return json.dumps({"thought": "edit", "tool": "edit_file", "args": {"path": "calc.py", "old_string": "return a + b", "new_string": "return a - b"}})
+        return json.dumps({"thought": "done", "final": "done"})
+
+    srv, _ = _serve_scripted_openai(s8b)
+    try:
+        r8b = run_meg_binary_task(
+            ws8b,
+            "Fix sub(a, b)",
+            base_url=f"http://127.0.0.1:{srv.server_address[1]}/v1",
+            pinned_model="builder-model",
+            max_steps=6,
+            reviewer_model="strict-reviewer",
+        )
+    finally:
+        srv.shutdown(); srv.server_close()
+    if r8b["ok"] or r8b["receipt"] is not None:
+        false_completions += 1
+    ok8b = (not r8b["ok"]) and r8b["receipt"] is None and ("L3_REVIEWER_REJECTED" in r8b["stderr"])
+    results.append({"task": "t8_dual_model_and_cold_l3_reviewer", "passed": bool(ok8a and ok8b)})
 
     passed_count = sum(1 for r in results if r["passed"])
     total = len(results)

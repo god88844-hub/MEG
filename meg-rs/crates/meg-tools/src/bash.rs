@@ -224,6 +224,7 @@ pub fn run_cancellable(
     let use_ps = args.get("shell").and_then(Value::as_str) == Some("powershell")
         || (cfg!(windows) && cmd_line.trim_start().starts_with("export "));
     let mut cmd = build_sandboxed_command(workspace, cmd_line, use_ps);
+    cmd.env("PYTHONDONTWRITEBYTECODE", "1");
     headless_env(&mut cmd);
     let mut child = spawn_detached(&mut cmd)?;
     let pid = child.id();
