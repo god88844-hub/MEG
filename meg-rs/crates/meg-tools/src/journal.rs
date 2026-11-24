@@ -3,7 +3,6 @@
 //! Never pollutes the workspace's own `.git` directory.
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -165,6 +164,7 @@ fn run_side_git(git_dir: &Path, workspace: &Path, args: &[&str]) -> Result<Strin
         .env("GIT_DIR", git_dir)
         .env("GIT_WORK_TREE", workspace)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["-c", "core.autocrlf=false"])
         .args(args)
         .output()
         .context("failed to execute git for side-git snapshot")?;
@@ -242,15 +242,24 @@ pub fn side_git_restore(workspace: &Path, rev: &str) -> Result<()> {
 // Local Keep-Rate Tracker
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeepOutcome {
     Kept,
     Reverted,
     Overwritten,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl KeepOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Kept => "kept",
+            Self::Reverted => "reverted",
+            Self::Overwritten => "overwritten",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct KeepRateSummary {
     pub kept: usize,
     pub reverted: usize,
@@ -265,7 +274,7 @@ pub fn record_keep_rate_event(workspace: &Path, path: &Path, outcome: KeepOutcom
     }
     let line = json!({
         "path": path.to_string_lossy(),
-        "outcome": outcome,
+        "outcome": outcome.as_str(),
     })
     .to_string();
     use std::io::Write;

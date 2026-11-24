@@ -1,4 +1,4 @@
-//! Workspace-confined file tools, bounded search, grep and cancellable shell execution.
+//! Workspace-confined file tools, bounded search, grep, worktrees, security guards, and cancellable shell execution.
 
 pub mod bash;
 pub mod deliverable_guard;
@@ -7,5 +7,7 @@ pub mod fs_tools;
 pub mod grep;
 pub mod journal;
 pub mod registry;
+pub mod security_guards;
+pub mod worktree;
 
 pub use registry::{ToolRegistry, ToolResult, ToolSchema};

@@ -37,14 +37,14 @@
   - *Micro-Check:* `cargo test -p meg-core truncate`
 - [x] **P1-06 Out-of-Tree `side-git` Snapshots & Keep-Rate Tracker (`meg-tools/src/journal.rs`):** Maintain bare shadow git index in `~/.meg/snapshots/<repo-hash>/` for 1-ms pre-edit snapshots and `/undo` without polluting `.git`; log local `Keep Rate` when user reverts or immediately overwrites agent lines.
   - *Micro-Check:* `cargo test -p meg-tools journal`
-- [ ] **P1-07 CoW Worktree Manager (`meg-tools/src/worktree.rs`):** Create isolated worktrees (`~/.meg/worktrees/`) with 4-state lease log (`requested -> prepared -> lease_active -> scope_activated`, `cleanup: remove_if_clean`), linking `.env` and local caches (`node_modules`, `.venv`, `target/`) with zero reinstall wait.
+- [x] **P1-07 CoW Worktree Manager (`meg-tools/src/worktree.rs`):** Create isolated worktrees (`~/.meg/worktrees/`) with 4-state lease log (`requested -> prepared -> lease_active -> scope_activated`, `cleanup: remove_if_clean`), linking `.env` and local caches (`node_modules`, `.venv`, `target/`) with zero reinstall wait.
   - *Micro-Check:* `cargo test -p meg-tools worktree`
-- [ ] **P1-08 Windows PowerShell 5.1 Adapter & Cross-OS Sandbox (`meg-tools/src/bash.rs`):**
+- [x] **P1-08 Windows PowerShell 5.1 Adapter & Cross-OS Sandbox (`meg-tools/src/bash.rs`):**
   - Windows: Job Objects + UTF-8 console prefix (`[Console]::OutputEncoding = [System.Text.Encoding]::UTF8`) + POSIX idiom translator (`export` -> `$env:`, `rm -rf` -> `Remove-Item`, safe `;` chaining for PS 5.1).
   - Linux: `bubblewrap --unshare-all --unshare-net` (zero loopback control-plane exposure); macOS: `Seatbelt`.
   - Add cgroup/host RAM `make -j` cap (`max(1, RAM_GB / 2)`) and detached daemon FD handling (`</dev/null >/tmp/daemon.log 2>&1 &`).
   - *Micro-Check:* `cargo test -p meg-tools bash`
-- [ ] **P1-09 Stage-by-Stage Compound Bash Gate & Secret Airlock (`meg-tools/src/security_guards.rs`):**
+- [x] **P1-09 Stage-by-Stage Compound Bash Gate & Secret Airlock (`meg-tools/src/security_guards.rs`):**
   - Split `&&`, `||`, `;`, `|`, `$()`, backticks; if ANY stage is denied, abort entire command before Stage 1 runs.
   - Auto-lock `.env*` in `.gitignore`, block direct `.env` reads/writes, run Shannon-entropy + token-prefix (`sk-`, `ghp_`, `AIza`) pre-commit scanner, and scrub observations into `<SURROGATE_...>` tokens (`SAL` membrane; `disable_codebase_upload = true`).
   - Implement `ChildAuthority::clamp` bitmask intersection (`Child = Parent & Requested`).

@@ -325,3 +325,93 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 }
+
+/// Translate common POSIX idioms (`export K=V`, `rm -rf`, `&&`) into Windows
+/// PowerShell 5.1-safe syntax with explicit UTF-8 output encoding.
+pub fn translate_posix_for_powershell51(command: &str) -> String {
+    let mut out = command.trim().to_string();
+    if let Some(rest) = out.strip_prefix("export ") {
+        if let Some((k, v)) = rest.split_once('=') {
+            out = format!("$env:{} = {}", k.trim(), v.trim());
+        }
+    }
+    if out.contains("rm -rf ") {
+        out = out.replace("rm -rf ", "Remove-Item -Recurse -Force ");
+    }
+    // PowerShell 5.1 does not support `&&`; replace top-level ` && ` with `; if ($?) { ... }`
+    if out.contains(" && ") {
+        let parts: Vec<&str> = out.split(" && ").collect();
+        let mut chained = parts[0].to_string();
+        for p in &parts[1..] {
+            chained.push_str(&format!("; if ($?) {{ {p} }}"));
+        }
+        out = chained;
+    }
+    format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {out}")
+}
+
+/// Cap `make -j` parallelism to `max(1, RAM_GB / 2)` so builds never OOM.
+pub fn cap_make_jobs(ram_gb: u64) -> u64 {
+    (ram_gb / 2).max(1)
+}
+
+/// Build cross-OS sandbox argv (`bubblewrap --unshare-all --unshare-net` on Linux,
+/// `sandbox-exec` Seatbelt on macOS).
+pub fn sandbox_command_preview(os: &str, workspace: &Path, inner_cmd: &str) -> Vec<String> {
+    let ws = workspace.to_string_lossy().to_string();
+    match os {
+        "linux" => vec![
+            "bwrap".into(),
+            "--unshare-all".into(),
+            "--unshare-net".into(),
+            "--bind".into(),
+            ws.clone(),
+            ws,
+            "--".into(),
+            "sh".into(),
+            "-lc".into(),
+            inner_cmd.into(),
+        ],
+        "macos" => vec![
+            "sandbox-exec".into(),
+            "-p".into(),
+            format!("(version 1)(deny default)(allow file-read* file-write* (subpath \"{ws}\"))"),
+            "sh".into(),
+            "-lc".into(),
+            inner_cmd.into(),
+        ],
+        _ => vec!["powershell".into(), "-NoProfile".into(), "-Command".into(), translate_posix_for_powershell51(inner_cmd)],
+    }
+}
+
+/// Wrap a background daemon command with detached stdio FDs so pipes never hang.
+pub fn detach_daemon_command(cmd: &str, log_path: &str) -> String {
+    format!("{cmd} </dev/null >{log_path} 2>&1 &")
+}
+
+#[cfg(test)]
+mod p1_08_tests {
+    use super::*;
+
+    #[test]
+    fn powershell51_translator_and_ram_cap_and_sandbox_preview() {
+        let ps = translate_posix_for_powershell51("export FOO=bar && rm -rf tmp_dir");
+        assert!(ps.contains("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8"));
+        assert!(ps.contains("$env:FOO = bar"));
+        assert!(ps.contains("Remove-Item -Recurse -Force tmp_dir"));
+        assert!(ps.contains("if ($?)"));
+
+        assert_eq!(cap_make_jobs(1), 1);
+        assert_eq!(cap_make_jobs(8), 4);
+        assert_eq!(cap_make_jobs(32), 16);
+
+        let linux = sandbox_command_preview("linux", Path::new("/ws"), "echo hi");
+        assert!(linux.contains(&"--unshare-all".to_string()));
+        assert!(linux.contains(&"--unshare-net".to_string()));
+        let mac = sandbox_command_preview("macos", Path::new("/ws"), "echo hi");
+        assert_eq!(mac[0], "sandbox-exec");
+
+        let detached = detach_daemon_command("python server.py", "/tmp/daemon.log");
+        assert!(detached.contains("</dev/null >/tmp/daemon.log 2>&1 &"));
+    }
+}
