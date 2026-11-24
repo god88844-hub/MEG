@@ -63,3 +63,228 @@ export class WorkspaceExtensions{
   async tool(alias:string,args:Record<string,unknown>,readOnly:boolean,signal?:AbortSignal){const tool=this.host.allTools().find(t=>t.alias===alias);if(!tool)throw new Error("MCP tool is not connected; use /mcp start <server>");if(readOnly&&!tool.readOnly)throw new Error("MCP tool is disabled in Plan mode: no read-only annotation");const result:any=await this.host.callTool(tool.server,tool.name,args,signal);if(result?.isError)throw new Error((result.content??[]).filter((p:any)=>p.type==="text").map((p:any)=>p.text).join("\n")||"MCP tool failed");return result;}
   async readSkill(name:string){const skill=(await this.catalog()).skills.find(s=>s.name===name);if(!skill)throw new Error("Unknown skill");return skill;}
 }
+
+// ===========================================================================
+// P2-07: Code Mode, HarnessMM (EDG/GDR/CCS), HARNESSPRO 4-Stage Hook & AHE 7-Risk Hook
+// ===========================================================================
+
+import { resolve as resolvePathP207, isAbsolute as isAbsolutePathP207 } from "node:path";
+import {
+  evaluateSubstitutionCertificate,
+  type EDGNode,
+  type SubstitutionCertificate,
+} from "./types";
+import type { BudgetAllocation } from "./fusion";
+
+export interface LazyToolDescriptor {
+  specifier: string;
+  name: string;
+  typedSignature: string;
+  loaded: boolean;
+}
+
+const CODE_MODE_CATALOG: Record<string, string> = {
+  "@tools/bash": "runBash(args: { command: string; timeout_seconds?: number }): Promise<string>",
+  "@tools/read_file": "readFile(args: { path: string; offset?: number; limit?: number; hashlines?: boolean }): Promise<string>",
+  "@tools/write_file": "writeFile(args: { path: string; content: string }): Promise<string>",
+  "@tools/edit_file": "editFile(args: { path: string; old_string?: string; new_string?: string; edits?: unknown[] }): Promise<string>",
+  "@tools/glob_grep": "globGrep(args: { mode?: 'glob' | 'grep'; pattern: string; path?: string }): Promise<string>",
+  "@tools/finish": "finish(args: { summary: string; deliverables?: string[] }): Promise<string>",
+};
+
+/** Code Mode: lazily resolve typed `@tools/*` imports on demand without bloating base prompts. */
+export function resolveLazyToolImport(specifier: string): LazyToolDescriptor {
+  if (!specifier.startsWith("@tools/")) {
+    throw new Error(`Code Mode only resolves @tools/* imports (got '${specifier}')`);
+  }
+  const sig = CODE_MODE_CATALOG[specifier];
+  if (!sig) {
+    throw new Error(`Unknown Code Mode tool module: ${specifier}`);
+  }
+  return {
+    specifier,
+    name: specifier.slice("@tools/".length),
+    typedSignature: sig,
+    loaded: true,
+  };
+}
+
+export interface GdrCacheLookup {
+  hit: boolean;
+  node?: EDGNode;
+  certificate?: SubstitutionCertificate;
+  ccsScore: number;
+}
+
+/**
+ * HarnessMM Executable Decision Graph (EDG) / Graph-Driven Replay (GDR) /
+ * Cache-Confidence Score (CCS), gated strictly by the Substitution Paradox.
+ */
+export class DecisionGraphCache {
+  private nodes = new Map<string, EDGNode>();
+
+  register(node: EDGNode): void {
+    this.nodes.set(node.id, { ...node });
+  }
+
+  lookupGdr(
+    goalText: string,
+    activePreconditions: readonly string[],
+    costs: {
+      eliminatedReasoningTokens: number;
+      authorshipCostTokens: number;
+      selectionCostTokens: number;
+      recoveryCostTokens: number;
+    },
+  ): GdrCacheLookup {
+    const preSet = new Set(activePreconditions);
+    for (const node of this.nodes.values()) {
+      const re = new RegExp(node.triggerPattern, "i");
+      if (!re.test(goalText)) continue;
+      const matchedPre = node.preconditions.filter((p) => preSet.has(p)).length;
+      const ccsScore =
+        node.preconditions.length === 0 ? 1.0 : matchedPre / node.preconditions.length;
+      if (ccsScore < 1.0) continue;
+
+      const certificate = evaluateSubstitutionCertificate(
+        node.id,
+        costs.eliminatedReasoningTokens,
+        costs.authorshipCostTokens,
+        costs.selectionCostTokens,
+        costs.recoveryCostTokens,
+      );
+      if (!certificate.approved) {
+        return { hit: false, node, certificate, ccsScore };
+      }
+      node.hitCount += 1;
+      return { hit: true, node: { ...node }, certificate, ccsScore };
+    }
+    return { hit: false, ccsScore: 0 };
+  }
+}
+
+export type PreToolHookStage =
+  | "economy"
+  | "convergence"
+  | "finalization_grace"
+  | "hard_stop_deny";
+
+export interface PreToolHookDecision {
+  stage: PreToolHookStage;
+  allow: boolean;
+  graceWindow: number;
+  hookPath: string;
+  advisory?: string;
+}
+
+/** Resolve hook scripts via absolute `$MEG_HOME` path (never relative cwd). */
+export function resolveMegHomeHookPath(scriptName: string, env = process.env): string {
+  const home = env.MEG_HOME?.trim() || configRoot();
+  const absHome = isAbsolutePathP207(home) ? home : resolvePathP207(home);
+  return resolvePathP207(absHome, "hooks", scriptName);
+}
+
+/**
+ * HARNESSPRO 4-Stage PreToolUse Hook:
+ * Economy -> Convergence -> Finalization Grace Window [max(8, rem)] -> Hard Stop Deny.
+ */
+export function evaluatePreToolUseHook(
+  toolCallsUsed: number,
+  budget: Pick<BudgetAllocation, "econ" | "strict" | "final" | "rem">,
+  toolName: string,
+  env = process.env,
+): PreToolHookDecision {
+  const hookPath = resolveMegHomeHookPath("pre_tool_use.ts", env);
+  const graceWindow = Math.max(8, budget.rem);
+  const hardLimit = budget.final + graceWindow;
+
+  if (toolName === "finish") {
+    return { stage: "finalization_grace", allow: true, graceWindow, hookPath };
+  }
+  if (toolCallsUsed < budget.econ) {
+    return { stage: "economy", allow: true, graceWindow, hookPath };
+  }
+  if (toolCallsUsed < budget.strict) {
+    return {
+      stage: "convergence",
+      allow: true,
+      graceWindow,
+      hookPath,
+      advisory: `[CONVERGENCE] ${toolCallsUsed}/${budget.final} tool calls used; stop exploring and converge on implementation.`,
+    };
+  }
+  if (toolCallsUsed < hardLimit) {
+    return {
+      stage: "finalization_grace",
+      allow: true,
+      graceWindow,
+      hookPath,
+      advisory: `[FINALIZATION GRACE WINDOW (${graceWindow})] Run final verification and call finish now.`,
+    };
+  }
+  return {
+    stage: "hard_stop_deny",
+    allow: false,
+    graceWindow,
+    hookPath,
+    advisory: `[HARD STOP DENY] Tool call budget exhausted (${toolCallsUsed}/${hardLimit}); call finish or report blockers.`,
+  };
+}
+
+export type AheRiskKind =
+  | "unverified_claim"
+  | "destructive_cmd"
+  | "secret_exposure"
+  | "test_weakening"
+  | "scope_creep"
+  | "stale_context"
+  | "infinite_retry";
+
+export interface AfterToolRiskReport {
+  risks: AheRiskKind[];
+  topOfTurnReminder: string | null;
+}
+
+/**
+ * AHE 7-Risk AfterToolHook: scans tool name + args + output and promotes
+ * any detected risk into a top-of-turn `[FRAMEWORK REMINDER]`.
+ */
+export function evaluateAfterToolRisks(input: {
+  toolName: string;
+  argsText: string;
+  outputText: string;
+  consecutiveRepeats?: number;
+  editedOutsideScope?: boolean;
+}): AfterToolRiskReport {
+  const risks: AheRiskKind[] = [];
+  const combined = `${input.argsText}\n${input.outputText}`;
+
+  if (/\b(all tests pass|verified complete)\b/i.test(input.outputText) && input.toolName !== "bash") {
+    risks.push("unverified_claim");
+  }
+  if (/\b(rm -rf|git reset --hard|git clean -fd|drop table)\b/i.test(input.argsText)) {
+    risks.push("destructive_cmd");
+  }
+  if (/(sk-[A-Za-z0-9_\-]{16,}|ghp_[A-Za-z0-9]{20,}|AIza[0-9A-Za-z\-_]{20,}|AKIA[0-9A-Z]{16})/.test(combined)) {
+    risks.push("secret_exposure");
+  }
+  if (/\b(\.skip\(|test\.skip|xit\(|#\[ignore\]|assert!\(true\))\b/.test(input.argsText)) {
+    risks.push("test_weakening");
+  }
+  if (input.editedOutsideScope) {
+    risks.push("scope_creep");
+  }
+  if (/\b(stale hashline anchor|file changed after|ENOENT)\b/i.test(input.outputText)) {
+    risks.push("stale_context");
+  }
+  if ((input.consecutiveRepeats ?? 0) >= 3) {
+    risks.push("infinite_retry");
+  }
+
+  const topOfTurnReminder =
+    risks.length > 0
+      ? `[FRAMEWORK REMINDER] AfterToolHook flagged ${risks.length} risk(s): ${risks.join(", ")}. Address before continuing.`
+      : null;
+
+  return { risks, topOfTurnReminder };
+}

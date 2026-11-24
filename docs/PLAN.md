@@ -100,11 +100,11 @@
   - `Fetch` (newest-first `mtime` sort, `<=3` hits); `Compress` (`EoCC`/`SAC` 5-part handoff briefs keeping current-attempt errors visible, stripping raw tracebacks across fresh attempts, `<40%` active context cap); `Split` (`>20`-page / `40K`-char reads -> 5-line reader subagent).
   - Single-pass media compaction: replace processed images/video frames with `@media:` disk pointers (fixes 39.5 MB replay bug).
   - *Micro-Check:* `bun test test/context.test.ts`
-- [ ] **P2-07 Code Mode, `HarnessMM` & 4-Stage `PreToolUse` Hooks (`src/extensions.ts`):**
+- [x] **P2-07 Code Mode, `HarnessMM` & 4-Stage `PreToolUse` Hooks (`src/extensions.ts`):**
   - Lazy `@tools/*` typed imports (`Code Mode`) + `HarnessMM` `EDG`/`GDR`/`CCS` cached decision-graph bypass gated by Substitution Paradox (`eliminated_reasoning > authorship + selection + recovery`).
   - `HARNESSPRO` 4-stage hook (`Economy -> Convergence -> Finalization Grace Window [max(8, rem)] -> Hard Stop Deny`) using absolute `$MEG_HOME` paths + `AHE` 7-risk `AfterToolHook` promoting warnings to top-of-turn `[FRAMEWORK REMINDER]`.
   - *Micro-Check:* `bun test test/extensions.test.ts`
-- [ ] **P2-08 Magnitude Router (`M0`-`M5`), `pstack` `/mode` & 7 Slash Commands (`src/commands.ts`, `meg-cli`):**
+- [x] **P2-08 Magnitude Router (`M0`-`M5`), `pstack` `/mode` & 7 Slash Commands (`src/commands.ts`, `meg-cli`):**
   - `M0` Nano (1 file, `<=3` turns, `$0.05`) through `M5` Mega-Engine (`250` turns).
   - `pstack` `/mode` (`feature | refactor | bug-hunt | migration`) with `>10`-file blast-radius pause.
   - 7 slash commands (`/verify`, `/commit` [session-edited files only], `/review`, `/refactor` [`jscpd`+`knip`+`ast-grep`], `/spec`, `/garden`, `/clear`) + `.meg/backlog.md` ticket drop (prevents scope poisoning).

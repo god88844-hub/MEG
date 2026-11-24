@@ -6,6 +6,7 @@ import { SessionTree, TaskStateMachine, initThreeZoneWorkspace, type TaskState }
 import { McpHost } from "./mcp-host";
 import { WorkspaceExtensions, configRoot } from "./extensions";
 import { AgentManager } from "./agents";
+import { dispatchSlashCommand, dropBacklogTicket, routeMagnitude, type PstackMode } from "./commands";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -122,6 +123,17 @@ const handlers: Record<string, Handler> = {
     tasks.set(p.taskId, sm);
     return { taskId: sm.taskId, state: sm.state, events: sm.history().length };
   },
+  "commands.routeMagnitude": (p: { files: number; complexity?: "trivial" | "normal" | "complex" | "mega" }) =>
+    routeMagnitude(p.files, p.complexity),
+  "commands.dispatch": (p: { input: string; workspace: string; sessionEditedFiles?: string[]; currentMode?: PstackMode }) =>
+    dispatchSlashCommand(p.input, {
+      workspace: p.workspace,
+      sessionEditedFiles: p.sessionEditedFiles ?? [],
+      currentMode: p.currentMode ?? "feature",
+    }),
+  "commands.backlogDrop": (p: { workspace: string; title: string; reason?: string }) => ({
+    file: dropBacklogTicket(p.workspace, p.title, p.reason),
+  }),
   "mcp.startServer": async (p: { name: string; command: string; args?: string[] }) =>
     mcp.startServer(p.name, p.command, p.args ?? []),
   "mcp.callTool": (p: { server: string; tool: string; args: Record<string, unknown> }) =>
