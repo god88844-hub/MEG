@@ -421,6 +421,8 @@ struct TuiOptions {
     max_steps: Option<usize>,
     json_output: bool,
     core_six: bool,
+    pair_mode: Option<String>,
+    executor_model: Option<String>,
 }
 fn parse_tui_options(args: &[String]) -> Result<TuiOptions> {
     let mut options = TuiOptions::default();
@@ -480,7 +482,7 @@ fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)> {
                 options.core_six = true;
                 i += 1;
             }
-            "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps" => {
+            "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps" | "--pair-mode" | "--executor-model" => {
                 let flag = &args[i];
                 let value = args
                     .get(i + 1)
@@ -493,6 +495,14 @@ fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)> {
                         options.pinned_model = Some(value.clone());
                         options.model = Some(value.clone());
                     }
+                    "--pair-mode" => {
+                        anyhow::ensure!(
+                            matches!(value.as_str(), "devin_fusion" | "antigravity_orchestrator"),
+                            "--pair-mode must be 'devin_fusion' or 'antigravity_orchestrator'"
+                        );
+                        options.pair_mode = Some(value.clone());
+                    }
+                    "--executor-model" => options.executor_model = Some(value.clone()),
                     "--max-steps" => {
                         let parsed: usize = value
                             .parse()
@@ -1172,6 +1182,8 @@ async fn run_goal_headless(workspace: &Path, goal: &str, options: &TuiOptions) -
             "goal": goal,
             "model": state.model,
             "pinned_model": options.pinned_model,
+            "pair_mode": options.pair_mode,
+            "executor_model": options.executor_model,
             "turns": outcomes.len(),
             "receipt_path": if receipt_path.is_file() { Some(receipt_path.display().to_string()) } else { None },
             "receipt": receipt_json,

@@ -348,10 +348,16 @@ pub async fn run_loop_with_config(
         .unwrap_or_default(),
         None => String::new(),
     };
+    let env_boot = format!(
+        "[TURN-0 ENV]: os={} arch={} shell={}\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        if cfg!(windows) { "cmd/powershell5.1" } else { "sh" }
+    );
     let recon = if workspace_map.is_empty() {
-        String::new()
+        format!("{env_boot}\n")
     } else {
-        format!("Current workspace state:\n{workspace_map}\n\n")
+        format!("{env_boot}Current workspace state:\n{workspace_map}\n\n")
     };
     let mut messages = vec![ChatMessage {
         role: "system".into(),
@@ -376,11 +382,26 @@ pub async fn run_loop_with_config(
     let mut consecutive_same_call = 0usize;
     let mut consecutive_same_fail = 0usize;
 
+    let mut dead_ends: Vec<String> = Vec::new();
     for step in 0..config.max_steps {
         if engine.is_cancelled() {
             anyhow::bail!("Run cancelled");
         }
         compact_transcript(&mut messages, goal_msg_idx, config.max_transcript_chars);
+        if step > 0 && step % 4 == 0 {
+            let dead_summary = if dead_ends.is_empty() {
+                "none".to_string()
+            } else {
+                dead_ends.iter().rev().take(3).cloned().collect::<Vec<_>>().join(" | ")
+            };
+            messages.push(ChatMessage {
+                role: "user".into(),
+                content: format!(
+                    "[TAIL GOAL ANCHOR | step {step}/{}]\nACTIVE GOAL: {goal}\nDEAD ENDS: {dead_summary}",
+                    config.max_steps
+                ),
+            });
+        }
         let raw = engine.generate(&messages).await?;
         if raw.trim().is_empty() {
             anyhow::bail!("Model returned an empty response");
@@ -431,6 +452,10 @@ pub async fn run_loop_with_config(
                 let result = engine.execute_tool(&tool, &args).await;
                 let ok = result.is_ok();
                 let raw_obs = result.unwrap_or_else(|e| format!("tool error: {e}"));
+                if !ok {
+                    let brief: String = raw_obs.lines().next().unwrap_or("error").chars().take(80).collect();
+                    dead_ends.push(format!("{tool}: {brief}"));
+                }
                 let mut observation = format_live_observation(
                     config,
                     &format!("step{step}"),
