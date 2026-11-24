@@ -73,13 +73,13 @@
 ## PHASE 2 -- TypeScript Control Plane, Multi-Model Routing & 5-Move Context (`meg-plane/`)
 **Language:** TypeScript on Bun (`meg-plane/src/`)
 
-- [ ] **P2-01 Canonical Schemas & Contracts (`src/types.ts`):** Define TypeScript interfaces for `PreFlightTaskContract`, monotonic `MonotonicFeatureItem` (`features.json`), `ExecutionReceipt`, 4-Card Cookbook schemas (`Planner`, `Builder`, `Reviewer`, `Kickoff`), 7-field Swarm Handoff, `EDGNode`, `SubstitutionCertificate`, 5-enum `ToolErrorCategory` (`Transient | InvalidArguments | UnexpectedEnvironment | ProviderError | Timeout | UserAborted`), and `GOAL.md`.
+- [x] **P2-01 Canonical Schemas & Contracts (`src/types.ts`):** Define TypeScript interfaces for `PreFlightTaskContract`, monotonic `MonotonicFeatureItem` (`features.json`), `ExecutionReceipt`, 4-Card Cookbook schemas (`Planner`, `Builder`, `Reviewer`, `Kickoff`), 7-field Swarm Handoff, `EDGNode`, `SubstitutionCertificate`, 5-enum `ToolErrorCategory` (`Transient | InvalidArguments | UnexpectedEnvironment | ProviderError | Timeout | UserAborted`), and `GOAL.md`.
   - *Micro-Check:* `bun test test/types.test.ts`
-- [ ] **P2-02 Deterministic Task State Machine & 3-Zone Workspace (`src/index.ts`, `src/session-tree.ts`):**
+- [x] **P2-02 Deterministic Task State Machine & 3-Zone Workspace (`src/index.ts`, `src/session-tree.ts`):**
   - Implement state transitions `CREATED -> SCOPED -> PLANNED -> EXECUTING -> VERIFYING -> {VERIFIED | NEEDS_WORK | BLOCKED | FAILED | CANCELLED}` (only machine-verified receipt commits `VERIFIED`).
   - Initialize 3-zone workspace (`sources/`, `drafts/`, `published/`) + 6-field `progress.md` (`Task, Outputs, Completed, Decisions, Open issues, Next action`) + crash/restart replay from event ledger.
   - *Micro-Check:* `bun test test/plane.test.ts`
-- [ ] **P2-03 Turn-0 Bootstrap (<50ms) & Ambiguity Brake (`src/bootstrap.ts`):**
+- [x] **P2-03 Turn-0 Bootstrap (<50ms) & Ambiguity Brake (`src/bootstrap.ts`):**
   - Probe OS/shell, git state, compilers, RAM, and DB/API schema pre-checks before Turn 1.
   - `Kimi K3` Turn-0 Ambiguity Gate: pause for `<=2` concise MCQ questions when high-impact ambiguities exist; write minor reversible assumptions to non-blocking `assumptions.md`.
   - *Micro-Check:* `bun test test/bootstrap.test.ts`

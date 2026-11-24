@@ -3,7 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ModelRouter, type ModelEntry } from "../src/router";
-import { SessionTree } from "../src/session-tree";
+import { SessionTree, TaskStateMachine, initThreeZoneWorkspace, parseProgressMd, writeProgressMd } from "../src/session-tree";
+import { signExecutionReceipt } from "../src/types";
 import { AgentManager, type AgentEvent } from "../src/agents";
 import { handleRpc } from "../src/index";
 
@@ -184,6 +185,52 @@ describe("JSON-RPC dispatch", () => {
       const loaded = (await handleRpc("session.load", { workspace: ws, sessionId: "persist-1" })) as any;
       expect(loaded.size).toBe(1);
       expect(loaded.nodes[0].id).toBe(n1.id);
+    } finally {
+      fs.rmSync(ws, { recursive: true, force: true });
+    }
+  });
+});
+describe("P2-02 TaskStateMachine, 3-Zone Workspace & Crash Replay", () => {
+  test("enforces deterministic transitions, requires signed receipt for VERIFIED, and replays from ledger", () => {
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), "meg-p202-"));
+    try {
+      const zones = initThreeZoneWorkspace(ws, "Build P2-02");
+      expect(fs.existsSync(zones.sources)).toBeTrue();
+      expect(fs.existsSync(zones.drafts)).toBeTrue();
+      expect(fs.existsSync(zones.published)).toBeTrue();
+      const parsed = parseProgressMd(fs.readFileSync(zones.progressFile, "utf8"));
+      expect(parsed.task).toBe("Build P2-02");
+
+      writeProgressMd(zones.progressFile, {
+        task: "Build P2-02",
+        outputs: ["src/session-tree.ts"],
+        completed: ["Created zones"],
+        decisions: ["Use append-only JSONL ledger"],
+        openIssues: [],
+        nextAction: "Run bun test",
+      });
+      expect(parseProgressMd(fs.readFileSync(zones.progressFile, "utf8")).outputs).toEqual(["src/session-tree.ts"]);
+
+      const ledger = path.join(ws, ".meg", "tasks", "t-1.events.jsonl");
+      const sm = new TaskStateMachine("t-1", ledger);
+      expect(() => sm.transition("VERIFIED")).toThrow("Invalid task state transition");
+      sm.transition("SCOPED");
+      sm.transition("PLANNED");
+      sm.transition("EXECUTING");
+      sm.transition("VERIFYING");
+
+      // VERIFIED blocked without valid receipt
+      expect(() => sm.transition("VERIFIED")).toThrow("machine-verified receipt");
+
+      // Machine-verified receipt commits VERIFIED
+      const receipt = signExecutionReceipt("t-1", "tree-sha-1", true);
+      sm.transition("VERIFIED", { receipt, expectedTreeHash: "tree-sha-1" });
+      expect(sm.state).toBe("VERIFIED");
+
+      // Crash/restart replay restores VERIFIED state deterministically
+      const replayed = TaskStateMachine.replayFromLedger("t-1", ledger);
+      expect(replayed.state).toBe("VERIFIED");
+      expect(replayed.history().length).toBe(sm.history().length);
     } finally {
       fs.rmSync(ws, { recursive: true, force: true });
     }

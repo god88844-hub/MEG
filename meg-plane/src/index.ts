@@ -2,14 +2,16 @@
 // workspace extensions, MCP servers and native worker delegation.
 
 import { ModelRouter, type ModelEntry, type StoredProviderProfile } from "./router";
-import { SessionTree } from "./session-tree";
+import { SessionTree, TaskStateMachine, initThreeZoneWorkspace, type TaskState } from "./session-tree";
 import { McpHost } from "./mcp-host";
 import { WorkspaceExtensions, configRoot } from "./extensions";
 import { AgentManager } from "./agents";
 import fs from "node:fs";
+import path from "node:path";
 
 const router = new ModelRouter();
 const sessions = new Map<string, SessionTree>();
+const tasks = new Map<string, TaskStateMachine>();
 const mcp = new McpHost();
 const workspaces = new Map<string, WorkspaceExtensions>();
 const delegates = new AgentManager(4);
@@ -92,6 +94,33 @@ const handlers: Record<string, Handler> = {
   "session.forkPath": (p: { sessionId: string; workspace?: string; nodeId: string }) => {
     const tree = getOrOpenSession(p.sessionId, p.workspace);
     return tree.forkFrom(p.nodeId);
+  },
+  "workspace.initZones": (p: { workspace: string; task?: string }) =>
+    initThreeZoneWorkspace(p.workspace, p.task ?? ""),
+  "task.create": (p: { taskId: string; workspace?: string }) => {
+    const ledger = p.workspace
+      ? path.join(fs.realpathSync(p.workspace), ".meg", "tasks", `${p.taskId}.events.jsonl`)
+      : null;
+    const sm = new TaskStateMachine(p.taskId, ledger);
+    tasks.set(p.taskId, sm);
+    return { taskId: sm.taskId, state: sm.state };
+  },
+  "task.transition": (p: { taskId: string; to: TaskState; reason?: string; receipt?: any; expectedTreeHash?: string }) => {
+    const sm = tasks.get(p.taskId);
+    if (!sm) throw new Error(`unknown task: ${p.taskId}`);
+    const ev = sm.transition(p.to, { reason: p.reason, receipt: p.receipt, expectedTreeHash: p.expectedTreeHash });
+    return { taskId: sm.taskId, state: sm.state, event: ev };
+  },
+  "task.status": (p: { taskId: string }) => {
+    const sm = tasks.get(p.taskId);
+    if (!sm) throw new Error(`unknown task: ${p.taskId}`);
+    return { taskId: sm.taskId, state: sm.state, events: sm.history().length, verified: sm.state === "VERIFIED" };
+  },
+  "task.replay": (p: { taskId: string; workspace: string }) => {
+    const ledger = path.join(fs.realpathSync(p.workspace), ".meg", "tasks", `${p.taskId}.events.jsonl`);
+    const sm = TaskStateMachine.replayFromLedger(p.taskId, ledger);
+    tasks.set(p.taskId, sm);
+    return { taskId: sm.taskId, state: sm.state, events: sm.history().length };
   },
   "mcp.startServer": async (p: { name: string; command: string; args?: string[] }) =>
     mcp.startServer(p.name, p.command, p.args ?? []),
