@@ -20,6 +20,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
+from rsi_guards import (
+    audit_for_security_poisoning,
+    attribute_harness_delta,
+    calibrate_verifier_against_anchors,
+    classify_failure_mode,
+    summarize_failure_cohort,
+)
+
 RING0_LOCKED_PREFIXES: Tuple[str, ...] = (
     "meg-rs/crates/meg-tools/src/security_guards.rs",
     "meg-rs/crates/meg-tools/src/deliverable_guard.rs",
@@ -285,6 +293,14 @@ def evaluate_dual_rubric_gauntlet(
             "gaming_hits": gaming_hits,
             "reason": f"Dual-Rubric Gauntlet flagged GAMING pattern(s): {gaming_hits}",
         }
+    poison_audit = audit_for_security_poisoning(mutation.diff_text, source_name=mutation.candidate_id)
+    if not poison_audit["clean"]:
+        return {
+            "verdict": "GAMING",
+            "admitted": False,
+            "gaming_hits": list(poison_audit["poison_hits"]),
+            "reason": str(poison_audit["reason"]),
+        }
     if fires_on_stable:
         return {
             "verdict": "REJECTED",
@@ -338,6 +354,9 @@ def run_controlled_evolution_dry_run(
     three_config_results: Sequence[bool],
     previous_peak_score: float,
     rejection_ledger: Optional[RejectionLedger] = None,
+    benchmark_texts: Sequence[str] = (),
+    heldout_attribution: Optional[Dict[str, object]] = None,
+    verifier_calibration: Optional[Dict[str, object]] = None,
 ) -> Dict[str, object]:
     """
     End-to-end offline evolution gate:
@@ -347,6 +366,21 @@ def run_controlled_evolution_dry_run(
     ledger = rejection_ledger or RejectionLedger()
     if ledger.is_rejected(mutation):
         return {"admitted": False, "verdict": "REJECTED", "reason": "Previously rejected in GUARD ledger", "pr": None}
+    for idx, b_text in enumerate(benchmark_texts):
+        b_audit = audit_for_security_poisoning(b_text, source_name=f"benchmark_{idx}")
+        if not b_audit["clean"]:
+            reason = str(b_audit["reason"])
+            ledger.record_rejection(mutation, reason)
+            return {"admitted": False, "verdict": "POISONED_BENCHMARK", "reason": reason, "pr": None}
+
+    if verifier_calibration is not None and not verifier_calibration.get("calibrated", False):
+        reason = str(verifier_calibration.get("reason", "Verifier failed 10-anchor calibration"))
+        return {"admitted": False, "verdict": "UNCALIBRATED_VERIFIER", "reason": reason, "pr": None}
+
+    if heldout_attribution is not None and not heldout_attribution.get("admitted", False):
+        reason = str(heldout_attribution.get("reason", "Failed equal-compute held-out attribution gate"))
+        ledger.record_rejection(mutation, reason)
+        return {"admitted": False, "verdict": "OVERFIT_OR_NOISE", "reason": reason, "pr": None}
 
     mod_ok, mod_errs = validate_single_module_and_ring0(mutation)
     if not mod_ok:

@@ -134,3 +134,4 @@ def run_bitter_lesson_decay_sweep(
         "obsolete_count": len(to_delete),
         "pr": pr,
     }
+from rsi_guards import attribute_harness_delta  # noqa: E402,F401
