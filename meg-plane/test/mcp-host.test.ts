@@ -57,3 +57,12 @@ describe("P3-06 CLI > MCP Enforcer & Hardened MCP Host", () => {
     expect(results[2]?.ok).toBeTrue();
   });
 });
+import { McpHost } from "../src/mcp-host";
+
+describe("Batch 7.5D Live CLI > MCP Enforcement in McpHost.connect()", () => {
+  test("rejects connecting MCP wrappers for CLI-first tools (gh, stripe, git) live in McpHost.connect", async () => {
+    const host = new McpHost();
+    await expect(host.connect("gh", { command: "echo" })).rejects.toThrow("CLI_OVER_MCP_BLOCKED");
+    await expect(host.connect("stripe-mcp", { command: "echo" })).rejects.toThrow("CLI_OVER_MCP_BLOCKED");
+  });
+});

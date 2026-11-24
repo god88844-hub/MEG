@@ -17,6 +17,9 @@ export class McpHost {
     if(this.starting.has(name))return this.starting.get(name)!;
     if(this.servers.has(name))return this.servers.get(name)!.tools;
     if(config.disabled)throw new Error(`MCP server '${name}' is disabled in configuration`);
+    const policy=routeCliOrMcp(name);
+    if(policy.route==="cli")throw new Error(`CLI_OVER_MCP_BLOCKED: ${policy.reason}`);
+    if(policy.route==="denied"&&process.env.MEG_STRICT_MCP_ALLOWLIST==="1")throw new Error(`MCP_ALLOWLIST_BLOCKED: ${policy.reason}`);
     const operation=this.open(name,config,cwd);this.starting.set(name,operation);
     try{return await operation;}finally{this.starting.delete(name);}
   }

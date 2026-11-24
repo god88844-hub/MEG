@@ -219,3 +219,89 @@ def validate_public_adapter_invocation(inv: AdapterInvocation) -> Dict[str, obje
         "task_count": len(inv.task_ids),
         "ready": True,
     }
+
+# ===========================================================================
+# Batch 7.5D: Real `meg.exe` Subprocess Benchmark Runner (Strictly Offline)
+# ===========================================================================
+
+import json as _json
+import os as _os
+import subprocess as _subprocess
+from pathlib import Path as _Path
+
+
+def find_meg_binary(repo_root: Optional[_Path] = None) -> _Path:
+    root = repo_root or _Path(__file__).resolve().parent.parent
+    exe_name = "meg.exe" if _os.name == "nt" else "meg"
+    for candidate in (
+        root / "meg-rs" / "target" / "debug" / exe_name,
+        root / "meg-rs" / "target" / "release" / exe_name,
+    ):
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(f"Compiled MEG binary not found under {root / 'meg-rs' / 'target'}")
+
+
+def run_meg_binary_task(
+    workspace: _Path,
+    goal: str,
+    *,
+    base_url: str,
+    pinned_model: str,
+    api_key: str = "offline-eval-key",
+    max_steps: int = 12,
+    timeout_s: float = 60.0,
+    no_plane: bool = True,
+    meg_bin: Optional[_Path] = None,
+) -> Dict[str, object]:
+    """Execute the real compiled `meg` binary headlessly in `--pinned-model --json` mode."""
+    binary = meg_bin or find_meg_binary()
+    cmd = [
+        str(binary),
+        "run",
+        "-C",
+        str(workspace),
+        "--pinned-model",
+        pinned_model,
+        "--max-steps",
+        str(max_steps),
+        "--json",
+        "--",
+        goal,
+    ]
+    env = dict(_os.environ)
+    env["MEG_TUI_BASE_URL"] = base_url
+    env["MEG_TUI_MODEL"] = pinned_model
+    env["MEG_TUI_API_KEY"] = api_key
+    env["MEG_OFFLINE"] = "0"
+    if no_plane:
+        env["MEG_NO_PLANE"] = "1"
+
+    proc = _subprocess.run(
+        cmd,
+        cwd=str(workspace),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+    parsed: Optional[Dict[str, object]] = None
+    for line in reversed(proc.stdout.splitlines()):
+        stripped = line.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = _json.loads(stripped)
+                break
+            except Exception:
+                pass
+
+    receipt_file = workspace / ".meg" / "receipt.json"
+    receipt = _json.loads(receipt_file.read_text(encoding="utf-8")) if receipt_file.is_file() else None
+    return {
+        "returncode": proc.returncode,
+        "ok": proc.returncode == 0 and bool(parsed and parsed.get("ok")),
+        "json": parsed,
+        "receipt": receipt,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }

@@ -382,9 +382,12 @@ enum CliCommand {
 struct TuiOptions {
     cwd: Option<std::path::PathBuf>,
     model: Option<String>,
+    pinned_model: Option<String>,
     effort: Option<String>,
     resume: Option<String>,
     picker: Option<bool>,
+    max_steps: Option<usize>,
+    json_output: bool,
 }
 fn parse_tui_options(args: &[String]) -> Result<TuiOptions> {
     let mut options = TuiOptions::default();
@@ -436,7 +439,11 @@ fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)> {
                 break;
             }
             "--headless" => i += 1,
-            "-C" | "--cd" | "-m" | "--model" | "--effort" => {
+            "--json" => {
+                options.json_output = true;
+                i += 1;
+            }
+            "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps" => {
                 let flag = &args[i];
                 let value = args
                     .get(i + 1)
@@ -445,6 +452,20 @@ fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)> {
                 match flag.as_str() {
                     "-C" | "--cd" => options.cwd = Some(value.into()),
                     "-m" | "--model" => options.model = Some(value.clone()),
+                    "--pinned-model" => {
+                        options.pinned_model = Some(value.clone());
+                        options.model = Some(value.clone());
+                    }
+                    "--max-steps" => {
+                        let parsed: usize = value
+                            .parse()
+                            .context("--max-steps requires an integer in 1..=200")?;
+                        anyhow::ensure!(
+                            (1..=200).contains(&parsed),
+                            "--max-steps must be between 1 and 200"
+                        );
+                        options.max_steps = Some(parsed);
+                    }
                     _ => {
                         anyhow::ensure!(
                             matches!(value.as_str(), "low" | "medium" | "high" | "max"),
@@ -469,7 +490,7 @@ fn print_usage() {
     println!("  meg [COMMAND] [OPTIONS]\n");
     println!("Commands:");
     println!("  tui             Launch the interactive Workstation TUI (default)");
-    println!("  run [OPTIONS] [--] <goal>  Execute headlessly (-C, -m, --effort; --headless is accepted)");
+    println!("  run [OPTIONS] [--] <goal>  Execute headlessly (-C, -m, --pinned-model, --max-steps, --effort, --json)");
     println!("\nOptions:");
     println!("  -h, --help      Print this help message");
     println!("  -C, --cd PATH   Open a workspace\n  -m, --model ID  Select the session model\n  --effort LEVEL  low, medium, high or max\n  --resume ID     Resume a saved session (or latest)\n  --continue      Resume the latest saved session\n  --workspace-picker  Choose a workspace before opening\n  --no-picker     Open the current workspace directly");
@@ -607,6 +628,14 @@ async fn run_request_with_plane(
     tx: Option<Sender<RunnerMsg>>,
     plane: Option<Arc<meg_core::plane_client::PlaneClient>>,
 ) -> Result<(Vec<meg_core::TurnOutcome>, Option<String>)> {
+    run_request_with_options(request, tx, plane, None).await
+}
+async fn run_request_with_options(
+    request: meg_tui::RunRequest,
+    tx: Option<Sender<RunnerMsg>>,
+    plane: Option<Arc<meg_core::plane_client::PlaneClient>>,
+    max_steps_override: Option<usize>,
+) -> Result<(Vec<meg_core::TurnOutcome>, Option<String>)> {
     anyhow::ensure!(
         !request.model.trim().is_empty(),
         "No model selected. Connect a provider and choose /model first."
@@ -658,7 +687,7 @@ async fn run_request_with_plane(
         request.cancel.0.clone(),
     ));
     shim.tools = build_tool_specs(&registry, request.mode, &catalog, plane.is_some());
-    let max_steps = default_max_steps();
+    let max_steps = max_steps_override.unwrap_or_else(default_max_steps);
     let targets = extract_finish_deliverables(&request.workspace, &request.goal, request.mode);
     let mut deliverable_guard =
         meg_tools::deliverable_guard::DeliverableGuard::from_goal(&request.workspace, &request.goal);
@@ -1001,7 +1030,9 @@ fn meg_tui_clock() -> String {
 
 /// Executes a goal with the workspace's saved local/cloud connection settings.
 async fn run_goal_headless(workspace: &Path, goal: &str, options: &TuiOptions) -> Result<()> {
-    println!("MEG (rust) \u{2502} goal: {goal}\n");
+    if !options.json_output {
+        println!("MEG (rust) \u{2502} goal: {goal}\n");
+    }
     anyhow::ensure!(
         std::env::var("MEG_OFFLINE").as_deref() != Ok("1"),
         "MEG_OFFLINE=1: inference is disabled; no provider was contacted"
@@ -1044,8 +1075,51 @@ async fn run_goal_headless(workspace: &Path, goal: &str, options: &TuiOptions) -
     if let Some(effort) = &options.effort {
         state.select_effort(effort.clone());
     }
-    let (outcomes, final_answer) =
-        run_request_with_plane(state.run_request(goal.into()), None, Some(start_plane()?)).await?;
+    if let Some(pinned) = &options.pinned_model {
+        state.select_model(pinned.clone());
+        anyhow::ensure!(
+            state.model == *pinned,
+            "PINNED_MODEL_VIOLATION: expected '{pinned}', resolved '{}'",
+            state.model
+        );
+    }
+    let plane = if std::env::var("MEG_NO_PLANE").as_deref() == Ok("1") {
+        None
+    } else {
+        Some(start_plane()?)
+    };
+    let (outcomes, final_answer) = run_request_with_options(
+        state.run_request(goal.into()),
+        None,
+        plane,
+        options.max_steps,
+    )
+    .await?;
+    if options.json_output {
+        let receipt_path = workspace.join(".meg").join("receipt.json");
+        let receipt_json: Option<serde_json::Value> = if receipt_path.is_file() {
+            std::fs::read_to_string(&receipt_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+        } else {
+            None
+        };
+        let payload = serde_json::json!({
+            "ok": final_answer.is_some(),
+            "goal": goal,
+            "model": state.model,
+            "pinned_model": options.pinned_model,
+            "turns": outcomes.len(),
+            "receipt_path": if receipt_path.is_file() { Some(receipt_path.display().to_string()) } else { None },
+            "receipt": receipt_json,
+            "final_answer": final_answer,
+        });
+        println!("{}", serde_json::to_string(&payload)?);
+        if final_answer.is_none() {
+            anyhow::bail!("Budget exhausted without a final answer");
+        }
+        return Ok(());
+    }
     for (i, o) in outcomes.iter().enumerate() {
         match &o.action {
             meg_core::Action::Tool { tool, .. } => {
@@ -1244,6 +1318,36 @@ mod tests {
 
         let long = vec!["meg".to_string(), "--help".to_string()];
         assert!(matches!(parse_cli_args(&long), CliCommand::Help));
+    }
+
+    #[test]
+    fn run_options_parse_pinned_model_max_steps_and_json() {
+        let args: Vec<String> = [
+            "meg",
+            "run",
+            "--pinned-model",
+            "offline-eval-v1",
+            "--max-steps",
+            "12",
+            "--json",
+            "--",
+            "fix calc.py",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (goal, opts) = parse_run_options(&args).unwrap();
+        assert_eq!(goal, "fix calc.py");
+        assert_eq!(opts.pinned_model.as_deref(), Some("offline-eval-v1"));
+        assert_eq!(opts.model.as_deref(), Some("offline-eval-v1"));
+        assert_eq!(opts.max_steps, Some(12));
+        assert!(opts.json_output);
+
+        let bad_steps: Vec<String> = ["meg", "run", "--max-steps", "0", "hi"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_run_options(&bad_steps).is_err());
     }
 
     #[test]

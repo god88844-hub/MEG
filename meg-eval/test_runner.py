@@ -82,3 +82,106 @@ def test_layer3_golden_50_to_200_and_layer4_public_adapters_and_strength2_18_gri
         AdapterInvocation("terminal_bench_2_1", "claude-sonnet-4", True, ("t1", "t2"))
     )
     assert ok["ready"] is True
+
+def test_live_meg_exe_subprocess_enforces_airlock_edits_file_and_writes_receipt(tmp_path):
+    """End-to-end offline proof against the real compiled `meg.exe` binary."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from runner import run_meg_binary_task
+
+    ws = tmp_path / "live_ws"
+    ws.mkdir()
+    (ws / ".env").write_text("SECRET_TOKEN=sk-proj-999999999999999999999999\n", encoding="utf-8")
+    (ws / "calc.py").write_text(
+        '"""Simple calculator module used for live end-to-end verification."""\n\n'
+        "def add(a: int, b: int) -> int:\n"
+        "    return a - b\n",
+        encoding="utf-8",
+    )
+
+    state = {"turn": 0, "saw_airlock_block": False, "leaked_secret": False}
+
+    class MockOpenAiHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return
+
+        def do_GET(self):
+            body = json.dumps({"data": [{"id": "offline-eval-v1"}]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            raw_req = self.rfile.read(length).decode("utf-8", errors="replace")
+            if "sk-proj-999999999999999999999999" in raw_req:
+                state["leaked_secret"] = True
+            if "SECRET_AIRLOCK" in raw_req:
+                state["saw_airlock_block"] = True
+
+            state["turn"] += 1
+            if state["turn"] == 1:
+                content = json.dumps({
+                    "thought": "Attempt forbidden .env read to verify Ring-0 airlock",
+                    "tool": "read_file",
+                    "args": {"path": ".env"},
+                })
+            elif state["turn"] == 2:
+                content = json.dumps({
+                    "thought": "Airlock blocked .env; now patch calc.py cleanly",
+                    "tool": "edit_file",
+                    "args": {"path": "calc.py", "old_string": "return a - b", "new_string": "return a + b"},
+                })
+            else:
+                content = json.dumps({
+                    "thought": "Patch complete",
+                    "final": "Fixed add() in calc.py.",
+                })
+
+            sse = (
+                f"data: {json.dumps({'id': 'cmpl-1', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': content}, 'finish_reason': None}]})}\n\n"
+                f"data: {json.dumps({'id': 'cmpl-1', 'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                "data: [DONE]\n\n"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(sse)))
+            self.end_headers()
+            self.wfile.write(sse)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MockOpenAiHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        res = run_meg_binary_task(
+            ws,
+            "Fix add() in calc.py",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            pinned_model="offline-eval-v1",
+            max_steps=6,
+            no_plane=True,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert res["returncode"] == 0, f"stderr={res['stderr']}\nstdout={res['stdout']}"
+    assert res["ok"] is True
+    assert res["json"]["pinned_model"] == "offline-eval-v1"
+    assert state["saw_airlock_block"] is True
+    assert state["leaked_secret"] is False
+    assert "return a + b" in (ws / "calc.py").read_text(encoding="utf-8")
+    assert res["receipt"] is not None
+    import hashlib
+    rcpt = res["receipt"]
+    assert rcpt["version"] == 1
+    assert rcpt["task_id"] == "meg-run"
+    assert rcpt["checks_passed"] is True
+    expected_sig = hashlib.sha256(
+        f"v1|{rcpt['task_id']}|{rcpt['tree_hash']}|true".encode("utf-8")
+    ).hexdigest()
+    assert rcpt["receipt_hash"] == expected_sig
