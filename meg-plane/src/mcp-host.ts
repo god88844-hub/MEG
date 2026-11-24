@@ -58,3 +58,211 @@ export class McpHost {
   async stopAll(){await Promise.all([...this.servers.keys()].map(name=>this.stopServer(name)));}
 }
 function expandEnvironment(values:Record<string,string>):Record<string,string>{const result:Record<string,string>={};for(const[key,value]of Object.entries(values)){if(typeof value!=="string")throw new Error("MCP environment/header values must be strings");result[key]=value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g,(_,name)=>{if(process.env[name]===undefined)throw new Error(`Missing MCP environment variable: ${name}`);return process.env[name]!;});}return result;}
+
+// ===========================================================================
+// P3-06: CLI > MCP Enforcer, Hardened Lifecycle, Verdict/Transport Split,
+// Ephemeral uvx Spawner, Scoped Action Tokens & Parallel Web-Research Connector
+// ===========================================================================
+
+import { createHmac, randomBytes } from "node:crypto";
+
+export const CLI_FIRST_BINARIES = [
+  "gh",
+  "supabase",
+  "stripe",
+  "vercel",
+  "git",
+  "curl",
+] as const;
+
+export const DEFAULT_ALLOWED_MCP_SERVERS = [
+  "chrome-devtools",
+  "Context7",
+  "sentry",
+] as const;
+
+export type CliOrMcpRoute =
+  | { route: "cli"; binary: string; reason: string }
+  | { route: "mcp"; server: string; reason: string }
+  | { route: "denied"; target: string; reason: string };
+
+/**
+ * CLI > MCP Enforcer:
+ * - Routes `gh`, `supabase`, `stripe`, `vercel`, `git`, `curl` strictly to native CLIs.
+ * - Restricts default MCP servers to `chrome-devtools`, `Context7`, and `sentry`
+ *   (unless explicitly opted in via `extraAllowedMcp`).
+ */
+export function routeCliOrMcp(
+  target: string,
+  options: { extraAllowedMcp?: readonly string[] } = {},
+): CliOrMcpRoute {
+  const clean = target.trim();
+  const low = clean.toLowerCase();
+  const cliMatch = CLI_FIRST_BINARIES.find(
+    (b) => low === b || low === `${b}-mcp` || low.startsWith(`${b}_`) || low.startsWith(`${b}-`),
+  );
+  if (cliMatch) {
+    return {
+      route: "cli",
+      binary: cliMatch,
+      reason: `CLI > MCP policy: use native '${cliMatch}' CLI directly instead of MCP wrapper`,
+    };
+  }
+  const allowed = new Set(
+    [...DEFAULT_ALLOWED_MCP_SERVERS, ...(options.extraAllowedMcp ?? [])].map((s) => s.toLowerCase()),
+  );
+  if (allowed.has(low)) {
+    return {
+      route: "mcp",
+      server: clean,
+      reason: `Allowed default MCP server '${clean}'`,
+    };
+  }
+  return {
+    route: "denied",
+    target: clean,
+    reason: `MCP server '${clean}' blocked by default allowlist (${DEFAULT_ALLOWED_MCP_SERVERS.join(", ")})`,
+  };
+}
+
+/** Verdict-vs-transport error split so harness retries transport faults without blaming tool logic. */
+export class McpTransportError extends Error {
+  readonly kind = "transport" as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "McpTransportError";
+  }
+}
+
+export class McpVerdictError extends Error {
+  readonly kind = "verdict" as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "McpVerdictError";
+  }
+}
+
+export function classifyMcpError(err: unknown): McpTransportError | McpVerdictError {
+  if (err instanceof McpTransportError || err instanceof McpVerdictError) return err;
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/\b(ECONNREFUSED|EPIPE|ETIMEDOUT|timeout|timed out|abort|closed|Could not initialize)\b/i.test(msg)) {
+    return new McpTransportError(msg);
+  }
+  return new McpVerdictError(msg);
+}
+
+/** Mint a short-lived scoped per-action token (zero raw user token passthrough). */
+export function mintScopedActionToken(
+  secretSeed: string,
+  server: string,
+  action: string,
+  ttlSeconds = 60,
+): { token: string; expiresAt: number; scope: string } {
+  const expiresAt = Date.now() + ttlSeconds * 1000;
+  const nonce = randomBytes(8).toString("hex");
+  const scope = `${server}:${action}`;
+  const sig = createHmac("sha256", secretSeed)
+    .update(`${scope}|${expiresAt}|${nonce}`)
+    .digest("hex")
+    .slice(0, 32);
+  return {
+    token: `meg_act_${nonce}_${sig}`,
+    expiresAt,
+    scope,
+  };
+}
+
+/**
+ * Build an on-demand ephemeral `uvx` MCP server config with:
+ * - Zero turn-context exposure (only explicit whitelisted env vars + scoped action token)
+ * - No raw user credential passthrough.
+ */
+export function buildEphemeralUvxMcpConfig(
+  packageName: string,
+  args: readonly string[],
+  scopedActionToken: string,
+): McpConfig {
+  if (!/^[a-zA-Z0-9._@-]+$/.test(packageName)) {
+    throw new Error(`Invalid uvx package name: ${packageName}`);
+  }
+  return {
+    command: "uvx",
+    args: ["--from", packageName, packageName, ...args],
+    env: {
+      MEG_SCOPED_ACTION_TOKEN: scopedActionToken,
+      MEG_ZERO_TURN_CONTEXT: "1",
+    },
+  };
+}
+
+/** Non-blocking async startup helper + per-caller timeout wrapper around McpHost. */
+export function startMcpNonBlocking(
+  host: McpHost,
+  name: string,
+  config: McpConfig,
+  cwd?: string,
+): { started: true; ready: Promise<McpTool[]> } {
+  const ready = host.connect(name, config, cwd);
+  return { started: true, ready };
+}
+
+export async function callMcpWithPerCallerTimeout<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+): Promise<T> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new Error(`MCP caller timeout after ${timeoutMs}ms`)), timeoutMs);
+  try {
+    return await Promise.race([
+      operation(ac.signal),
+      new Promise<never>((_, reject) => {
+        ac.signal.addEventListener(
+          "abort",
+          () => reject(new McpTransportError(`MCP caller timeout after ${timeoutMs}ms`)),
+          { once: true },
+        );
+      }),
+    ]);
+  } catch (e) {
+    throw classifyMcpError(e);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export interface WebResearchHit {
+  url: string;
+  title: string;
+  excerpt: string;
+  ok: boolean;
+  error?: string;
+}
+
+/** Parallel/browser web-research connector with concurrency bound and offline-injectable fetcher. */
+export class ParallelWebResearchConnector {
+  constructor(
+    private fetcher: (url: string, signal: AbortSignal) => Promise<{ title: string; text: string }>,
+    private timeoutMs = 8_000,
+  ) {}
+
+  async fetchParallel(urls: readonly string[]): Promise<WebResearchHit[]> {
+    const tasks = urls.map(async (url): Promise<WebResearchHit> => {
+      try {
+        const res = await callMcpWithPerCallerTimeout(
+          (sig) => this.fetcher(url, sig),
+          this.timeoutMs,
+        );
+        return { url, title: res.title, excerpt: res.text.slice(0, 600), ok: true };
+      } catch (e) {
+        return {
+          url,
+          title: "",
+          excerpt: "",
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+        };
+      }
+    });
+    return Promise.all(tasks);
+  }
+}

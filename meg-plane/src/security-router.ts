@@ -45,3 +45,69 @@ export function routeTask(
   }
   return { kind: "delegate", reason: `hand-off ${handOffsSoFar + 1} of max 5` };
 }
+
+// ===========================================================================
+// P3-05: DDIPE Skill Supply-Chain Scanner
+// Scans third-party SKILL.md files and embedded code blocks for implicit
+// payload execution before loading.
+// ===========================================================================
+
+export interface DdipeFinding {
+  rule: string;
+  severity: "critical" | "high";
+  line: number;
+  snippet: string;
+  inCodeBlock: boolean;
+}
+
+export interface DdipeScanReport {
+  safe: boolean;
+  source: string;
+  findings: DdipeFinding[];
+}
+
+const DDIPE_RULES: readonly { rule: string; severity: "critical" | "high"; pattern: RegExp }[] = [
+  { rule: "pip_conf_hijack", severity: "critical", pattern: /\bpip\.conf\b|\bpip\.ini\b/i },
+  { rule: "pip_extra_index_url", severity: "critical", pattern: /--extra-index-url|\bextra-index-url\b|\bPIP_EXTRA_INDEX_URL\b/i },
+  { rule: "python_requests_exfil", severity: "critical", pattern: /\brequests\.(post|put)\s*\(/i },
+  { rule: "curl_data_exfil", severity: "critical", pattern: /\bcurl\b[^\n]*(\s-d\s|\s--data\b|\s--data-binary\b|\s-F\s)/i },
+  { rule: "ssh_authorized_keys", severity: "critical", pattern: /\bauthorized_keys\b/i },
+  { rule: "ssh_dir_access", severity: "critical", pattern: /(^|[\s"'`~/$])\.ssh(\/|\\|\b)/i },
+  { rule: "pipe_to_shell", severity: "high", pattern: /\b(curl|wget)\b[^\n]*\|\s*(sh|bash|zsh|pwsh|powershell)\b/i },
+  { rule: "base64_shell_exec", severity: "high", pattern: /base64\s+(-d|--decode)\s*\|\s*(sh|bash|python|node)\b/i },
+];
+
+/**
+ * Scan raw `SKILL.md` content (both prose and fenced code blocks) for DDIPE
+ * supply-chain attack vectors. Any finding blocks loading (`safe: false`).
+ */
+export function scanSkillSupplyChain(content: string, source = "SKILL.md"): DdipeScanReport {
+  const lines = content.split(/\r?\n/);
+  const findings: DdipeFinding[] = [];
+  let inCodeBlock = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (/^\s*```/.test(line)) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    for (const spec of DDIPE_RULES) {
+      if (spec.pattern.test(line)) {
+        findings.push({
+          rule: spec.rule,
+          severity: spec.severity,
+          line: i + 1,
+          snippet: line.trim().slice(0, 140),
+          inCodeBlock,
+        });
+      }
+    }
+  }
+
+  return {
+    safe: findings.length === 0,
+    source,
+    findings,
+  };
+}

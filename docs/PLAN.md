@@ -130,14 +130,14 @@
 - [x] **P3-03 Multi-Agent `Omnigraph` Git-Model Memory (`src/omnigraph.ts`):**
   - Per-agent memory branches keyed by `@key` slugs, record-level `merge_base` conflict detection (`409 divergent_update` rejection on stale full-record writes), `--snapshot` time-travel reads, and reviewer-only merge policy (`HTTP 403` for worker merges to `main`).
   - *Micro-Check:* `bun test test/omnigraph.test.ts`
-- [ ] **P3-04 8-Layer `SKILL.md` Loader & `Skill++` Index (`src/skills.ts`):**
+- [x] **P3-04 8-Layer `SKILL.md` Loader & `Skill++` Index (`src/skills.ts`):**
   - 3-level progressive disclosure (`Metadata ~100 tok` -> `Body <500 lines` -> `references/ assets/ scripts/`), capping active load at `<=3` skills (`<=1` universal + `<=2` specific, `<=1,600` tokens, `>0.80` similarity dedupe) and `<=6 -> 4` tools post-refresh.
   - `Skill++` flat contrastive index (`Supports | Differs | Excludes`), path-scoped `.meg/rules/*.md` (`paths:` YAML), USC duplicate-skill merger, and `Data Forge` `manifest.yaml` multi-client packager (`--check` in CI).
   - *Micro-Check:* `bun test test/skills.test.ts`
-- [ ] **P3-05 `DDIPE` Skill Supply-Chain Scanner (`src/security-router.ts`):**
+- [x] **P3-05 `DDIPE` Skill Supply-Chain Scanner (`src/security-router.ts`):**
   - Scan all third-party `SKILL.md` files and embedded code blocks for implicit payload execution (`pip.conf`, `extra-index-url`, `requests.post`, `curl -d`, `authorized_keys`, `.ssh/`) before loading.
   - *Micro-Check:* `bun test test/security-router.test.ts`
-- [ ] **P3-06 `CLI > MCP` Enforcer & Hardened MCP Host (`src/mcp-host.ts`):**
+- [x] **P3-06 `CLI > MCP` Enforcer & Hardened MCP Host (`src/mcp-host.ts`):**
   - Route `gh`, `supabase`, `stripe`, `vercel`, `git`, `curl` to native CLIs; restrict default MCP servers to `chrome-devtools`, `Context7`, and `sentry`.
   - Non-blocking async startup, per-caller timeouts, verdict-vs-transport error split, on-demand `uvx` ephemeral MCP spawning, zero turn-context exposure, scoped per-action tokens (no token passthrough), and Parallel/browser web-research connector.
   - *Micro-Check:* `bun test test/mcp-host.test.ts`
