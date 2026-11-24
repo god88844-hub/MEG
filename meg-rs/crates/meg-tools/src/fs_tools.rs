@@ -14,9 +14,12 @@ pub const MAX_SEARCH_HITS: usize = 50;
 
 /// Tracks content hashes of previously read file slices to suppress wasteful
 /// repeated identical reads while always returning full content on change or `force: true`.
+type ReadCacheKey = (PathBuf, usize, usize, bool);
+type ReadCacheEntry = (u64, usize, usize);
+
 #[derive(Default)]
 pub struct ReadCache {
-    seen: Mutex<HashMap<(PathBuf, usize, usize, bool), (u64, usize, usize)>>,
+    seen: Mutex<HashMap<ReadCacheKey, ReadCacheEntry>>,
 }
 
 impl ReadCache {

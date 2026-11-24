@@ -349,6 +349,30 @@ impl ToolRegistry {
         reg
     }
 
+    /// Strict locked 6-tool menu with cancellation support (`--core-six` / `MEG_CORE_SIX=1`).
+    pub fn with_core_six_cancellable(
+        workspace: &std::path::Path,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let mut registry = Self::with_core_six(workspace);
+        let gg_ws = workspace.to_path_buf();
+        let gg_cancel = cancel.clone();
+        registry.register_with_schema(
+            "glob_grep",
+            "Unified glob/regex search with cancellation.",
+            glob_grep_schema(),
+            move |args| run_glob_grep(&gg_ws, args, Some(&gg_cancel)),
+        );
+        let ws = workspace.to_path_buf();
+        registry.register_with_schema(
+            "bash",
+            "Run a command with cancellation and timeout_seconds.",
+            bash_schema(),
+            move |args| bash::run_cancellable(&ws, args, &cancel),
+        );
+        registry
+    }
+
     pub fn with_cancellation(
         workspace: &std::path::Path,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,

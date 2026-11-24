@@ -68,13 +68,11 @@ pub fn extract_json_object(text: &str) -> Option<&str> {
                 }
                 depth += 1;
             }
-            '}' => {
-                if depth > 0 {
-                    depth -= 1;
-                    if depth == 0 {
-                        if let Some(s) = start {
-                            return Some(&text[s..=i]);
-                        }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start {
+                        return Some(&text[s..=i]);
                     }
                 }
             }

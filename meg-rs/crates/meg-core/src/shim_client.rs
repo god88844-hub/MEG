@@ -1439,3 +1439,8 @@ mod streaming_regressions {
         assert_eq!(usage, Some((10, 5, 0)));
     }
 }
+impl Default for ShimClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}

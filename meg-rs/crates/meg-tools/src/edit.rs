@@ -21,16 +21,16 @@ fn decode_with_bom(bytes: &[u8]) -> Result<(String, TextEncoding)> {
         let s = std::str::from_utf8(&bytes[3..])?.to_string();
         return Ok((s, TextEncoding::Utf8Bom));
     }
-    if bytes.starts_with(&[0xFF, 0xFE]) && bytes.len() % 2 == 0 {
+    if bytes.starts_with(&[0xFF, 0xFE]) && bytes.len().is_multiple_of(2) {
         let u16s: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         return Ok((String::from_utf16(&u16s)?, TextEncoding::Utf16LeBom));
     }
-    if bytes.starts_with(&[0xFE, 0xFF]) && bytes.len() % 2 == 0 {
+    if bytes.starts_with(&[0xFE, 0xFF]) && bytes.len().is_multiple_of(2) {
         let u16s: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         return Ok((String::from_utf16(&u16s)?, TextEncoding::Utf16BeBom));

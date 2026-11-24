@@ -1,4 +1,4 @@
-//! meg — the Rust binary (Codex shape: Rust owns the loop + TUI).
+//! meg â€” the Rust binary (Codex shape: Rust owns the loop + TUI).
 //!
 //! Entrypoints:
 //! - Bare invocation (`meg`) or `meg tui`: opens the interactive Workstation TUI.
@@ -30,6 +30,9 @@ struct ShimEngine {
     mode: meg_tui::Mode,
     next_tool: std::sync::atomic::AtomicUsize,
     guard: Arc<std::sync::Mutex<meg_tools::deliverable_guard::DeliverableGuard>>,
+    read_only_lock: Arc<meg_tools::deliverable_guard::ReadOnlyLock>,
+    sealed: Arc<meg_tools::deliverable_guard::SealedManifest>,
+    aepn: Arc<std::sync::Mutex<meg_core::finish_hook::AepnSupervisor>>,
 }
 impl ShimEngine {
     fn emit(&self, msg: RunnerMsg) {
@@ -100,6 +103,9 @@ impl LoopEngine for ShimEngine {
         let read_only = self.mode == meg_tui::Mode::Plan;
         let events = self.tx.clone();
         let guard = self.guard.clone();
+        let read_only_lock = self.read_only_lock.clone();
+        let sealed = self.sealed.clone();
+        let aepn = self.aepn.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<meg_tools::ToolResult> {
             anyhow::ensure!(!cancel.is_cancelled(), "Run cancelled");
             if connected{
@@ -109,7 +115,23 @@ impl LoopEngine for ShimEngine {
                 if name=="delegate"{if let Some(tx)=&events{let _=tx.send(RunnerMsg::DelegatedUsage(value["usage"].clone()));}}
                 return Ok(meg_tools::ToolResult{ok:true,output:if let Some(answer)=value["answer"].as_str(){answer.to_string()}else{serde_json::to_string(&value)?}});
             }
+            if let Err(locked_msg) = read_only_lock.guard_mutation(&name) {
+                return Ok(meg_tools::ToolResult { ok: false, output: locked_msg });
+            }
             let unlock = args["unlock_deliverable"].as_bool().unwrap_or(false);
+            if matches!(name.as_str(), "write_file" | "edit_file") {
+                if let Some(raw_path) = args["path"].as_str() {
+                    let norm = raw_path.replace('\\', "/");
+                    if sealed.contains_rel_path(&norm) {
+                        return Ok(meg_tools::ToolResult {
+                            ok: false,
+                            output: format!(
+                                "SEALED_FILE_WALL: '{norm}' is a protected test/migration/check file and cannot be modified"
+                            ),
+                        });
+                    }
+                }
+            }
             if matches!(name.as_str(), "write_file" | "edit_file") {
                 if let Some(raw_path) = args["path"].as_str() {
                     if let Ok(resolved) = meg_tools::fs_tools::resolve(&workspace, raw_path) {
@@ -127,6 +149,14 @@ impl LoopEngine for ShimEngine {
                     if let Some(blocked) = g.check_bash(cmd) {
                         return Ok(meg_tools::ToolResult { ok: false, output: blocked });
                     }
+                    let locked_targets: Vec<std::path::PathBuf> = g.target_paths.iter().cloned().collect();
+                    if !locked_targets.is_empty() {
+                        if let Err(pub_err) =
+                            meg_tools::deliverable_guard::check_publish_state_shell(cmd, &locked_targets)
+                        {
+                            return Ok(meg_tools::ToolResult { ok: false, output: pub_err });
+                        }
+                    }
                 }
             }
             let checkpoint = if matches!(name.as_str(), "write_file" | "edit_file") {
@@ -143,6 +173,7 @@ impl LoopEngine for ShimEngine {
                     checkpoint.commit(&workspace).map_err(|e| {
                         anyhow::anyhow!("File changed but undo journal could not be saved: {e}")
                     })?;
+                    let _ = aepn.lock().unwrap().on_code_edit();
                 }
                 if name == "bash" {
                     let cmd = args
@@ -151,6 +182,7 @@ impl LoopEngine for ShimEngine {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     if is_verification_command(cmd) {
+                        let _ = aepn.lock().unwrap().record_tests_green();
                         let mut g = guard.lock().unwrap();
                         let targets: Vec<std::path::PathBuf> = g.target_paths.iter().cloned().collect();
                         for target in targets {
@@ -388,6 +420,7 @@ struct TuiOptions {
     picker: Option<bool>,
     max_steps: Option<usize>,
     json_output: bool,
+    core_six: bool,
 }
 fn parse_tui_options(args: &[String]) -> Result<TuiOptions> {
     let mut options = TuiOptions::default();
@@ -443,6 +476,10 @@ fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)> {
                 options.json_output = true;
                 i += 1;
             }
+            "--core-six" => {
+                options.core_six = true;
+                i += 1;
+            }
             "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps" => {
                 let flag = &args[i];
                 let value = args
@@ -485,7 +522,7 @@ fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)> {
 }
 
 fn print_usage() {
-    println!("MEG — native agent harness & workstation\n");
+    println!("MEG â€” native agent harness & workstation\n");
     println!("Usage:");
     println!("  meg [COMMAND] [OPTIONS]\n");
     println!("Commands:");
@@ -682,10 +719,12 @@ async fn run_request_with_options(
             }
         }
     }
-    let registry = Arc::new(ToolRegistry::with_cancellation(
-        &request.workspace,
-        request.cancel.0.clone(),
-    ));
+    let strict_core_six = std::env::var("MEG_CORE_SIX").as_deref() == Ok("1");
+    let registry = Arc::new(if strict_core_six {
+        ToolRegistry::with_core_six_cancellable(&request.workspace, request.cancel.0.clone())
+    } else {
+        ToolRegistry::with_cancellation(&request.workspace, request.cancel.0.clone())
+    });
     shim.tools = build_tool_specs(&registry, request.mode, &catalog, plane.is_some());
     let max_steps = max_steps_override.unwrap_or_else(default_max_steps);
     let targets = extract_finish_deliverables(&request.workspace, &request.goal, request.mode);
@@ -710,6 +749,16 @@ async fn run_request_with_options(
     };
     let receipt_workspace = request.workspace.clone();
     let receipt_mode = request.mode;
+    let sealed_manifest = Arc::new(
+        meg_tools::deliverable_guard::SealedManifest::seal_protected_paths(&request.workspace),
+    );
+    let read_only_lock = Arc::new(meg_tools::deliverable_guard::ReadOnlyLock::new());
+    if read_only_lock.check_stop_phrase(&request.goal) {
+        anyhow::bail!("RING0_READ_ONLY_LOCK: stop phrase received; execution halted before any mutation");
+    }
+    let mut aepn_sup = meg_core::finish_hook::AepnSupervisor::new(max_steps as u32);
+    aepn_sup.lock_contract();
+    let aepn = Arc::new(std::sync::Mutex::new(aepn_sup));
     let engine = ShimEngine {
         plane,
         catalog,
@@ -722,6 +771,9 @@ async fn run_request_with_options(
         mode: request.mode,
         next_tool: std::sync::atomic::AtomicUsize::new(1),
         guard: Arc::new(std::sync::Mutex::new(deliverable_guard)),
+        read_only_lock,
+        sealed: sealed_manifest.clone(),
+        aepn,
     };
     let result = meg_core::run_loop_with_config(
         &engine,
@@ -734,6 +786,14 @@ async fn run_request_with_options(
         result.1.is_some(),
         "Turn budget exhausted after {max_steps} steps; no final answer was produced"
     );
+    if !sealed_manifest.is_empty() {
+        if let Err(tampered) = sealed_manifest.verify(&receipt_workspace) {
+            anyhow::bail!(
+                "SEALED_MANIFEST_VIOLATION: protected file(s) modified during run: {}",
+                tampered.join("; ")
+            );
+        }
+    }
     if receipt_mode != meg_tui::Mode::Plan {
         let mutated = result.0.iter().any(|t| match &t.action {
             meg_core::Action::Tool { tool, .. } => {
@@ -1082,6 +1142,9 @@ async fn run_goal_headless(workspace: &Path, goal: &str, options: &TuiOptions) -
             "PINNED_MODEL_VIOLATION: expected '{pinned}', resolved '{}'",
             state.model
         );
+    }
+    if options.core_six {
+        std::env::set_var("MEG_CORE_SIX", "1");
     }
     let plane = if std::env::var("MEG_NO_PLANE").as_deref() == Ok("1") {
         None
@@ -1494,6 +1557,9 @@ mod native_integration {
             mode: meg_tui::Mode::Plan,
             next_tool: std::sync::atomic::AtomicUsize::new(1),
             guard,
+            read_only_lock: Arc::new(meg_tools::deliverable_guard::ReadOnlyLock::new()),
+            sealed: Arc::new(meg_tools::deliverable_guard::SealedManifest::default()),
+            aepn: Arc::new(std::sync::Mutex::new(meg_core::finish_hook::AepnSupervisor::new(10))),
         };
         for name in ["bash", "write_file", "edit_file"] {
             assert!(engine
@@ -1665,6 +1731,56 @@ mod native_integration {
     }
 
     #[tokio::test]
+    async fn sealed_manifest_blocks_direct_edit_and_detects_bash_tampering_on_protected_tests() {
+        let server = fixture().await;
+        let ws = std::env::temp_dir().join(format!("meg-sealed-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(ws.join("tests")).unwrap();
+        std::fs::write(ws.join("tests/spec.rs"), "assert!(true);\n").unwrap();
+
+        // Turn 1: model tries edit_file on tests/spec.rs -> blocked by SEALED_FILE_WALL
+        // Turn 2: model tries to bypass via bash overwrite -> post-run SealedManifest fails the run
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"try edit\",\"tool\":\"edit_file\",\"args\":{\"path\":\"tests/spec.rs\",\"old_string\":\"true\",\"new_string\":\"false\"}}" } }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"bypass via bash\",\"tool\":\"bash\",\"args\":{\"command\":\"echo tampered > tests/spec.rs\"}}" } }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"done\",\"final\":\"all done\"}" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let req = meg_tui::RunRequest {
+            workspace: ws.clone(),
+            goal: "Update code without touching tests".into(),
+            base_url: format!("{}/v1", server.uri()),
+            model: "fixture".into(),
+            provider: None,
+            mode: meg_tui::Mode::default(),
+            effort: "medium".into(),
+            history: vec![],
+            cancel: meg_core::CancellationToken::default(),
+        };
+        let err = run_request(req, None).await.unwrap_err();
+        assert!(err.to_string().contains("SEALED_MANIFEST_VIOLATION"), "{err}");
+        assert!(!ws.join(".meg/receipt.json").exists(), "Tampered run must NEVER sign a receipt");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
     async fn deliverable_guard_locks_verified_file_and_allows_explicit_unlock() {
         let server = fixture().await;
         let ws = std::env::temp_dir().join(format!("meg-cli-p4-dg-{}", uuid::Uuid::new_v4()));
@@ -1686,6 +1802,9 @@ mod native_integration {
             mode: meg_tui::Mode::default(),
             next_tool: std::sync::atomic::AtomicUsize::new(1),
             guard: Arc::new(std::sync::Mutex::new(guard)),
+            read_only_lock: Arc::new(meg_tools::deliverable_guard::ReadOnlyLock::new()),
+            sealed: Arc::new(meg_tools::deliverable_guard::SealedManifest::default()),
+            aepn: Arc::new(std::sync::Mutex::new(meg_core::finish_hook::AepnSupervisor::new(10))),
         };
 
         engine

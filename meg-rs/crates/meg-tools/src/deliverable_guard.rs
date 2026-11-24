@@ -271,19 +271,18 @@ pub fn deep_artifact_sanity(workspace: &Path, artifacts: &[PathBuf]) -> Result<(
                 }
                 Err(_) => problems.push(format!("{name}: unreadable image")),
             }
-        } else if lower.ends_with(".caffemodel")
+        } else if (lower.ends_with(".caffemodel")
             || lower.ends_with(".bin")
             || lower.ends_with(".ftz")
             || lower.ends_with(".pt")
             || lower.ends_with(".pth")
             || lower.ends_with(".pkl")
-            || lower.ends_with(".rds")
+            || lower.ends_with(".rds"))
+            && size < 4096
         {
-            if size < 4096 {
-                problems.push(format!(
-                    "{name}: weights file is {size} bytes (< 4096) — a dummy file"
-                ));
-            }
+            problems.push(format!(
+                "{name}: weights file is {size} bytes (< 4096) — a dummy file"
+            ));
         }
     }
     if problems.is_empty() {
@@ -293,10 +292,7 @@ pub fn deep_artifact_sanity(workspace: &Path, artifacts: &[PathBuf]) -> Result<(
     }
 }
 
-/// Whitelist single-file sweep (2026-11-12 T1.3 port): when the deliverable
-/// is the ONLY source file in its directory, remove EVERY other entry so
-/// os.listdir() == [expected] by construction. Returns removed names.
-
+// Whitelist single-file sweep helper magic bytes.
 fn byte_png_magic() -> &'static [u8] {
     &[0x89, b'P', b'N', b'G']
 }
@@ -451,7 +447,7 @@ pub fn sha256_hex(input: &[u8]) -> String {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([
@@ -596,10 +592,8 @@ pub fn check_gh_privacy_and_publish(command: &str, allowed_repo: Option<&str>) -
         for (i, tok) in tokens.iter().enumerate() {
             let repo_arg = if *tok == "--repo" || *tok == "-R" {
                 tokens.get(i + 1).copied()
-            } else if let Some(rest) = tok.strip_prefix("--repo=") {
-                Some(rest)
             } else {
-                None
+                tok.strip_prefix("--repo=")
             };
             if let Some(target) = repo_arg {
                 let target_clean = target.trim_matches(|c| c == '"' || c == '\'');
@@ -666,6 +660,45 @@ impl SealedManifest {
 
     pub fn is_empty(&self) -> bool {
         self.hashes.is_empty()
+    }
+
+    pub fn contains_rel_path(&self, rel: &str) -> bool {
+        self.hashes.contains_key(&rel.replace('\\', "/"))
+    }
+
+    /// Seal all existing protected files under `tests/`, `migrations/`, and `scripts/check.*`.
+    pub fn seal_protected_paths(workspace: &std::path::Path) -> Self {
+        let mut hashes = std::collections::BTreeMap::new();
+        for fixed in ["scripts/check.ps1", "scripts/check.sh", "scripts/selftest.ps1", "scripts/selftest.sh"] {
+            let full = workspace.join(fixed);
+            if full.is_file() {
+                if let Ok(bytes) = std::fs::read(&full) {
+                    hashes.insert(fixed.to_string(), sha256_hex(&bytes));
+                }
+            }
+        }
+        for dir_name in ["tests", "migrations"] {
+            let root = workspace.join(dir_name);
+            if !root.is_dir() {
+                continue;
+            }
+            let mut stack = vec![root];
+            while let Some(dir) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p.is_file() {
+                        if let (Ok(rel), Ok(bytes)) = (p.strip_prefix(workspace), std::fs::read(&p)) {
+                            let key = rel.to_string_lossy().replace('\\', "/");
+                            hashes.insert(key, sha256_hex(&bytes));
+                        }
+                    }
+                }
+            }
+        }
+        Self { hashes }
     }
 }
 

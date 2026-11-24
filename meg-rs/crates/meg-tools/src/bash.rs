@@ -145,6 +145,39 @@ impl Drop for ProcessJob {
     }
 }
 
+
+fn build_sandboxed_command(workspace: &Path, cmd_line: &str, use_powershell: bool) -> Command {
+    if cfg!(windows) {
+        if use_powershell {
+            let translated = translate_posix_for_powershell51(cmd_line);
+            let mut c = Command::new("powershell.exe");
+            c.args(["-NoProfile", "-NonInteractive", "-Command", &translated])
+                .current_dir(workspace);
+            return c;
+        }
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(cmd_line).current_dir(workspace);
+        return c;
+    }
+
+    let sandbox_mode = std::env::var("MEG_SANDBOX").unwrap_or_default();
+    if cfg!(target_os = "linux") && matches!(sandbox_mode.as_str(), "1" | "true" | "bwrap") {
+        let preview = sandbox_command_preview("linux", workspace, cmd_line);
+        let mut c = Command::new(&preview[0]);
+        c.args(&preview[1..]).current_dir(workspace);
+        return c;
+    }
+    if cfg!(target_os = "macos") && matches!(sandbox_mode.as_str(), "1" | "true" | "seatbelt") {
+        let preview = sandbox_command_preview("macos", workspace, cmd_line);
+        let mut c = Command::new(&preview[0]);
+        c.args(&preview[1..]).current_dir(workspace);
+        return c;
+    }
+
+    let mut c = Command::new("sh");
+    c.arg("-c").arg(cmd_line).current_dir(workspace);
+    c
+}
 pub fn run(workspace: &Path, args: &Value) -> Result<String> {
     run_cancellable(workspace, args, &std::sync::atomic::AtomicBool::new(false))
 }
@@ -175,10 +208,9 @@ pub fn run_cancellable(
         .and_then(Value::as_u64)
         .unwrap_or(60)
         .clamp(1, 600);
-    let mut cmd = Command::new(if cfg!(windows) { "cmd" } else { "sh" });
-    cmd.arg(if cfg!(windows) { "/C" } else { "-c" })
-        .arg(cmd_line)
-        .current_dir(workspace);
+    let use_ps = args.get("shell").and_then(Value::as_str) == Some("powershell")
+        || (cfg!(windows) && cmd_line.trim_start().starts_with("export "));
+    let mut cmd = build_sandboxed_command(workspace, cmd_line, use_ps);
     headless_env(&mut cmd);
     let mut child = spawn_detached(&mut cmd)?;
     let pid = child.id();
