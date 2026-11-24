@@ -131,6 +131,11 @@ pub fn apply_hashline_patch(workspace: &Path, args: &Value) -> Result<String> {
     ensure!(!edits.is_empty(), "'edits' array cannot be empty");
 
     let full = resolve(workspace, path)?;
+    if crate::security_guards::is_blocked_env_path(&full) {
+        bail!(
+            "SECRET_AIRLOCK: direct edit of '{path}' is blocked (.env* files are airlocked)"
+        );
+    }
     let raw_bytes = std::fs::read(&full)?;
     let (content, enc) = decode_with_bom(&raw_bytes)?;
     let uses_crlf = content.contains("\r\n");
@@ -218,6 +223,10 @@ pub fn apply_hashline_patch(workspace: &Path, args: &Value) -> Result<String> {
     } else {
         joined
     };
+    let hot_violations = crate::deliverable_guard::lint_hot_frame_file(&full, &final_text);
+    if !hot_violations.is_empty() {
+        bail!("HOT_FRAME_LINTER_BLOCKED:\n{}", hot_violations.join("\n"));
+    }
     write_atomic(&full, &encode_with_bom(&final_text, enc))?;
     Ok(format!("hashline-patched {path} ({op_count} edit(s))"))
 }
@@ -247,6 +256,11 @@ pub fn str_replace(workspace: &Path, args: &Value) -> Result<String> {
 
     ensure!(!old.is_empty(), "old_string cannot be empty");
     let full = resolve(workspace, path)?;
+    if crate::security_guards::is_blocked_env_path(&full) {
+        bail!(
+            "SECRET_AIRLOCK: direct edit of '{path}' is blocked (.env* files are airlocked)"
+        );
+    }
     let raw_bytes = std::fs::read(&full)?;
     let (content, enc) = decode_with_bom(&raw_bytes)?;
 

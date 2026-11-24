@@ -163,6 +163,13 @@ pub fn run_cancellable(
         .or_else(|| args.get("cmd"))
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("missing 'command'"))?;
+    crate::security_guards::validate_compound_bash(cmd_line)?;
+    let allowed_repo = std::env::var("MEG_ALLOWED_GH_REPO").ok();
+    if let Err(msg) =
+        crate::deliverable_guard::check_gh_privacy_and_publish(cmd_line, allowed_repo.as_deref())
+    {
+        bail!("{msg}");
+    }
     let timeout_secs = args
         .get("timeout_seconds")
         .and_then(Value::as_u64)
@@ -235,6 +242,7 @@ pub fn run_cancellable(
             &body[end..]
         );
     }
+    body = crate::security_guards::scrub_sal_observation(&body);
     if let Some(reason) = interrupted {
         bail!("{reason}; process tree killed.\n{body}");
     }

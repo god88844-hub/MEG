@@ -103,6 +103,11 @@ pub fn read_file_cached(
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'path'"))?;
     let full = resolve(workspace, path)?;
+    if crate::security_guards::is_blocked_env_path(&full) {
+        bail!(
+            "SECRET_AIRLOCK: direct read of '{path}' is blocked (.env* files cannot enter model context; use .env.example)"
+        );
+    }
     let text = std::fs::read_to_string(&full)?;
 
     let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as usize);
@@ -171,10 +176,10 @@ pub fn read_file_cached(
             }
         }
         let out = out.trim_end_matches('\n').to_string();
-        return Ok(cap_utf8(out, MAX_READ_BYTES));
+        return Ok(cap_utf8(crate::security_guards::scrub_sal_observation(&out), MAX_READ_BYTES));
     }
 
-    Ok(cap_utf8(text, MAX_READ_BYTES))
+    Ok(cap_utf8(crate::security_guards::scrub_sal_observation(&text), MAX_READ_BYTES))
 }
 
 fn cap_utf8(text: String, max_bytes: usize) -> String {
@@ -196,6 +201,15 @@ pub fn write_file(workspace: &Path, args: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing 'content'"))?;
     let full = resolve(workspace, path)?;
+    if crate::security_guards::is_blocked_env_path(&full) {
+        bail!(
+            "SECRET_AIRLOCK: direct write to '{path}' is blocked (.env* files are airlocked)"
+        );
+    }
+    let hot_violations = crate::deliverable_guard::lint_hot_frame_file(&full, content);
+    if !hot_violations.is_empty() {
+        bail!("HOT_FRAME_LINTER_BLOCKED:\n{}", hot_violations.join("\n"));
+    }
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent)?;
     }

@@ -312,3 +312,55 @@ mod tests {
         assert!(!child.has(ChildAuthority::NETWORK));
     }
 }
+#[cfg(test)]
+mod live_ring0_wiring_tests {
+    use serde_json::json;
+
+    #[test]
+    fn live_tools_enforce_compound_bash_sal_scrub_env_airlock_and_hot_linter() {
+        let ws = std::env::temp_dir().join(format!("meg-live-ring0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join(".env"), "API_KEY=supersecret\n").unwrap();
+        std::fs::write(ws.join(".env.example"), "API_KEY=changeme\n").unwrap();
+        std::fs::write(ws.join("config.txt"), "leaked=sk-proj-1234567890abcdef1234567890\n").unwrap();
+
+        // 1. Live bash blocks compound denied stage BEFORE Stage 1 runs
+        let denied_bash = crate::bash::run(
+            &ws,
+            &json!({"command": "echo stage1 > pwned.txt && git push --force origin main"}),
+        );
+        assert!(denied_bash.is_err());
+        assert!(!ws.join("pwned.txt").exists(), "Stage 1 must NEVER run when Stage 2 is denied");
+
+        // 2. Live bash scrubs secrets from stdout via SAL membrane
+        let scrubbed_bash = crate::bash::run(
+            &ws,
+            &json!({"command": "echo sk-proj-1234567890abcdef1234567890"}),
+        )
+        .unwrap();
+        assert!(scrubbed_bash.contains("<SURROGATE_SECRET_1>"), "{scrubbed_bash}");
+        assert!(!scrubbed_bash.contains("sk-proj-"), "{scrubbed_bash}");
+
+        // 3. Live read_file, write_file, edit_file enforce .env airlock while allowing .env.example
+        assert!(crate::fs_tools::read_file(&ws, &json!({"path": ".env"})).is_err());
+        assert!(crate::fs_tools::read_file(&ws, &json!({"path": ".env.example"})).is_ok());
+        assert!(crate::fs_tools::write_file(&ws, &json!({"path": ".env.local", "content": "X=1"})).is_err());
+        assert!(crate::edit::str_replace(&ws, &json!({"path": ".env", "old_string": "super", "new_string": "x"})).is_err());
+
+        // 4. Live read_file scrubs secrets via SAL membrane
+        let read_cfg = crate::fs_tools::read_file(&ws, &json!({"path": "config.txt"})).unwrap();
+        assert!(read_cfg.contains("<SURROGATE_SECRET_1>"), "{read_cfg}");
+        assert!(!read_cfg.contains("sk-proj-"), "{read_cfg}");
+
+        // 5. Live write_file enforces .hot.* zero-alloc / zero-unseeded-RNG linter
+        let hot_err = crate::fs_tools::write_file(
+            &ws,
+            &json!({"path": "physics.hot.ts", "content": "const x = Math.random();\n"}),
+        );
+        assert!(hot_err.is_err());
+        assert!(!ws.join("physics.hot.ts").exists());
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+}
