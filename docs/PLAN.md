@@ -190,13 +190,13 @@
 - [x] **P5-03 7-Rule File Swarm (`src/file_swarm.ts`):**
   - Enforce `BOARD.md`, pairwise scope-tightened `tasks/T[n].md`, `outputs/T[n].md` requiring final-line `END` sentinel, `checks/CONFLICTS.md`, `[T#]` paragraph provenance in `FINAL.md`, and `<=30`-line `LESSONS.md`.
   - *Micro-Check:* `bun test test/file_swarm.test.ts`
-- [ ] **P5-04 Goal & Motion Engineering (`src/goals_motions.ts`):**
+- [x] **P5-04 Goal & Motion Engineering (`src/goals_motions.ts`):**
   - Dual-Cadence handoff (`STATE.md` loops -> `GOAL.md` + `goal-budget.md` + quiet `update_goal` telemetry + `/goal status|pause|resume|clear`).
   - Anti-Goal-Gaming floor invariants (`total_test_assertions >= baseline`, `0 protected files deleted`).
   - Background Entity Context Gatherers + horizontal **Motion Agents** grouping pending drafts into a Homogeneous Batch Review Queue for cross-entity tacit taste transfer.
   - Isolated scheduled routine runner with 0-token pre-run delta check (`routines/state/<name>.txt`) in `dontAsk` mode.
   - *Micro-Check:* `bun test test/goals_motions.test.ts`
-- [ ] **P5-05 GitHub IssueBot, CI Triage & PR Hygiene (`src/github.ts`):**
+- [x] **P5-05 GitHub IssueBot, CI Triage & PR Hygiene (`src/github.ts`):**
   - **IssueBot 5-Stage Graph:** Tool-less Planner reads untrusted issue -> code-validated contract -> raw issue deleted (Lethal Trifecta broken) -> worktree Builder -> parallel Verify (`test+lint+typecheck`) -> cold Reviewer -> idempotent Draft PR -> CI watch -> human merge.
   - **5-Category CI Triage (`env | flake | bug | dep | infra`)**, 4-tick PR watcher (`Watching 1/3..3/3 -> Ready`), conflict-only rebase, `Qodo` approval invalidation on new commits, multi-PR session summary, post-merge staging QA, and 2-PR missed-case rule extraction.
   - *Micro-Check:* `bun test test/github.test.ts`
