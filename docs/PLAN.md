@@ -149,23 +149,23 @@
 ## PHASE 4 -- Zero-Trust Verification Gauntlet & Loop Engineering (`meg-plane/` + `meg-rs/`)
 **Language:** TypeScript + Rust
 
-- [ ] **P4-01 Verified Work Loop (`Loop 2`) & Stall/EFC Guards (`src/verifier_loop.ts`):**
+- [x] **P4-01 Verified Work Loop (`Loop 2`) & Stall/EFC Guards (`src/verifier_loop.ts`):**
   - Pre-run `check_cannot_fail` gate (`Green -> Red -> Green`), `<3,000`-char `FAILED / EXPECTED / SAW / file:line` feedback, path+digit-masked fingerprint `phi(e)`, `.loop/state.json` `tried` ledger, 3-pattern loop detector (`Repetition`, `Stagnation`, `A->B->A Cycling`), `EFC` (`I*V*R*M`) monitor, `MAX_SAME = 2` stall exit parking on `blocked/<id>`, and Karpathy Clean-Slate Replay (after `>4` messy retries, reset via `side-git` and re-implement cleanly in 1 fresh pass).
   - Concentric 4-Layer Diagnostic Router (`Harness -> Loop -> Context -> Prompt`), `DeclineCraft` calibrated abstention, and `Adaptive Replay Refinement`.
   - *Micro-Check:* `bun test test/verifier_loop.test.ts`
-- [ ] **P4-02 Patched `RISEHARNESS` 4-Stage Handshake (`src/handshake.ts`):**
+- [x] **P4-02 Patched `RISEHARNESS` 4-Stage Handshake (`src/handshake.ts`):**
   - Unified `+SE/+OO` (validates `verification_cmd` + `expected_exit_code` and runs ONCE in 30s out-of-band sandbox, failing open on infra error) + `spec_check_failure_ledger` (`pytest --last-failed` keyed by artifact SHA).
   - `+DI` (designated script invocation / unverified diff check) + `+IR` (reachable single-signature AND conflicting-readings branches), bounded at `MAX_WITHHOLDS = 1` per gate.
   - *Micro-Check:* `bun test test/handshake.test.ts`
-- [ ] **P4-03 Verification Engineering (`L0`-`L5`) & Maker-Blinded `CHECKS.md` (`src/checks_gate.ts`):**
+- [x] **P4-03 Verification Engineering (`L0`-`L5`) & Maker-Blinded `CHECKS.md` (`src/checks_gate.ts`):**
   - Block completion below `L4 . Proof Attached`.
   - Keep `CHECKS.md` scoring blinded from Maker; return only failed lines (max 3 rounds); live ground-truth recomputation + `>30%` delta flagging + cross-tenant leak scan + `MiRL` 8-misbehavior gate + `CAAF` monotonic state locking (`read_only: true` on passing criteria).
   - *Micro-Check:* `bun test test/checks_gate.test.ts`
-- [ ] **P4-04 `L1` After-Edit Reminders & Cold Cross-Model `L3` Critic (`src/critic.ts`):**
+- [x] **P4-04 `L1` After-Edit Reminders & Cold Cross-Model `L3` Critic (`src/critic.ts`):**
   - Disable wasteful `L2` self-recheck prompts; emit `L1` after-edit reminders (capped at 4/run).
   - Harness assigns a different model family (`>=` writer capability) in a fresh context seeing ONLY Contract + `git diff` + test logs (`Claim-guided: changes`, `Width = 1..4` sequential critics before 1 revision, conclusion-blind mode, `/tmp` throwaway probes, `PROXY`/`SHARED MISTAKE` bans, non-mutation enforced).
   - *Micro-Check:* `bun test test/critic.test.ts`
-- [ ] **P4-05 `Poteto Pyramid` Linters, Mutation Gate & Statechart Checker (`src/poteto_checks.ts`):**
+- [x] **P4-05 `Poteto Pyramid` Linters, Mutation Gate & Statechart Checker (`src/poteto_checks.ts`):**
   - AST anti-stub/false-zero scanner (`TODO`, `501`, `catch { return [] }`, weakened assertions) + Remediation-Injecting Linter formatter (`[REMEDIATION FIX]: ...`).
   - `tesearch`-style fast mutation check rejecting hollow tests + BFS Statechart/`TLA+` reachability verifier (deadlock & forbidden-state checks) + optional 3-question Maintainer Comprehension Quiz on diffs `>300` lines.
   - *Micro-Check:* `bun test test/poteto_checks.test.ts`
