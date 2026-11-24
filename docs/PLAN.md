@@ -225,15 +225,15 @@
   - `M5` 7-Subsystem ECS template (`SCHEMA.md` + `.hot.*` zero-alloc 60-FPS lint) + WebGL 0-console-error check + automated BFS playtester.
   - `Kepler 1.0` / `Schema` world-model (`step(state, action)` 100% `run_backtest` certification + auto-`RESET` on `GAME_OVER`).
   - *Micro-Check:* `bun test test/pack_games.test.ts`
-- [ ] **P6-05 Pack 4 -- Graphic Design, SVG, 60-FPS Motion Video & 3D/CAD (Domains 18-20):**
+- [x] **P6-05 Pack 4 -- Graphic Design, SVG, 60-FPS Motion Video & 3D/CAD (Domains 18-20):**
   - 2-Stage Parametric Skeleton rule (named joints/anchors before raw coordinates) + `BrickBench` DSG visual question graph.
   - `3DCodeVerse` 17-bundle skill library & 28-rule routing table (`bpy`, `CadQuery`, `OpenSCAD`, `Three.js`, `URDF`, `GLSL`, `OpenGL` + spatial collision/connectivity checks) + 18 `VisualBench` deliverable checklists.
   - Deterministic `window.seek(t)` 60-FPS Motion Studio (closed-form multi-target springs `track(t, keys)`, `librosa` beat sync, OpenCV `#00B140` chroma cutouts, 3 FFmpeg sheets `contact.png`, `strip.png`, `phone.png`, plus `2000ms`/`15000ms` frame-diff check).
   - *Micro-Check:* `pytest meg-eval/oracles/test_visual_motion.py`
-- [ ] **P6-06 Pack 5 -- OS/Kernel, Compilers, Embedded/IoT, Edge, Robotics, Quantum, Web3, DevOps/Cloud/SRE, AppSec & Data/AI-ML (Domains 21-29):**
+- [x] **P6-06 Pack 5 -- OS/Kernel, Compilers, Embedded/IoT, Edge, Robotics, Quantum, Web3, DevOps/Cloud/SRE, AppSec & Data/AI-ML (Domains 21-29):**
   - QEMU boot / GCC differential compiler oracle, `ChartEvo` `SELT` compiled local toolchains (`3%-5%` near-miss audit + uncertain-interval midpoint ban), read-only AppSec audit, `foundry`/`slither` (Web3), `Qiskit` (Quantum + Competing-Algorithm search), and `ROS2`/`URDF` (Robotics) templates.
   - *Micro-Check:* `pytest meg-eval/oracles/test_systems_selt.py`
-- [ ] **P6-07 Pack 6 -- Daily Usage, Second Brain & Team Rooms:**
+- [x] **P6-07 Pack 6 -- Daily Usage, Second Brain & Team Rooms:**
   - Flat-file Obsidian/Markdown Second Brain (`notes/`, `people/`, `projects/`, `inbox/`, `briefs/`, `decisions.md`) with Karpathy 6-Pass Wiki Compiler + `/remember`, `/recall`, `/resurface` (1/3/7/21/60d), `/review`, `/morning-brief`, `/weekly-review` (`dontAsk` draft-only).
   - Local `Alook`-style team rooms (`#intel` vs `#alerts`) + `Nimble`-style dated web snapshot diffing + voice keyterm support.
   - *Micro-Check:* `bun test test/pack_daily.test.ts`
