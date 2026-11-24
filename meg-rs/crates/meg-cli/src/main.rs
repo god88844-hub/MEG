@@ -33,6 +33,10 @@ struct ShimEngine {
     read_only_lock: Arc<meg_tools::deliverable_guard::ReadOnlyLock>,
     sealed: Arc<meg_tools::deliverable_guard::SealedManifest>,
     aepn: Arc<std::sync::Mutex<meg_core::finish_hook::AepnSupervisor>>,
+    edited_files: Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
+    verify_cmd: Option<String>,
+    require_verify: bool,
+    verify_passed: Arc<std::sync::atomic::AtomicBool>,
 }
 impl ShimEngine {
     fn emit(&self, msg: RunnerMsg) {
@@ -106,6 +110,7 @@ impl LoopEngine for ShimEngine {
         let read_only_lock = self.read_only_lock.clone();
         let sealed = self.sealed.clone();
         let aepn = self.aepn.clone();
+        let edited_files = self.edited_files.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<meg_tools::ToolResult> {
             anyhow::ensure!(!cancel.is_cancelled(), "Run cancelled");
             if connected{
@@ -174,6 +179,14 @@ impl LoopEngine for ShimEngine {
                         anyhow::anyhow!("File changed but undo journal could not be saved: {e}")
                     })?;
                     let _ = aepn.lock().unwrap().on_code_edit();
+                    if let Some(raw_path) = args["path"].as_str() {
+                        if let Ok(resolved) = meg_tools::fs_tools::resolve(&workspace, raw_path) {
+                            let mut ef = edited_files.lock().unwrap();
+                            if !ef.contains(&resolved) {
+                                ef.push(resolved);
+                            }
+                        }
+                    }
                 }
                 if name == "bash" {
                     let cmd = args
@@ -315,6 +328,62 @@ impl LoopEngine for ShimEngine {
         self.emit(RunnerMsg::Online(result.is_ok()));
         result
     }
+    async fn verify_before_finish(&self, _answer: &str) -> Result<Option<String>> {
+        if self.mode == meg_tui::Mode::Plan {
+            return Ok(None);
+        }
+        let edited: Vec<std::path::PathBuf> = self.edited_files.lock().unwrap().clone();
+        // 1. Live Poteto anti-stub & false-zero check on every edited code file.
+        let mut stub_findings = Vec::new();
+        for path in &edited {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                stub_findings.extend(meg_tools::deliverable_guard::scan_anti_stub_and_false_zero(
+                    path, &text,
+                ));
+            }
+        }
+        if !stub_findings.is_empty() {
+            return Ok(Some(format!(
+                "[ANTI_STUB_GATE WITHHOLD] Incomplete stub or false-zero handler detected in edited code:\n{}\nFix all items above and verify before declaring completion.",
+                stub_findings.join("\n")
+            )));
+        }
+
+        // 2. Out-of-band `+OO` external verification command (30s timeout).
+        if let Some(cmd) = self.verify_cmd.clone() {
+            let ws = self.workspace.clone();
+            let cancel = self.cancel.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                meg_tools::bash::run_cancellable(
+                    &ws,
+                    &serde_json::json!({ "command": cmd, "timeout_seconds": 30 }),
+                    &cancel.0,
+                )
+            })
+            .await?;
+            match res {
+                Ok(_) => {
+                    self.verify_passed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = self.aepn.lock().unwrap().record_tests_green();
+                }
+                Err(e) => {
+                    self.verify_passed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return Ok(Some(format!(
+                        "[+OO VERIFICATION WITHHOLD] External check failed:\n{e}\nFix the underlying code (never protected tests) and try again."
+                    )));
+                }
+            }
+        } else if self.require_verify && !edited.is_empty() {
+            // 3. Strict AEPN check when --require-verify is active: tests must be green AFTER the last code edit.
+            let tests_green = self.aepn.lock().unwrap().p_tests_green;
+            if tests_green == 0 {
+                return Ok(Some(
+                    "[AEPN VERIFICATION WITHHOLD] Code was edited without a passing verification command afterward. Run your test/build check via bash before finishing.".into()
+                ));
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn visible_preview(raw: &str) -> String {
@@ -423,6 +492,8 @@ struct TuiOptions {
     core_six: bool,
     pair_mode: Option<String>,
     executor_model: Option<String>,
+    verify_cmd: Option<String>,
+    require_verify: bool,
 }
 fn parse_tui_options(args: &[String]) -> Result<TuiOptions> {
     let mut options = TuiOptions::default();
@@ -482,7 +553,11 @@ fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)> {
                 options.core_six = true;
                 i += 1;
             }
-            "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps" | "--pair-mode" | "--executor-model" => {
+            "--require-verify" => {
+                options.require_verify = true;
+                i += 1;
+            }
+            "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps" | "--pair-mode" | "--executor-model" | "--verify-cmd" => {
                 let flag = &args[i];
                 let value = args
                     .get(i + 1)
@@ -503,6 +578,7 @@ fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)> {
                         options.pair_mode = Some(value.clone());
                     }
                     "--executor-model" => options.executor_model = Some(value.clone()),
+                    "--verify-cmd" => options.verify_cmd = Some(value.clone()),
                     "--max-steps" => {
                         let parsed: usize = value
                             .parse()
@@ -670,18 +746,25 @@ async fn run_request(
 ) -> Result<(Vec<meg_core::TurnOutcome>, Option<String>)> {
     run_request_with_plane(request, tx, None).await
 }
+#[derive(Default, Clone)]
+struct RunExtras {
+    max_steps: Option<usize>,
+    verify_cmd: Option<String>,
+    require_verify: bool,
+}
+
 async fn run_request_with_plane(
     request: meg_tui::RunRequest,
     tx: Option<Sender<RunnerMsg>>,
     plane: Option<Arc<meg_core::plane_client::PlaneClient>>,
 ) -> Result<(Vec<meg_core::TurnOutcome>, Option<String>)> {
-    run_request_with_options(request, tx, plane, None).await
+    run_request_with_options(request, tx, plane, RunExtras::default()).await
 }
 async fn run_request_with_options(
     request: meg_tui::RunRequest,
     tx: Option<Sender<RunnerMsg>>,
     plane: Option<Arc<meg_core::plane_client::PlaneClient>>,
-    max_steps_override: Option<usize>,
+    extras: RunExtras,
 ) -> Result<(Vec<meg_core::TurnOutcome>, Option<String>)> {
     anyhow::ensure!(
         !request.model.trim().is_empty(),
@@ -736,7 +819,7 @@ async fn run_request_with_options(
         ToolRegistry::with_cancellation(&request.workspace, request.cancel.0.clone())
     });
     shim.tools = build_tool_specs(&registry, request.mode, &catalog, plane.is_some());
-    let max_steps = max_steps_override.unwrap_or_else(default_max_steps);
+    let max_steps = extras.max_steps.unwrap_or_else(default_max_steps);
     let targets = extract_finish_deliverables(&request.workspace, &request.goal, request.mode);
     let mut deliverable_guard =
         meg_tools::deliverable_guard::DeliverableGuard::from_goal(&request.workspace, &request.goal);
@@ -769,6 +852,8 @@ async fn run_request_with_options(
     let mut aepn_sup = meg_core::finish_hook::AepnSupervisor::new(max_steps as u32);
     aepn_sup.lock_contract();
     let aepn = Arc::new(std::sync::Mutex::new(aepn_sup));
+    let edited_files = Arc::new(std::sync::Mutex::new(Vec::<std::path::PathBuf>::new()));
+    let verify_passed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let engine = ShimEngine {
         plane,
         catalog,
@@ -783,7 +868,11 @@ async fn run_request_with_options(
         guard: Arc::new(std::sync::Mutex::new(deliverable_guard)),
         read_only_lock,
         sealed: sealed_manifest.clone(),
-        aepn,
+        aepn: aepn.clone(),
+        edited_files: edited_files.clone(),
+        verify_cmd: extras.verify_cmd.clone(),
+        require_verify: extras.require_verify,
+        verify_passed: verify_passed.clone(),
     };
     let result = meg_core::run_loop_with_config(
         &engine,
@@ -801,6 +890,44 @@ async fn run_request_with_options(
             anyhow::bail!(
                 "SEALED_MANIFEST_VIOLATION: protected file(s) modified during run: {}",
                 tampered.join("; ")
+            );
+        }
+    }
+    // Hard post-loop check: never sign a green receipt if stubs remain or --verify-cmd still fails.
+    if receipt_mode != meg_tui::Mode::Plan {
+        let edited_snapshot = edited_files.lock().unwrap().clone();
+        let mut final_stubs = Vec::new();
+        for p in &edited_snapshot {
+            if let Ok(text) = std::fs::read_to_string(p) {
+                final_stubs.extend(meg_tools::deliverable_guard::scan_anti_stub_and_false_zero(
+                    p, &text,
+                ));
+            }
+        }
+        if !final_stubs.is_empty() {
+            anyhow::bail!(
+                "ANTI_STUB_VIOLATION: unresolved stub/false-zero code remained at finish: {}",
+                final_stubs.join(" | ")
+            );
+        }
+        if let Some(cmd) = &extras.verify_cmd {
+            if !verify_passed.load(std::sync::atomic::Ordering::SeqCst) {
+                let ws_v = receipt_workspace.clone();
+                let cmd_v = cmd.clone();
+                let final_check = tokio::task::spawn_blocking(move || {
+                    meg_tools::bash::run(
+                        &ws_v,
+                        &serde_json::json!({ "command": cmd_v, "timeout_seconds": 30 }),
+                    )
+                })
+                .await?;
+                if let Err(err) = final_check {
+                    anyhow::bail!("VERIFY_CMD_FAILED: external verification `{cmd}` did not pass: {err}");
+                }
+            }
+        } else if extras.require_verify && !edited_snapshot.is_empty() && aepn.lock().unwrap().p_tests_green == 0 {
+            anyhow::bail!(
+                "AEPN_VERIFICATION_REQUIRED: code was edited without passing verification after the last edit"
             );
         }
     }
@@ -1165,7 +1292,12 @@ async fn run_goal_headless(workspace: &Path, goal: &str, options: &TuiOptions) -
         state.run_request(goal.into()),
         None,
         plane,
-        options.max_steps,
+        RunExtras {
+            max_steps: options.max_steps,
+            verify_cmd: options.verify_cmd.clone(),
+            require_verify: options.require_verify
+                || std::env::var("MEG_REQUIRE_VERIFY").as_deref() == Ok("1"),
+        },
     )
     .await?;
     if options.json_output {
@@ -1572,6 +1704,10 @@ mod native_integration {
             read_only_lock: Arc::new(meg_tools::deliverable_guard::ReadOnlyLock::new()),
             sealed: Arc::new(meg_tools::deliverable_guard::SealedManifest::default()),
             aepn: Arc::new(std::sync::Mutex::new(meg_core::finish_hook::AepnSupervisor::new(10))),
+            edited_files: Arc::new(std::sync::Mutex::new(Vec::new())),
+            verify_cmd: None,
+            require_verify: false,
+            verify_passed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         for name in ["bash", "write_file", "edit_file"] {
             assert!(engine
@@ -1743,6 +1879,78 @@ mod native_integration {
     }
 
     #[tokio::test]
+    async fn anti_stub_gate_withholds_finish_and_recovers_once_stub_removed() {
+        let server = fixture().await;
+        let ws = std::env::temp_dir().join(format!("meg-stub-gate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("app.py"), "def run():\n    return 1\n").unwrap();
+
+        // Turn 1: writes a NotImplementedError stub
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"write stub\",\"tool\":\"edit_file\",\"args\":{\"path\":\"app.py\",\"old_string\":\"return 1\",\"new_string\":\"raise NotImplementedError()\"}}" } }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Turn 2: prematurely claims finish -> withheld by ANTI_STUB_GATE
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"done\",\"final\":\"finished\"}" } }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Turn 3: replaces stub with real implementation
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"fix stub\",\"tool\":\"edit_file\",\"args\":{\"path\":\"app.py\",\"old_string\":\"raise NotImplementedError()\",\"new_string\":\"return 42\"}}" } }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Turn 4: clean finish -> approved!
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"verified\",\"final\":\"implemented run()\"}" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let req = meg_tui::RunRequest {
+            workspace: ws.clone(),
+            goal: "Implement run() in app.py".into(),
+            base_url: format!("{}/v1", server.uri()),
+            model: "fixture".into(),
+            provider: None,
+            mode: meg_tui::Mode::default(),
+            effort: "medium".into(),
+            history: vec![],
+            cancel: meg_core::CancellationToken::default(),
+        };
+        let (outcomes, ans) = run_request_with_options(
+            req,
+            None,
+            None,
+            RunExtras {
+                max_steps: Some(8),
+                verify_cmd: Some("python -c \"import app; assert app.run() == 42\"".into()),
+                require_verify: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ans.as_deref(), Some("implemented run()"));
+        assert!(outcomes.iter().any(|o| o.observation.as_deref().is_some_and(|s| s.contains("ANTI_STUB_GATE"))));
+        assert!(ws.join(".meg/receipt.json").is_file(), "Verified run must sign .meg/receipt.json");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
     async fn sealed_manifest_blocks_direct_edit_and_detects_bash_tampering_on_protected_tests() {
         let server = fixture().await;
         let ws = std::env::temp_dir().join(format!("meg-sealed-live-{}", uuid::Uuid::new_v4()));
@@ -1817,6 +2025,10 @@ mod native_integration {
             read_only_lock: Arc::new(meg_tools::deliverable_guard::ReadOnlyLock::new()),
             sealed: Arc::new(meg_tools::deliverable_guard::SealedManifest::default()),
             aepn: Arc::new(std::sync::Mutex::new(meg_core::finish_hook::AepnSupervisor::new(10))),
+            edited_files: Arc::new(std::sync::Mutex::new(Vec::new())),
+            verify_cmd: None,
+            require_verify: false,
+            verify_passed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         engine

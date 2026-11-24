@@ -1,5 +1,5 @@
 //! Publish-State Deliverable Guard (AHE iterations 5 & 8): once a deliverable
-//! passes verification it is LOCKED — write/edit/destructive-bash attempts
+//! passes verification it is LOCKED â€” write/edit/destructive-bash attempts
 //! against it are blocked until explicitly unlocked. Also the single-file
 //! layout cleanliness check (polyglot-rust-c / polyglot-c-py fail on stray
 //! a.out/.o/.pyc).
@@ -281,7 +281,7 @@ pub fn deep_artifact_sanity(workspace: &Path, artifacts: &[PathBuf]) -> Result<(
             && size < 4096
         {
             problems.push(format!(
-                "{name}: weights file is {size} bytes (< 4096) — a dummy file"
+                "{name}: weights file is {size} bytes (< 4096) â€” a dummy file"
             ));
         }
     }
@@ -709,6 +709,64 @@ pub fn protected_restore_argv(base_ref: &str, paths: &[String]) -> Vec<String> {
     argv
 }
 
+
+/// Scan edited code files for incomplete stubs (`TODO`, `todo!()`, `unimplemented!()`,
+/// `NotImplementedError`, `501`) and false-zero error swallowing (`catch { return [] }`,
+/// `except: pass`). Returns actionable remediation messages.
+pub fn scan_anti_stub_and_false_zero(path: &std::path::Path, content: &str) -> Vec<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(
+        ext.as_str(),
+        "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go" | "java" | "c" | "cpp" | "h" | "hpp"
+    ) {
+        return Vec::new();
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let mut findings = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    for (idx, raw) in lines.iter().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = raw.trim();
+        let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+        if trimmed.contains("todo!(")
+            || trimmed.contains("unimplemented!(")
+            || trimmed.contains("NotImplementedError")
+            || trimmed.contains("501 Not Implemented")
+            || trimmed.contains("TODO:")
+            || trimmed.contains("FIXME:")
+        {
+            findings.push(format!(
+                "{name}:{line_no}: stub/placeholder detected (`{trimmed}`). [REMEDIATION FIX] Replace with complete working logic."
+            ));
+        }
+        if compact.contains("catch(")
+            && (compact.contains("return[];")
+                || compact.contains("return{};")
+                || compact.contains("returnnull;")
+                || compact.contains("return0;")
+                || compact.contains("returnfalse;"))
+        {
+            findings.push(format!(
+                "{name}:{line_no}: false-zero catch handler detected (`{trimmed}`). [REMEDIATION FIX] Propagate or handle the error explicitly instead of returning an empty/zero fallback."
+            ));
+        }
+        if trimmed == "except:" || trimmed.starts_with("except ") {
+            if let Some(next_line) = lines.get(idx + 1) {
+                let next_trim = next_line.trim();
+                if next_trim == "pass" || next_trim == "return []" || next_trim == "return None" || next_trim == "return 0" {
+                    findings.push(format!(
+                        "{name}:{line_no}: silent/false-zero Python except block (`{trimmed}` -> `{next_trim}`). [REMEDIATION FIX] Surface or handle the exception explicitly."
+                    ));
+                }
+            }
+        }
+    }
+    findings
+}
 /// Lauren Tan `.hot.*` 60-FPS frame linter: flags heap allocations and unseeded
 /// RNG inside `.hot.*` hot-loop files.
 pub fn lint_hot_frame_file(path: &std::path::Path, content: &str) -> Vec<String> {

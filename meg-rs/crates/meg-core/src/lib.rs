@@ -264,6 +264,11 @@ pub trait LoopEngine: Send + Sync {
     async fn execute_tool(&self, tool: &str, args: &Value) -> anyhow::Result<String>;
     /// Generate the next model turn from the transcript.
     async fn generate(&self, transcript: &[ChatMessage]) -> anyhow::Result<String>;
+    /// Optional engine-owned verification gate invoked before accepting completion.
+    /// Return `Ok(Some(feedback))` to withhold completion once (`MAX_WITHHOLDS = 1`).
+    async fn verify_before_finish(&self, _answer: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -378,6 +383,7 @@ pub async fn run_loop_with_config(
     let mut outcomes = Vec::new();
     let mut malformed_replies = 0usize;
     let mut finish_reprompt_count = 0u32;
+    let mut verify_withholds_used = 0u32;
     let mut last_call_sig: Option<String> = None;
     let mut consecutive_same_call = 0usize;
     let mut consecutive_same_fail = 0usize;
@@ -434,6 +440,28 @@ pub async fn run_loop_with_config(
                         continue;
                     }
                 }
+                if verify_withholds_used < 1 {
+                    if let Some(feedback) = engine.verify_before_finish(&answer).await? {
+                        verify_withholds_used += 1;
+                        messages.push(ChatMessage {
+                            role: "assistant".into(),
+                            content: raw.clone(),
+                        });
+                        messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: feedback.clone(),
+                        });
+                        outcomes.push(TurnOutcome {
+                            action: Action::Final {
+                                thought: String::new(),
+                                answer,
+                            },
+                            observation: Some(feedback),
+                            ok: false,
+                        });
+                        continue;
+                    }
+                }
                 outcomes.push(TurnOutcome {
                     action: Action::Final {
                         thought: String::new(),
@@ -460,7 +488,7 @@ pub async fn run_loop_with_config(
                     config,
                     &format!("step{step}"),
                     &raw_obs,
-                    finish_reprompt_count > 0,
+                    (finish_reprompt_count + verify_withholds_used) > 0,
                 );
                 let doom = update_doom_loop(
                     &mut last_call_sig,
@@ -632,6 +660,28 @@ pub async fn run_loop_with_config(
                                     answer,
                                 },
                                 observation: Some(verdict.detail),
+                                ok: false,
+                            });
+                            continue;
+                        }
+                    }
+                    if verify_withholds_used < 1 {
+                        if let Some(feedback) = engine.verify_before_finish(&answer).await? {
+                            verify_withholds_used += 1;
+                            messages.push(ChatMessage {
+                                role: "assistant".into(),
+                                content: raw.clone(),
+                            });
+                            messages.push(ChatMessage {
+                                role: "user".into(),
+                                content: feedback.clone(),
+                            });
+                            outcomes.push(TurnOutcome {
+                                action: Action::Final {
+                                    thought: String::new(),
+                                    answer,
+                                },
+                                observation: Some(feedback),
                                 ok: false,
                             });
                             continue;

@@ -155,9 +155,22 @@ fn build_sandboxed_command(workspace: &Path, cmd_line: &str, use_powershell: boo
                 .current_dir(workspace);
             return c;
         }
-        let mut c = Command::new("cmd");
-        c.arg("/C").arg(cmd_line).current_dir(workspace);
-        return c;
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let mut c = Command::new("cmd");
+            c.arg("/S")
+                .arg("/C")
+                .raw_arg(format!("\"{cmd_line}\""))
+                .current_dir(workspace);
+            return c;
+        }
+        #[cfg(not(windows))]
+        {
+            let mut c = Command::new("cmd");
+            c.arg("/C").arg(cmd_line).current_dir(workspace);
+            return c;
+        }
     }
 
     let sandbox_mode = std::env::var("MEG_SANDBOX").unwrap_or_default();
