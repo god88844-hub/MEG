@@ -117,17 +117,17 @@
 ## PHASE 3 -- Memory, 8-Layer Skills & `CLI > MCP` Gateway (`meg-plane/`)
 **Language:** TypeScript on Bun (`meg-plane/src/`, `meg-plane/skills/`)
 
-- [ ] **P3-01 4-Part Memory Stack & Bi-Temporal Ledger (`src/memory.ts`):**
+- [x] **P3-01 4-Part Memory Stack & Bi-Temporal Ledger (`src/memory.ts`):**
   - Authoritative event ledger + lexical/AST/`ripgrep` search first (no mandatory code vector DB) + `STAIR` ToC leaf retriever for long docs.
   - `Reglos` bi-temporal records (`valid_time` + `learning_time`, closing intervals on updates rather than overwriting), 5 epistemic states (`KNOWS | BELIEVES | TRIED | VERIFIED | UNESTABLISHED`), SHA-256 source-file hash staleness invalidation, and `HYRA 2.0` 3-tier `Books` (`Observation -> Verified -> Convention [human approved]`).
   - Grok Bot Fast-Fact rule: block caching volatile live state (`price`, `plan_tier`, `ci_status`, `assignee`, `balance`).
   - *Micro-Check:* `bun test test/memory.test.ts`
-- [ ] **P3-02 Model-Tier Steering, `ACE` Librarian & Offline Dreaming (`src/dreaming.ts`):**
+- [x] **P3-02 Model-Tier Steering, `ACE` Librarian & Offline Dreaming (`src/dreaming.ts`):**
   - Index-separated rule workspace (`c_0 + compact index`).
   - Gear-aware memory steering: open salience on Gear 3 frontier models; mandatory `Read-Memory + Test-Theory` pre-hook on Gear 1-2 local/mid models.
   - Stanford 4-Agent `ACE` append-only `LEARNINGS.md` Librarian (`<=30` lines promoted to standing rules) + `[INSURANCE]` vs `[OPTIMIZATION]` rule gardening + Offline Dreaming pass (cross-checks notes against raw transcripts & builds linked `wiki/`).
   - *Micro-Check:* `bun test test/dreaming.test.ts`
-- [ ] **P3-03 Multi-Agent `Omnigraph` Git-Model Memory (`src/omnigraph.ts`):**
+- [x] **P3-03 Multi-Agent `Omnigraph` Git-Model Memory (`src/omnigraph.ts`):**
   - Per-agent memory branches keyed by `@key` slugs, record-level `merge_base` conflict detection (`409 divergent_update` rejection on stale full-record writes), `--snapshot` time-travel reads, and reviewer-only merge policy (`HTTP 403` for worker merges to `main`).
   - *Micro-Check:* `bun test test/omnigraph.test.ts`
 - [ ] **P3-04 8-Layer `SKILL.md` Loader & `Skill++` Index (`src/skills.ts`):**
