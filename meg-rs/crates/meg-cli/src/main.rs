@@ -37,6 +37,12 @@ struct ShimEngine {
     verify_cmd: Option<String>,
     require_verify: bool,
     verify_passed: Arc<std::sync::atomic::AtomicBool>,
+    executor_shim: Option<ShimClient>,
+    pair_mode: Option<String>,
+    turn_counter: std::sync::atomic::AtomicUsize,
+    planner_turns: Arc<std::sync::atomic::AtomicUsize>,
+    executor_turns: Arc<std::sync::atomic::AtomicUsize>,
+    consecutive_failures: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl ShimEngine {
     fn emit(&self, msg: RunnerMsg) {
@@ -220,12 +226,18 @@ impl LoopEngine for ShimEngine {
                     output: result.output.clone(),
                 });
                 if result.ok {
+                    self.consecutive_failures
+                        .store(0, std::sync::atomic::Ordering::SeqCst);
                     Ok(result.output)
                 } else {
+                    self.consecutive_failures
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     anyhow::bail!("{}", result.output)
                 }
             }
             Err(error) => {
+                self.consecutive_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.emit(RunnerMsg::ToolFinished {
                     id,
                     ok: false,
@@ -324,7 +336,38 @@ impl LoopEngine for ShimEngine {
                 cached,
             }),
         };
-        let result = self.shim.chat_stream_cancellable(&messages, Some(&self.cancel), &mut callback).await;
+        let turn_idx = self
+            .turn_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let active_shim = if let Some(exec_shim) = &self.executor_shim {
+            let is_antigravity = self.pair_mode.as_deref() == Some("antigravity_orchestrator");
+            let friction = self
+                .consecutive_failures
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0;
+            if turn_idx == 0 {
+                self.planner_turns
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                &self.shim
+            } else if is_antigravity && friction {
+                self.consecutive_failures
+                    .store(0, std::sync::atomic::Ordering::SeqCst);
+                self.planner_turns
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                &self.shim
+            } else {
+                self.executor_turns
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                exec_shim
+            }
+        } else {
+            self.planner_turns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            &self.shim
+        };
+        let result = active_shim
+            .chat_stream_cancellable(&messages, Some(&self.cancel), &mut callback)
+            .await;
         self.emit(RunnerMsg::Online(result.is_ok()));
         result
     }
@@ -466,6 +509,15 @@ fn parse_cli_args(args: &[String]) -> CliCommand {
                 .unwrap_or_default();
             CliCommand::Run { goal }
         }
+        Some("loop") => {
+            if args
+                .get(2)
+                .is_some_and(|arg| matches!(arg.as_str(), "-h" | "--help"))
+            {
+                return CliCommand::Help;
+            }
+            CliCommand::Loop
+        }
         Some(cmd) => CliCommand::Unknown(cmd.to_string()),
     }
 }
@@ -474,6 +526,7 @@ enum CliCommand {
     Worker,
     Tui,
     Run { goal: String },
+    Loop,
     Help,
     Version,
     Unknown(String),
@@ -494,6 +547,7 @@ struct TuiOptions {
     executor_model: Option<String>,
     verify_cmd: Option<String>,
     require_verify: bool,
+    reviewer_model: Option<String>,
 }
 fn parse_tui_options(args: &[String]) -> Result<TuiOptions> {
     let mut options = TuiOptions::default();
@@ -557,7 +611,7 @@ fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)> {
                 options.require_verify = true;
                 i += 1;
             }
-            "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps" | "--pair-mode" | "--executor-model" | "--verify-cmd" => {
+            "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps" | "--pair-mode" | "--executor-model" | "--verify-cmd" | "--reviewer-model" => {
                 let flag = &args[i];
                 let value = args
                     .get(i + 1)
@@ -579,6 +633,7 @@ fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)> {
                     }
                     "--executor-model" => options.executor_model = Some(value.clone()),
                     "--verify-cmd" => options.verify_cmd = Some(value.clone()),
+                    "--reviewer-model" => options.reviewer_model = Some(value.clone()),
                     "--max-steps" => {
                         let parsed: usize = value
                             .parse()
@@ -607,13 +662,107 @@ fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)> {
     Ok((goal, options))
 }
 
+struct LoopOptions {
+    goal: String,
+    check_cmd: String,
+    max_runs: usize,
+    max_same: usize,
+    base: TuiOptions,
+}
+
+fn parse_loop_options(args: &[String]) -> Result<LoopOptions> {
+    let mut base = TuiOptions::default();
+    let mut check_cmd: Option<String> = None;
+    let mut max_runs: usize = 5;
+    let mut max_same: usize = 2;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--" => {
+                i += 1;
+                break;
+            }
+            "--json" => {
+                base.json_output = true;
+                i += 1;
+            }
+            "--core-six" => {
+                base.core_six = true;
+                i += 1;
+            }
+            "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps"
+            | "--pair-mode" | "--executor-model" | "--reviewer-model" | "--check"
+            | "--max-runs" | "--max-same" => {
+                let flag = &args[i];
+                let value = args
+                    .get(i + 1)
+                    .context(format!("{flag} requires a value"))?;
+                anyhow::ensure!(!value.is_empty(), "{flag} requires a non-empty value");
+                match flag.as_str() {
+                    "-C" | "--cd" => base.cwd = Some(value.into()),
+                    "-m" | "--model" => base.model = Some(value.clone()),
+                    "--pinned-model" => {
+                        base.pinned_model = Some(value.clone());
+                        base.model = Some(value.clone());
+                    }
+                    "--pair-mode" => {
+                        anyhow::ensure!(
+                            matches!(value.as_str(), "devin_fusion" | "antigravity_orchestrator"),
+                            "--pair-mode must be 'devin_fusion' or 'antigravity_orchestrator'"
+                        );
+                        base.pair_mode = Some(value.clone());
+                    }
+                    "--executor-model" => base.executor_model = Some(value.clone()),
+                    "--reviewer-model" => base.reviewer_model = Some(value.clone()),
+                    "--check" => check_cmd = Some(value.clone()),
+                    "--max-steps" => {
+                        let n: usize = value.parse().context("--max-steps requires integer 1..=200")?;
+                        anyhow::ensure!((1..=200).contains(&n), "--max-steps must be 1..=200");
+                        base.max_steps = Some(n);
+                    }
+                    "--max-runs" => {
+                        let n: usize = value.parse().context("--max-runs requires integer 1..=20")?;
+                        anyhow::ensure!((1..=20).contains(&n), "--max-runs must be 1..=20");
+                        max_runs = n;
+                    }
+                    "--max-same" => {
+                        let n: usize = value.parse().context("--max-same requires integer 1..=5")?;
+                        anyhow::ensure!((1..=5).contains(&n), "--max-same must be 1..=5");
+                        max_same = n;
+                    }
+                    _ => {
+                        anyhow::ensure!(
+                            matches!(value.as_str(), "low" | "medium" | "high" | "max"),
+                            "Effort must be low, medium, high or max"
+                        );
+                        base.effort = Some(value.clone());
+                    }
+                }
+                i += 2;
+            }
+            _ => break,
+        }
+    }
+    let goal = args[i..].join(" ");
+    anyhow::ensure!(!goal.trim().is_empty(), "meg loop requires a goal");
+    let check_cmd = check_cmd.context("meg loop requires --check <cmd>")?;
+    Ok(LoopOptions {
+        goal,
+        check_cmd,
+        max_runs,
+        max_same,
+        base,
+    })
+}
+
 fn print_usage() {
     println!("MEG â€” native agent harness & workstation\n");
     println!("Usage:");
     println!("  meg [COMMAND] [OPTIONS]\n");
     println!("Commands:");
     println!("  tui             Launch the interactive Workstation TUI (default)");
-    println!("  run [OPTIONS] [--] <goal>  Execute headlessly (-C, -m, --pinned-model, --max-steps, --effort, --json)");
+    println!("  run [OPTIONS] [--] <goal>  Execute headlessly (-C, -m, --pinned-model, --verify-cmd, --pair-mode, --executor-model, --reviewer-model, --json)");
+    println!("  loop --check <cmd> [OPTIONS] [--] <goal>  Run verified Loop-2 outer work loop (.loop/state.json, check_cannot_fail, stall exit)");
     println!("\nOptions:");
     println!("  -h, --help      Print this help message");
     println!("  -C, --cd PATH   Open a workspace\n  -m, --model ID  Select the session model\n  --effort LEVEL  low, medium, high or max\n  --resume ID     Resume a saved session (or latest)\n  --continue      Resume the latest saved session\n  --workspace-picker  Choose a workspace before opening\n  --no-picker     Open the current workspace directly");
@@ -751,6 +900,27 @@ struct RunExtras {
     max_steps: Option<usize>,
     verify_cmd: Option<String>,
     require_verify: bool,
+    pair_mode: Option<String>,
+    executor_model: Option<String>,
+    reviewer_model: Option<String>,
+}
+
+#[derive(Default, Debug, Clone)]
+struct RunTelemetry {
+    planner_turns: usize,
+    executor_turns: usize,
+    reviewer_verdict: Option<String>,
+}
+
+struct ColdReviewRequest<'a> {
+    provider: &'a Option<meg_core::providers::ProviderProfile>,
+    base_url: &'a str,
+    reviewer_model: &'a str,
+    workspace: &'a std::path::Path,
+    goal: &'a str,
+    edited_files: &'a [std::path::PathBuf],
+    final_answer: &'a str,
+    cancel: &'a meg_core::CancellationToken,
 }
 
 async fn run_request_with_plane(
@@ -760,12 +930,97 @@ async fn run_request_with_plane(
 ) -> Result<(Vec<meg_core::TurnOutcome>, Option<String>)> {
     run_request_with_options(request, tx, plane, RunExtras::default()).await
 }
+
 async fn run_request_with_options(
     request: meg_tui::RunRequest,
     tx: Option<Sender<RunnerMsg>>,
     plane: Option<Arc<meg_core::plane_client::PlaneClient>>,
     extras: RunExtras,
 ) -> Result<(Vec<meg_core::TurnOutcome>, Option<String>)> {
+    let (outcomes, answer, _telemetry) = run_request_detailed(request, tx, plane, extras).await?;
+    Ok((outcomes, answer))
+}
+
+async fn run_cold_l3_reviewer(req: ColdReviewRequest<'_>) -> Result<String> {
+    let mut rev_shim = if let Some(profile) = req.provider {
+        ShimClient::with_profile(profile)?
+    } else {
+        ShimClient::with(req.base_url.to_string(), req.reviewer_model.to_string())
+    };
+    rev_shim.model = req.reviewer_model.to_string();
+    rev_shim.tools = Vec::new(); // Strictly read-only, tool-less fresh context.
+
+    let mut diff_context = String::new();
+    for path in req.edited_files.iter().take(12) {
+        let rel = path
+            .strip_prefix(req.workspace)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let preview: String = text.chars().take(4_000).collect();
+            diff_context.push_str(&format!("--- FILE: {rel} ---\n{preview}\n\n"));
+        }
+    }
+    if diff_context.is_empty() {
+        diff_context.push_str("(no source files modified)\n");
+    }
+
+    let messages = vec![
+        meg_core::ChatMessage {
+            role: "system".into(),
+            content: "You are a cold, independent L3 code reviewer. You have ZERO builder history. Your default answer is REJECT unless the code clearly satisfies the goal without bugs, stubs, or regressions. Respond ONLY with JSON: {\"verdict\":\"PASS\"|\"REJECT\",\"reason\":\"...\"}.".into(),
+        },
+        meg_core::ChatMessage {
+            role: "user".into(),
+            content: format!(
+                "GOAL: {}\n\nCLAIMED COMPLETION: {}\n\nMODIFIED WORKSPACE ARTIFACTS:\n{}",
+                req.goal, req.final_answer, diff_context
+            ),
+        },
+    ];
+    let mut ignore_cb = |_| {};
+    let reply = rev_shim
+        .chat_stream_cancellable(&messages, Some(req.cancel), &mut ignore_cb)
+        .await?;
+    let trimmed = reply.trim();
+    let verdict_val = serde_json::from_str::<serde_json::Value>(trimmed).ok().or_else(|| {
+        trimmed
+            .find('{')
+            .and_then(|s| trimmed.rfind('}').map(|e| &trimmed[s..=e]))
+            .and_then(|slice| serde_json::from_str::<serde_json::Value>(slice).ok())
+    });
+    let verdict = verdict_val
+        .as_ref()
+        .and_then(|v| v.get("verdict"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_else(|| {
+            if trimmed.to_ascii_uppercase().contains("PASS")
+                && !trimmed.to_ascii_uppercase().contains("REJECT")
+            {
+                "PASS".into()
+            } else {
+                "REJECT".into()
+            }
+        });
+    if verdict != "PASS" {
+        let reason = verdict_val
+            .as_ref()
+            .and_then(|v| v.get("reason"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(trimmed);
+        anyhow::bail!("L3_REVIEWER_REJECTED ({}): {reason}", req.reviewer_model);
+    }
+    Ok("PASS".into())
+}
+
+async fn run_request_detailed(
+    request: meg_tui::RunRequest,
+    tx: Option<Sender<RunnerMsg>>,
+    plane: Option<Arc<meg_core::plane_client::PlaneClient>>,
+    extras: RunExtras,
+) -> Result<(Vec<meg_core::TurnOutcome>, Option<String>, RunTelemetry)> {
     anyhow::ensure!(
         !request.model.trim().is_empty(),
         "No model selected. Connect a provider and choose /model first."
@@ -819,6 +1074,19 @@ async fn run_request_with_options(
         ToolRegistry::with_cancellation(&request.workspace, request.cancel.0.clone())
     });
     shim.tools = build_tool_specs(&registry, request.mode, &catalog, plane.is_some());
+    let executor_shim = if let Some(exec_model) = &extras.executor_model {
+        let mut es = if let Some(profile) = &request.provider {
+            ShimClient::with_profile(profile)?
+        } else {
+            ShimClient::with(request.base_url.clone(), exec_model.clone())
+        };
+        es.model = exec_model.clone();
+        es.reasoning_effort = shim.reasoning_effort.clone();
+        es.tools = shim.tools.clone();
+        Some(es)
+    } else {
+        None
+    };
     let max_steps = extras.max_steps.unwrap_or_else(default_max_steps);
     let targets = extract_finish_deliverables(&request.workspace, &request.goal, request.mode);
     let mut deliverable_guard =
@@ -842,6 +1110,12 @@ async fn run_request_with_options(
     };
     let receipt_workspace = request.workspace.clone();
     let receipt_mode = request.mode;
+    let reviewer_provider = request.provider.clone();
+    let reviewer_base_url = request.base_url.clone();
+    let reviewer_cancel = request.cancel.clone();
+    let planner_turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let executor_turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let consecutive_failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let sealed_manifest = Arc::new(
         meg_tools::deliverable_guard::SealedManifest::seal_protected_paths(&request.workspace),
     );
@@ -873,6 +1147,12 @@ async fn run_request_with_options(
         verify_cmd: extras.verify_cmd.clone(),
         require_verify: extras.require_verify,
         verify_passed: verify_passed.clone(),
+        executor_shim,
+        pair_mode: extras.pair_mode.clone(),
+        turn_counter: std::sync::atomic::AtomicUsize::new(0),
+        planner_turns: planner_turns.clone(),
+        executor_turns: executor_turns.clone(),
+        consecutive_failures,
     };
     let result = meg_core::run_loop_with_config(
         &engine,
@@ -931,6 +1211,7 @@ async fn run_request_with_options(
             );
         }
     }
+    let mut reviewer_verdict_out: Option<String> = None;
     if receipt_mode != meg_tui::Mode::Plan {
         let mutated = result.0.iter().any(|t| match &t.action {
             meg_core::Action::Tool { tool, .. } => {
@@ -942,10 +1223,32 @@ async fn run_request_with_options(
             _ => false,
         });
         if mutated {
+            // Cold cross-model L3 reviewer runs before signing .meg/receipt.json
+            if let Some(rev_model) = &extras.reviewer_model {
+                let edited_now = edited_files.lock().unwrap().clone();
+                let verdict = run_cold_l3_reviewer(ColdReviewRequest {
+                    provider: &reviewer_provider,
+                    base_url: &reviewer_base_url,
+                    reviewer_model: rev_model,
+                    workspace: &receipt_workspace,
+                    goal: &request.goal,
+                    edited_files: &edited_now,
+                    final_answer: result.1.as_deref().unwrap_or(""),
+                    cancel: &reviewer_cancel,
+                })
+                .await?;
+                let _ = aepn.lock().unwrap().record_critic_approved();
+                reviewer_verdict_out = Some(verdict);
+            }
             let _ = meg_tools::ledger::write_receipt(&receipt_workspace, "meg-run", true);
         }
     }
-    Ok(result)
+    let telemetry = RunTelemetry {
+        planner_turns: planner_turns.load(std::sync::atomic::Ordering::SeqCst),
+        executor_turns: executor_turns.load(std::sync::atomic::Ordering::SeqCst),
+        reviewer_verdict: reviewer_verdict_out,
+    };
+    Ok((result.0, result.1, telemetry))
 }
 
 fn default_max_steps() -> usize {
@@ -1288,7 +1591,7 @@ async fn run_goal_headless(workspace: &Path, goal: &str, options: &TuiOptions) -
     } else {
         Some(start_plane()?)
     };
-    let (outcomes, final_answer) = run_request_with_options(
+    let (outcomes, final_answer, telemetry) = run_request_detailed(
         state.run_request(goal.into()),
         None,
         plane,
@@ -1297,6 +1600,9 @@ async fn run_goal_headless(workspace: &Path, goal: &str, options: &TuiOptions) -
             verify_cmd: options.verify_cmd.clone(),
             require_verify: options.require_verify
                 || std::env::var("MEG_REQUIRE_VERIFY").as_deref() == Ok("1"),
+            pair_mode: options.pair_mode.clone(),
+            executor_model: options.executor_model.clone(),
+            reviewer_model: options.reviewer_model.clone(),
         },
     )
     .await?;
@@ -1316,6 +1622,10 @@ async fn run_goal_headless(workspace: &Path, goal: &str, options: &TuiOptions) -
             "pinned_model": options.pinned_model,
             "pair_mode": options.pair_mode,
             "executor_model": options.executor_model,
+            "reviewer_model": options.reviewer_model,
+            "planner_turns": telemetry.planner_turns,
+            "executor_turns": telemetry.executor_turns,
+            "reviewer_verdict": telemetry.reviewer_verdict,
             "turns": outcomes.len(),
             "receipt_path": if receipt_path.is_file() { Some(receipt_path.display().to_string()) } else { None },
             "receipt": receipt_json,
@@ -1351,6 +1661,259 @@ async fn run_goal_headless(workspace: &Path, goal: &str, options: &TuiOptions) -
     Ok(())
 }
 
+/// Compute a deterministic 8-hex-char fingerprint of the last 20 lines of failing output
+/// after masking digits so identical bugs produce the same hash.
+fn mask_failure_fingerprint(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    let tail = if lines.len() > 20 {
+        &lines[lines.len() - 20..]
+    } else {
+        &lines[..]
+    };
+    let mut normalized = String::new();
+    for line in tail {
+        for ch in line.chars() {
+            if ch.is_ascii_digit() {
+                normalized.push('#');
+            } else {
+                normalized.push(ch);
+            }
+        }
+        normalized.push('\n');
+    }
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in normalized.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", (hash >> 32) as u32)
+}
+
+fn run_external_check_cmd(workspace: &std::path::Path, cmd: &str) -> (bool, String) {
+    match meg_tools::bash::run(
+        workspace,
+        &serde_json::json!({ "command": cmd, "timeout_seconds": 60 }),
+    ) {
+        Ok(out) => (true, out),
+        Err(err) => {
+            let msg = err.to_string();
+            let tail = if msg.len() > 3_000 {
+                let start = msg.floor_char_boundary(msg.len() - 3_000);
+                msg[start..].to_string()
+            } else {
+                msg
+            };
+            (false, tail)
+        }
+    }
+}
+
+/// Loop-2 verified outer work loop (`meg loop --check "<cmd>" "<goal>"`):
+/// - Pre-run `check_cannot_fail` verification (must fail before agent starts)
+/// - Persists `.loop/state.json` on disk with `tried` dead-end history
+/// - Masks digits in failure fingerprints and parks on `stalled` after `max_same` repeats
+/// - Signs `.meg/receipt.json` only when external `--check` exits green
+async fn run_loop_headless(workspace: &std::path::Path, options: &LoopOptions) -> Result<()> {
+    anyhow::ensure!(
+        std::env::var("MEG_OFFLINE").as_deref() != Ok("1"),
+        "MEG_OFFLINE=1: inference is disabled; no provider was contacted"
+    );
+    let loop_dir = workspace.join(".loop");
+    std::fs::create_dir_all(&loop_dir)?;
+    let state_path = loop_dir.join("state.json");
+
+    let mut runs_log: Vec<serde_json::Value> = Vec::new();
+    let write_state = |status: &str, runs: &[serde_json::Value]| -> Result<()> {
+        let doc = serde_json::json!({
+            "goal": options.goal,
+            "check_cmd": options.check_cmd,
+            "status": status,
+            "runs": runs,
+        });
+        std::fs::write(&state_path, serde_json::to_vec_pretty(&doc)?)?;
+        Ok(())
+    };
+
+    // 1. Pre-run check_cannot_fail gate: if check already passes before Run 1, abort!
+    let (pre_ok, mut last_output) = run_external_check_cmd(workspace, &options.check_cmd);
+    if pre_ok {
+        write_state("check_cannot_fail", &runs_log)?;
+        if options.base.json_output {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "ok": false,
+                    "status": "check_cannot_fail",
+                    "runs": 0,
+                    "state_path": state_path.display().to_string(),
+                }))?
+            );
+        }
+        anyhow::bail!(
+            "CHECK_CANNOT_FAIL: external check `{}` was already green before any agent edit",
+            options.check_cmd
+        );
+    }
+
+    let store = meg_core::providers::ProviderStore::global();
+    let settings = store.load()?;
+    let provider = if std::env::var_os("MEG_TUI_BASE_URL").is_some() {
+        Some(meg_core::providers::ProviderProfile::environment())
+    } else {
+        settings
+            .profiles
+            .iter()
+            .find(|p| p.id == settings.active)
+            .cloned()
+    };
+    let default_model = std::env::var("MEG_TUI_MODEL")
+        .ok()
+        .or_else(|| provider.as_ref().map(|p| p.default_model.clone()))
+        .unwrap_or_default();
+    if options.base.core_six {
+        std::env::set_var("MEG_CORE_SIX", "1");
+    }
+    let plane = if std::env::var("MEG_NO_PLANE").as_deref() == Ok("1") {
+        None
+    } else {
+        Some(start_plane()?)
+    };
+
+    let mut recent_fps: Vec<String> = Vec::new();
+    for run_idx in 1..=options.max_runs {
+        let mut state = WorkstationState {
+            cwd: meg_tui::friendly_path(workspace),
+            providers: settings.profiles.clone(),
+            provider: provider.clone(),
+            model: default_model.clone(),
+            ..Default::default()
+        };
+        if let Some(m) = &options.base.model {
+            state.select_model(m.clone());
+        }
+        if let Some(pinned) = &options.base.pinned_model {
+            state.select_model(pinned.clone());
+            anyhow::ensure!(
+                state.model == *pinned,
+                "PINNED_MODEL_VIOLATION: expected '{pinned}', resolved '{}'",
+                state.model
+            );
+        }
+        if let Some(effort) = &options.base.effort {
+            state.select_effort(effort.clone());
+        }
+
+        let tried_summary = if runs_log.is_empty() {
+            "- nothing yet".to_string()
+        } else {
+            runs_log
+                .iter()
+                .map(|r| format!("- run {}: {}", r["n"], r["tried"].as_str().unwrap_or("")))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let iter_goal = format!(
+            "{}\n\nExternal check `{}` currently fails with:\n{}\n\nAlready tried (DO NOT REPEAT):\n{}\n\nMake the smallest fix to the implementation (never edit protected tests).",
+            options.goal, options.check_cmd, last_output, tried_summary
+        );
+
+        let attempt = run_request_detailed(
+            state.run_request(iter_goal),
+            None,
+            plane.clone(),
+            RunExtras {
+                max_steps: options.base.max_steps,
+                verify_cmd: None,
+                require_verify: false,
+                pair_mode: options.base.pair_mode.clone(),
+                executor_model: options.base.executor_model.clone(),
+                reviewer_model: options.base.reviewer_model.clone(),
+            },
+        )
+        .await;
+
+        let tried_note = match &attempt {
+            Ok((_, Some(ans), _)) => ans.lines().next().unwrap_or("completed").chars().take(180).collect::<String>(),
+            Ok((_, None, _)) => "exhausted step budget".into(),
+            Err(e) => format!("error: {}", e.to_string().chars().take(160).collect::<String>()),
+        };
+
+        let (ok_now, out_now) = run_external_check_cmd(workspace, &options.check_cmd);
+        let fp = if ok_now {
+            "00000000".to_string()
+        } else {
+            mask_failure_fingerprint(&out_now)
+        };
+        runs_log.push(serde_json::json!({
+            "n": run_idx,
+            "ok": ok_now,
+            "failure": fp,
+            "tried": tried_note,
+        }));
+
+        if ok_now {
+            let receipt = meg_tools::ledger::write_receipt(workspace, "meg-loop", true)?;
+            write_state("green", &runs_log)?;
+            if options.base.json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "ok": true,
+                        "status": "green",
+                        "runs": run_idx,
+                        "state_path": state_path.display().to_string(),
+                        "receipt": receipt,
+                    }))?
+                );
+            } else {
+                println!("MEG LOOP GREEN after {run_idx} run(s).");
+            }
+            return Ok(());
+        }
+
+        last_output = out_now;
+        recent_fps.push(fp.clone());
+        let stalled = recent_fps.len() >= options.max_same
+            && recent_fps[recent_fps.len() - options.max_same..]
+                .iter()
+                .all(|x| x == &fp);
+        if stalled {
+            write_state("stalled", &runs_log)?;
+            if options.base.json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "ok": false,
+                        "status": "stalled",
+                        "runs": run_idx,
+                        "failure_fingerprint": fp,
+                        "state_path": state_path.display().to_string(),
+                    }))?
+                );
+            }
+            anyhow::bail!(
+                "LOOP_STALLED: identical failure fingerprint ({fp}) repeated {} times",
+                options.max_same
+            );
+        }
+        write_state("running", &runs_log)?;
+    }
+
+    write_state("budget", &runs_log)?;
+    if options.base.json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "ok": false,
+                "status": "budget",
+                "runs": options.max_runs,
+                "state_path": state_path.display().to_string(),
+            }))?
+        );
+    }
+    anyhow::bail!("LOOP_BUDGET_EXHAUSTED: check did not pass within {} run(s)", options.max_runs)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -1371,6 +1934,18 @@ async fn main() -> Result<()> {
                 .canonicalize()?;
             anyhow::ensure!(workspace.is_dir(), "Workspace must be a directory");
             run_goal_headless(&workspace, &goal, &options).await?;
+            Ok(())
+        }
+        CliCommand::Loop => {
+            let options = parse_loop_options(&args)?;
+            let workspace = options
+                .base
+                .cwd
+                .as_deref()
+                .unwrap_or(&workspace)
+                .canonicalize()?;
+            anyhow::ensure!(workspace.is_dir(), "Workspace must be a directory");
+            run_loop_headless(&workspace, &options).await?;
             Ok(())
         }
         CliCommand::Help => {
@@ -1708,6 +2283,12 @@ mod native_integration {
             verify_cmd: None,
             require_verify: false,
             verify_passed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            executor_shim: None,
+            pair_mode: None,
+            turn_counter: std::sync::atomic::AtomicUsize::new(0),
+            planner_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            executor_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            consecutive_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         for name in ["bash", "write_file", "edit_file"] {
             assert!(engine
@@ -1879,6 +2460,166 @@ mod native_integration {
     }
 
     #[tokio::test]
+    async fn live_antigravity_orchestrator_routes_planner_executor_reintervention_and_cold_l3_reviewer() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = fixture().await;
+        let ws = std::env::temp_dir().join(format!("meg-dual-l3-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("calc.py"), "def mul(a, b):\n    return a + b\n").unwrap();
+
+        // Turn 0 (Planner: neon-planner): read_file calc.py
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"neon-planner\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"explore\",\"tool\":\"read_file\",\"args\":{\"path\":\"calc.py\"}}" } }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Turn 1 (Executor: hydrogen-exec): fails an edit (triggers friction!)
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"hydrogen-exec\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"bad edit\",\"tool\":\"edit_file\",\"args\":{\"path\":\"calc.py\",\"old_string\":\"NON_EXISTENT\",\"new_string\":\"return a * b\"}}" } }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Turn 2 (Planner re-intervenes on friction!): applies the clean edit
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"neon-planner\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"replan & fix\",\"tool\":\"edit_file\",\"args\":{\"path\":\"calc.py\",\"old_string\":\"return a + b\",\"new_string\":\"return a * b\"}}" } }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Turn 3 (Executor finishes cleanly)
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"hydrogen-exec\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"done\",\"final\":\"Fixed mul()\"}" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        // Cold L3 Reviewer (opus-reviewer): approves the clean diff
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"opus-reviewer\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"verdict\":\"PASS\",\"reason\":\"Verified mul() uses multiplication.\"}" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let req = meg_tui::RunRequest {
+            workspace: ws.clone(),
+            goal: "Fix mul() in calc.py".into(),
+            base_url: format!("{}/v1", server.uri()),
+            model: "neon-planner".into(),
+            provider: None,
+            mode: meg_tui::Mode::default(),
+            effort: "medium".into(),
+            history: vec![],
+            cancel: meg_core::CancellationToken::default(),
+        };
+        let (_outcomes, ans, telemetry) = run_request_detailed(
+            req,
+            None,
+            None,
+            RunExtras {
+                max_steps: Some(8),
+                verify_cmd: Some("python -c \"import calc; assert calc.mul(3, 4) == 12\"".into()),
+                require_verify: true,
+                pair_mode: Some("antigravity_orchestrator".into()),
+                executor_model: Some("hydrogen-exec".into()),
+                reviewer_model: Some("opus-reviewer".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ans.as_deref(), Some("Fixed mul()"));
+        assert_eq!(telemetry.planner_turns, 2, "Planner should run Turn 0 + 1 friction re-intervention");
+        assert_eq!(telemetry.executor_turns, 2, "Executor should run Turn 1 + final turn");
+        assert_eq!(telemetry.reviewer_verdict.as_deref(), Some("PASS"));
+        assert!(ws.join(".meg/receipt.json").is_file());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn cold_l3_reviewer_reject_blocks_receipt_signing() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = fixture().await;
+        let ws = std::env::temp_dir().join(format!("meg-l3-reject-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("calc.py"), "def mul(a, b):\n    return a + b\n").unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"builder-m\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"edit\",\"tool\":\"edit_file\",\"args\":{\"path\":\"calc.py\",\"old_string\":\"return a + b\",\"new_string\":\"return a * b\"}}" } }]
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"builder-m\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"thought\":\"done\",\"final\":\"done\"}" } }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"model\":\"strict-critic\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{ "message": { "content": "{\"verdict\":\"REJECT\",\"reason\":\"Missing overflow check\"}" } }]
+            })))
+            .mount(&server)
+            .await;
+
+        let req = meg_tui::RunRequest {
+            workspace: ws.clone(),
+            goal: "Fix mul()".into(),
+            base_url: format!("{}/v1", server.uri()),
+            model: "builder-m".into(),
+            provider: None,
+            mode: meg_tui::Mode::default(),
+            effort: "medium".into(),
+            history: vec![],
+            cancel: meg_core::CancellationToken::default(),
+        };
+        let err = run_request_detailed(
+            req,
+            None,
+            None,
+            RunExtras {
+                max_steps: Some(6),
+                reviewer_model: Some("strict-critic".into()),
+                ..RunExtras::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("L3_REVIEWER_REJECTED"), "{err}");
+        assert!(!ws.join(".meg/receipt.json").exists(), "Rejected run must NEVER sign receipt");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
     async fn anti_stub_gate_withholds_finish_and_recovers_once_stub_removed() {
         let server = fixture().await;
         let ws = std::env::temp_dir().join(format!("meg-stub-gate-{}", uuid::Uuid::new_v4()));
@@ -1940,6 +2681,7 @@ mod native_integration {
                 max_steps: Some(8),
                 verify_cmd: Some("python -c \"import app; assert app.run() == 42\"".into()),
                 require_verify: true,
+                ..RunExtras::default()
             },
         )
         .await
@@ -2029,6 +2771,12 @@ mod native_integration {
             verify_cmd: None,
             require_verify: false,
             verify_passed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            executor_shim: None,
+            pair_mode: None,
+            turn_counter: std::sync::atomic::AtomicUsize::new(0),
+            planner_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            executor_turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            consecutive_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
         engine
