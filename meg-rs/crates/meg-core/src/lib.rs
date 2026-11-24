@@ -431,8 +431,12 @@ pub async fn run_loop_with_config(
                 let result = engine.execute_tool(&tool, &args).await;
                 let ok = result.is_ok();
                 let raw_obs = result.unwrap_or_else(|e| format!("tool error: {e}"));
-                let mut observation =
-                    crate::truncate::truncate_observation(&raw_obs, config.observation_char_limit);
+                let mut observation = format_live_observation(
+                    config,
+                    &format!("step{step}"),
+                    &raw_obs,
+                    finish_reprompt_count > 0,
+                );
                 let doom = update_doom_loop(
                     &mut last_call_sig,
                     &mut consecutive_same_call,
@@ -643,6 +647,28 @@ pub async fn run_loop_with_config(
         }
     }
     Ok((outcomes, None))
+}
+
+fn format_live_observation(
+    config: &LoopConfig,
+    cmd_id: &str,
+    raw: &str,
+    first_completion_claimed: bool,
+) -> String {
+    if first_completion_claimed {
+        return crate::truncate::compact_text(raw);
+    }
+    if let Some(ws) = config.workspace.as_deref() {
+        if raw.len() > 4_000 || raw.lines().count() > 150 {
+            let spilled = crate::truncate::truncate_with_scratch(ws, cmd_id, raw, false);
+            return if spilled.len() > config.observation_char_limit {
+                crate::truncate::truncate_observation(&spilled, config.observation_char_limit)
+            } else {
+                spilled
+            };
+        }
+    }
+    crate::truncate::truncate_observation(raw, config.observation_char_limit)
 }
 
 fn check_finish_gate(

@@ -130,6 +130,7 @@ impl LoopEngine for ShimEngine {
                 }
             }
             let checkpoint = if matches!(name.as_str(), "write_file" | "edit_file") {
+                let _ = meg_tools::journal::side_git_snapshot(&workspace, &format!("pre-{name}"));
                 Some(meg_tools::journal::FileCheckpoint::capture(
                     &workspace, &args,
                 )?)
@@ -315,16 +316,22 @@ fn visible_preview(raw: &str) -> String {
                     end = Some(index + 1);
                     break;
                 }
-                if !escaped && ch == '\\' {
-                    escaped = true;
-                } else {
-                    escaped = false;
-                }
+                escaped = !escaped && ch == '\\';
             }
             let candidate = if let Some(end) = end {
                 rest[..end].to_string()
             } else {
-                format!("{rest}\"")
+                let mut trimmed = rest;
+                // Trim incomplete trailing escape (`\` or partial `\uXXXX`) before closing quote.
+                if escaped {
+                    trimmed = trimmed.strip_suffix('\\').unwrap_or(trimmed);
+                } else if let Some(u_idx) = trimmed.rfind("\\u") {
+                    let tail = &trimmed[u_idx + 2..];
+                    if tail.len() < 4 && tail.chars().all(|c| c.is_ascii_hexdigit()) {
+                        trimmed = &trimmed[..u_idx];
+                    }
+                }
+                format!("{trimmed}\"")
             };
             return serde_json::from_str::<String>(&candidate).unwrap_or_default();
         }
@@ -672,6 +679,8 @@ async fn run_request_with_plane(
         finish_hook,
         ..meg_core::LoopConfig::default()
     };
+    let receipt_workspace = request.workspace.clone();
+    let receipt_mode = request.mode;
     let engine = ShimEngine {
         plane,
         catalog,
@@ -696,6 +705,20 @@ async fn run_request_with_plane(
         result.1.is_some(),
         "Turn budget exhausted after {max_steps} steps; no final answer was produced"
     );
+    if receipt_mode != meg_tui::Mode::Plan {
+        let mutated = result.0.iter().any(|t| match &t.action {
+            meg_core::Action::Tool { tool, .. } => {
+                matches!(tool.as_str(), "write_file" | "edit_file")
+            }
+            meg_core::Action::Batch { calls, .. } => calls
+                .iter()
+                .any(|(tool, _)| matches!(tool.as_str(), "write_file" | "edit_file")),
+            _ => false,
+        });
+        if mutated {
+            let _ = meg_tools::ledger::write_receipt(&receipt_workspace, "meg-run", true);
+        }
+    }
     Ok(result)
 }
 

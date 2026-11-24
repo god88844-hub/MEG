@@ -7,12 +7,61 @@ import { McpHost } from "./mcp-host";
 import { WorkspaceExtensions, configRoot } from "./extensions";
 import { AgentManager } from "./agents";
 import { dispatchSlashCommand, dropBacklogTicket, routeMagnitude, type PstackMode } from "./commands";
+import { evaluateAmbiguityGate, runTurn0Bootstrap } from "./bootstrap";
+import { buildCompressedHandoff, compactProcessedMedia, compileContext } from "./context";
+import { checkEpamCircuitBreaker, classifyBudgetProfile, evaluateAgentBaton, selectHarnessGear } from "./fusion";
+import { BiTemporalMemoryStore, lexicalSearchWorkspace, stairTocLeafRetrieve } from "./memory";
+import { OmnigraphStore } from "./omnigraph";
+import { scanSkillSupplyChain } from "./security-router";
+import { loadSkillFromDir, renderSkillPlusPlusIndex, selectActiveSkills } from "./skills";
+import { routeCliOrMcp } from "./mcp-host";
+import { assertVerificationLevel, evaluateMirlGate } from "./checks_gate";
+import { assignColdCrossModelCritic } from "./critic";
+import { formatRemediationLint, scanAntiStubAndFalseZero } from "./poteto_checks";
+import { evaluateEarlyStartIndependence } from "./graphs";
+import { buildUnitOnlyReturnEdge } from "./agents";
+import { GoalManager, checkAntiGoalGamingInvariants } from "./goals_motions";
+import { compileIssueContractAndBreakTrifecta, triageCiFailure } from "./github";
+import { ingestClipboardMedia, ingestDroppedMedia } from "./media";
 import fs from "node:fs";
 import path from "node:path";
 
 const router = new ModelRouter();
 const sessions = new Map<string, SessionTree>();
 const tasks = new Map<string, TaskStateMachine>();
+const memories = new Map<string, BiTemporalMemoryStore>();
+const omnigraphs = new Map<string, OmnigraphStore>();
+const goals = new Map<string, GoalManager>();
+
+function getMemoryStore(workspace: string): BiTemporalMemoryStore {
+  const key = fs.realpathSync(workspace);
+  let store = memories.get(key);
+  if (!store) {
+    store = new BiTemporalMemoryStore(path.join(key, ".meg", "memory.jsonl"));
+    memories.set(key, store);
+  }
+  return store;
+}
+
+function getOmnigraph(workspace: string): OmnigraphStore {
+  const key = fs.realpathSync(workspace);
+  let og = omnigraphs.get(key);
+  if (!og) {
+    og = new OmnigraphStore();
+    omnigraphs.set(key, og);
+  }
+  return og;
+}
+
+function getGoalManager(workspace: string): GoalManager {
+  const key = fs.realpathSync(workspace);
+  let gm = goals.get(key);
+  if (!gm) {
+    gm = new GoalManager(key);
+    goals.set(key, gm);
+  }
+  return gm;
+}
 const mcp = new McpHost();
 const workspaces = new Map<string, WorkspaceExtensions>();
 const delegates = new AgentManager(4);
@@ -139,6 +188,68 @@ const handlers: Record<string, Handler> = {
   "mcp.callTool": (p: { server: string; tool: string; args: Record<string, unknown> }) =>
     mcp.callTool(p.server, p.tool, p.args),
   "mcp.allTools": () => mcp.allTools(),
+  "mcp.routePolicy": (p: { target: string; extraAllowedMcp?: string[] }) =>
+    routeCliOrMcp(p.target, { extraAllowedMcp: p.extraAllowedMcp }),
+  "bootstrap.probe": (p: { workspace: string }) => runTurn0Bootstrap(p.workspace),
+  "bootstrap.ambiguityGate": (p: { workspace: string; candidates: any[] }) =>
+    evaluateAmbiguityGate(p.workspace, p.candidates ?? []),
+  "context.compile": (p: any) => compileContext(p),
+  "context.handoff": (p: any) => ({ brief: buildCompressedHandoff(p) }),
+  "context.compactMedia": (p: { workspace: string; blocks: any[] }) =>
+    compactProcessedMedia(p.workspace, p.blocks ?? []),
+  "fusion.classifyBudget": (p: { profile: any; confidence: number }) =>
+    classifyBudgetProfile(p.profile, p.confidence),
+  "fusion.selectGear": (p: { paramBillions: number | "frontier" }) =>
+    selectHarnessGear(p.paramBillions),
+  "fusion.checkEpam": (p: any) => checkEpamCircuitBreaker(p),
+  "fusion.baton": (p: any) => evaluateAgentBaton(p),
+  "memory.record": (p: { workspace: string; key: string; value: string; epistemic: any; sourceFile?: string }) =>
+    getMemoryStore(p.workspace).recordFact(p),
+  "memory.query": (p: { workspace: string; key: string; validAt?: number }) =>
+    getMemoryStore(p.workspace).queryAsOf(p.key, p.validAt ?? Date.now()),
+  "memory.lexicalSearch": (p: { workspace: string; pattern: string; maxHits?: number }) =>
+    lexicalSearchWorkspace(p.workspace, p.pattern, p.maxHits),
+  "memory.stairRetrieve": (p: { markdown: string; query: string; maxLeaves?: number }) =>
+    stairTocLeafRetrieve(p.markdown, p.query, p.maxLeaves),
+  "omnigraph.branch": (p: { workspace: string; branch: string; from?: string }) => {
+    getOmnigraph(p.workspace).createBranch(p.branch, p.from ?? "main");
+    return { created: p.branch };
+  },
+  "omnigraph.put": (p: { workspace: string; branch: string; slug: string; value: string; actor: string; expectedBaseVersion?: number }) =>
+    getOmnigraph(p.workspace).put(p.branch, p.slug, p.value, p.actor, p.expectedBaseVersion),
+  "omnigraph.get": (p: { workspace: string; branch: string; slug: string; snapshot?: number }) =>
+    getOmnigraph(p.workspace).get(p.branch, p.slug, { snapshot: p.snapshot }),
+  "omnigraph.merge": (p: { workspace: string; branch: string; role: "worker" | "reviewer"; actor?: string }) =>
+    getOmnigraph(p.workspace).mergeToMain(p.branch, p.role, p.actor),
+  "skills.scanDdipe": (p: { content: string; source?: string }) =>
+    scanSkillSupplyChain(p.content, p.source),
+  "skills.selectActive": (p: { skillDirs: string[]; query: string }) => {
+    const loaded = (p.skillDirs ?? []).map((d) => loadSkillFromDir(d, { thirdParty: true }));
+    const res = selectActiveSkills(loaded, p.query);
+    return { selected: res.selected.map((s) => s.metadata), droppedReasons: res.droppedReasons, index: renderSkillPlusPlusIndex(res.selected) };
+  },
+  "verifier.checkLevel": (p: { level: any }) => assertVerificationLevel(p.level),
+  "verifier.mirlGate": (p: any) => evaluateMirlGate(p),
+  "verifier.potetoScan": (p: { filePath: string; source: string }) => {
+    const findings = scanAntiStubAndFalseZero(p.source);
+    return { ok: findings.length === 0, findings, formatted: formatRemediationLint(p.filePath, findings) };
+  },
+  "verifier.assignCritic": (p: { writer: any; pool: any[] }) =>
+    assignColdCrossModelCritic(p.writer, p.pool ?? []),
+  "graphs.earlyStart": (p: { slices: any[] }) => evaluateEarlyStartIndependence(p.slices ?? []),
+  "graphs.unitReturnEdge": (p: { slices: any[] }) => buildUnitOnlyReturnEdge(p.slices ?? []),
+  "goals.handoff": (p: { workspace: string; spec: any; budget: { maxUsd: number; maxRuns: number } }) =>
+    getGoalManager(p.workspace).handoffFromState(p.spec, p.budget),
+  "goals.command": (p: { workspace: string; command: string }) =>
+    getGoalManager(p.workspace).handleCommand(p.command),
+  "goals.checkInvariants": (p: any) => checkAntiGoalGamingInvariants(p),
+  "github.compileIssueContract": (p: { issue: any; plan: any }) =>
+    compileIssueContractAndBreakTrifecta(p.issue, p.plan),
+  "github.triageCi": (p: { logText: string }) => triageCiFailure(p.logText),
+  "media.ingestDrop": (p: { workspace: string; rawPath: string }) =>
+    ingestDroppedMedia(p.workspace, p.rawPath),
+  "media.ingestClipboard": (p: { workspace: string; payload: string; mimeType?: string }) =>
+    ingestClipboardMedia(p.workspace, p.payload, p.mimeType),
 };
 
 export async function handleRpc(
