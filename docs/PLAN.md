@@ -245,11 +245,11 @@
 ## PHASE 7 -- Offline Evaluation, Benchmarking & Controlled Evolution (`meg-eval/`)
 **Language:** Python 3.11+ (`uv` / `pytest` / `Inspect AI`) -- **Strictly Offline**
 
-- [ ] **P7-01 4-Layer Eval Runner (`meg-eval/runner.py`):** Layer 1 `<5s` behavioral trace assertions; Layer 2 security/adversarial (`DDIPE`, `InjecAgent`, `Blindfold` audit timing secrecy, `SABench` side effects); Layer 3 private 50-200 golden tasks; Layer 4 public adapters (`SWE-bench Verified/Pro`, `Terminal-Bench 2.0/2.1` in `--pinned-model` mode, `VisualBench`, `ARC-AGI-3`, `Strength-2` 18-config orthogonal stress grid).
+- [x] **P7-01 4-Layer Eval Runner (`meg-eval/runner.py`):** Layer 1 `<5s` behavioral trace assertions; Layer 2 security/adversarial (`DDIPE`, `InjecAgent`, `Blindfold` audit timing secrecy, `SABench` side effects); Layer 3 private 50-200 golden tasks; Layer 4 public adapters (`SWE-bench Verified/Pro`, `Terminal-Bench 2.0/2.1` in `--pinned-model` mode, `VisualBench`, `ARC-AGI-3`, `Strength-2` 18-config orthogonal stress grid).
   - *Micro-Check:* `pytest meg-eval/test_runner.py`
-- [ ] **P7-02 Reliability & DORA Metrics (`meg-eval/metrics.py`):** Compute `Pass@1`, `Pass^4`, `Flip`, unbiased `Pass@k`, `CoP` (Cost per Verified Outcome), **Harness Constraint Effect**, **Defect Escape Rate**, **False Completion Rate**, and `MAD-RSI` `Pass^M` / `D_q`.
+- [x] **P7-02 Reliability & DORA Metrics (`meg-eval/metrics.py`):** Compute `Pass@1`, `Pass^4`, `Flip`, unbiased `Pass@k`, `CoP` (Cost per Verified Outcome), **Harness Constraint Effect**, **Defect Escape Rate**, **False Completion Rate**, and `MAD-RSI` `Pass^M` / `D_q`.
   - *Micro-Check:* `pytest meg-eval/test_metrics.py`
-- [ ] **P7-03 Label-Free `TestSynth` & Trace Attribution (`meg-eval/testsynth.py`):** Generate 10 container-validated `unittest` cases per failure (banning `/empty_product` oracle scraping; serial `infra_error` repair) + `HarnessFix` `HTIR` fault attribution + `Shor` component priority ranker.
+- [x] **P7-03 Label-Free `TestSynth` & Trace Attribution (`meg-eval/testsynth.py`):** Generate 10 container-validated `unittest` cases per failure (banning `/empty_product` oracle scraping; serial `infra_error` repair) + `HarnessFix` `HTIR` fault attribution + `Shor` component priority ranker.
   - *Micro-Check:* `pytest meg-eval/test_testsynth.py`
 - [ ] **P7-04 Offline Controlled Candidate Evolution (`meg-eval/evolve.py`):**
   - **Gated Modular Evolution (`arXiv:2611.22299`):** Mutate 1 module at a time behind held-out gates + token caps.
