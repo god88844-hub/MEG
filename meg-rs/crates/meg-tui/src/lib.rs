@@ -18,6 +18,8 @@ pub mod session;
 pub mod stream;
 pub mod theme;
 pub mod viewport;
+pub mod pro_ui;
+pub mod ui_config;
 pub mod workspace;
 
 pub use chips::*;
@@ -31,6 +33,8 @@ pub use runtime::{run_app, run_app_with_services, tui_restore, Controller};
 pub use stream::*;
 pub use theme::*;
 pub use viewport::*;
+pub use pro_ui::*;
+pub use ui_config::*;
 pub use workspace::*;
 
 pub type ThemePalette = Palette;
@@ -137,6 +141,12 @@ pub struct WorkstationState {
     pub workspace_picker: Option<WorkspacePicker>,
     /// The live brain roster (fetched from the shim's /v1/models).
     pub available_models: Vec<String>,
+    pub ui_mode: ui_config::UiMode,
+    pub ui_config: ui_config::UserUiConfig,
+    pub pair_mode: Option<String>,
+    pub executor_model: Option<String>,
+    pub reviewer_model: Option<String>,
+    pub collapse_tool_cards: bool,
     pub should_quit: bool,
 }
 
@@ -187,6 +197,12 @@ impl Default for WorkstationState {
             subagents: Vec::new(),
             workspace_picker: None,
             available_models: Vec::new(),
+            ui_mode: ui_config::UiMode::Classic,
+            ui_config: ui_config::UserUiConfig::default(),
+            pair_mode: None,
+            executor_model: None,
+            reviewer_model: None,
+            collapse_tool_cards: true,
             should_quit: false,
         }
     }
@@ -716,6 +732,9 @@ pub struct RunRequest {
     pub mode: Mode,
     pub effort: String,
     pub cancel: meg_core::CancellationToken,
+    pub pair_mode: Option<String>,
+    pub executor_model: Option<String>,
+    pub reviewer_model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -748,6 +767,9 @@ impl WorkstationState {
             mode: self.mode,
             effort: self.effort.clone(),
             cancel: meg_core::CancellationToken::default(),
+            pair_mode: self.pair_mode.clone(),
+            executor_model: self.executor_model.clone(),
+            reviewer_model: self.reviewer_model.clone(),
         }
     }
 }

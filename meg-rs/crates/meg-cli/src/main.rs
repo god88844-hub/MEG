@@ -548,6 +548,7 @@ struct TuiOptions {
     verify_cmd: Option<String>,
     require_verify: bool,
     reviewer_model: Option<String>,
+    ui_mode: Option<String>,
 }
 fn parse_tui_options(args: &[String]) -> Result<TuiOptions> {
     let mut options = TuiOptions::default();
@@ -562,7 +563,7 @@ fn parse_tui_options(args: &[String]) -> Result<TuiOptions> {
             "--continue" => options.resume = Some("latest".into()),
             "--no-picker" => options.picker = Some(false),
             "--workspace-picker" => options.picker = Some(true),
-            "-C" | "--cd" | "-m" | "--model" | "--effort" | "--resume" => {
+            "-C" | "--cd" | "-m" | "--model" | "--effort" | "--resume" | "--ui" | "--pair-mode" | "--executor-model" | "--reviewer-model" => {
                 i += 1;
                 let value = args
                     .get(i)
@@ -809,7 +810,7 @@ fn launch_tui(workspace: &Path) -> Result<()> {
     let plane_result = start_plane();
     let plane_error = plane_result.as_ref().err().map(ToString::to_string);
     let plane = plane_result.ok();
-    let st = WorkstationState {
+    let mut st = WorkstationState {
         provider,
         providers: profiles,
         provider_root: Some(provider_store.root),
@@ -849,10 +850,17 @@ fn launch_tui(workspace: &Path) -> Result<()> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let (_outcomes, final_answer) = rt.block_on(run_request_with_plane(
+            let extras = RunExtras {
+                pair_mode: request.pair_mode.clone(),
+                executor_model: request.executor_model.clone(),
+                reviewer_model: request.reviewer_model.clone(),
+                ..RunExtras::default()
+            };
+            let (_outcomes, final_answer) = rt.block_on(run_request_with_options(
                 request,
                 Some(tx),
                 goal_plane.clone(),
+                extras,
             ))?;
             Ok(final_answer)
         },
@@ -885,6 +893,28 @@ fn launch_tui(workspace: &Path) -> Result<()> {
             forward_agent_event(&Some(events.clone()), value)
         })
     });
+    let (ui_cfg, _) = meg_tui::UserUiConfig::load(Some(workspace));
+    st.ui_mode = options
+        .ui_mode
+        .as_deref()
+        .and_then(meg_tui::UiMode::parse)
+        .unwrap_or(ui_cfg.ui_mode);
+    st.collapse_tool_cards = ui_cfg.compact_tool_cards;
+    if let Some(tname) = &ui_cfg.theme_name {
+        if let Some(p) = meg_tui::get_palette(tname) {
+            st.theme = p;
+        }
+    }
+    st.pair_mode = options.pair_mode.clone().or_else(|| ui_cfg.pair_mode.clone());
+    st.executor_model = options
+        .executor_model
+        .clone()
+        .or_else(|| ui_cfg.executor_model.clone());
+    st.reviewer_model = options
+        .reviewer_model
+        .clone()
+        .or_else(|| ui_cfg.reviewer_model.clone());
+    st.ui_config = ui_cfg;
     meg_tui::run_app_with_services(st, Some(runner), Some(services))?;
     Ok(())
 }
@@ -2531,6 +2561,9 @@ mod native_integration {
             effort: "medium".into(),
             history: vec![],
             cancel: meg_core::CancellationToken::default(),
+            pair_mode: None,
+            executor_model: None,
+            reviewer_model: None,
         };
         let (_outcomes, ans, telemetry) = run_request_detailed(
             req,
@@ -2601,6 +2634,9 @@ mod native_integration {
             effort: "medium".into(),
             history: vec![],
             cancel: meg_core::CancellationToken::default(),
+            pair_mode: None,
+            executor_model: None,
+            reviewer_model: None,
         };
         let err = run_request_detailed(
             req,
@@ -2672,6 +2708,9 @@ mod native_integration {
             effort: "medium".into(),
             history: vec![],
             cancel: meg_core::CancellationToken::default(),
+            pair_mode: None,
+            executor_model: None,
+            reviewer_model: None,
         };
         let (outcomes, ans) = run_request_with_options(
             req,
@@ -2735,6 +2774,9 @@ mod native_integration {
             effort: "medium".into(),
             history: vec![],
             cancel: meg_core::CancellationToken::default(),
+            pair_mode: None,
+            executor_model: None,
+            reviewer_model: None,
         };
         let err = run_request(req, None).await.unwrap_err();
         assert!(err.to_string().contains("SEALED_MANIFEST_VIOLATION"), "{err}");

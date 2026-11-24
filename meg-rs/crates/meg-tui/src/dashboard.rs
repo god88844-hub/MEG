@@ -81,7 +81,27 @@ impl DashboardLayout {
     }
 }
 
+pub struct ClassicFrontend;
+
+impl crate::ui_config::UiFrontend for ClassicFrontend {
+    fn name(&self) -> &'static str {
+        "classic"
+    }
+
+    fn draw(&self, f: &mut Frame, pal: &Palette, st: &WorkstationState) {
+        draw_classic(f, pal, st);
+    }
+}
+
+/// Dispatch to `/ui classic` or `/ui pro` cleanly based on `st.ui_mode`.
 pub fn draw(f: &mut Frame, pal: &Palette, st: &WorkstationState) {
+    match st.ui_mode {
+        crate::ui_config::UiMode::Classic => draw_classic(f, pal, st),
+        crate::ui_config::UiMode::Pro => crate::pro_ui::draw_pro(f, pal, st),
+    }
+}
+
+pub fn draw_classic(f: &mut Frame, pal: &Palette, st: &WorkstationState) {
     if let Some(picker) = &st.workspace_picker {
         if picker.fullscreen {
             crate::render_workspace_picker(f, pal, picker);

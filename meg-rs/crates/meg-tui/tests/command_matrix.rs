@@ -116,6 +116,13 @@ fn every_advertised_command_reaches_its_implementation_and_local_commands_stay_l
         "/theme Dashboard",
         "/effort high",
         "/model fixture",
+        "/ui pro",
+        "/ui cards",
+        "/ui classic",
+        "/ui config",
+        "/pair status",
+        "/pair antigravity_orchestrator exec-model rev-model",
+        "/pair off",
     ] {
         run(&mut c, &mut seen, command);
     }

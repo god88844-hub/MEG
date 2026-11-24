@@ -266,6 +266,19 @@ command_table![
         true
     ),
     (
+        Ui,
+        "/ui",
+        "Switch /ui classic|pro, toggle cards, or reload ~/.meg/ui.json",
+        true,
+        true
+    ),
+    (
+        Pair,
+        "/pair",
+        "Configure single-model (/pair off) or multi-model orchestration",
+        true,
+        false
+    ),    (
         Exit,
         "/exit",
         "Save the session, stop owned work and exit",
@@ -465,7 +478,94 @@ impl Controller {
                 else if args.is_empty(){self.system(if self.queue.is_empty(){"Follow-up queue is empty.".into()}else{self.queue.iter().enumerate().map(|(i,(_,display))|format!("{}. {display}",i+1)).collect::<Vec<_>>().join("\n")});}
                 else{bail!("Usage: /queue [clear|run]");}
             }
-            Exit => { self.cancel(); self.state.should_quit=true; }
+            Ui => {
+                let sub = args.trim().to_ascii_lowercase();
+                if sub.is_empty() || sub == "status" || sub == "config" {
+                    let ws_path = std::path::PathBuf::from(&self.state.cwd);
+                    let global_p = ui_config::UserUiConfig::global_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "~/.meg/ui.json".into());
+                    self.system(format!(
+                        "UI mode: {} | cards: {} | sidebar: {} | CSI-2026: {}\nCustom UI config paths:\n  workspace: {}\n  global   : {}",
+                        self.state.ui_mode.label(),
+                        if self.state.collapse_tool_cards { "compact" } else { "expanded" },
+                        if self.state.ui_config.show_sidebar { "on" } else { "off" },
+                        if self.state.ui_config.sync_csi_2026 { "on" } else { "off" },
+                        ui_config::UserUiConfig::workspace_path(&ws_path).display(),
+                        global_p
+                    ));
+                } else if let Some(mode) = ui_config::UiMode::parse(&sub) {
+                    self.state.ui_mode = mode;
+                    self.state.ui_config.ui_mode = mode;
+                    self.state.notice = format!("UI mode: {}", mode.label());
+                } else if sub == "cards" {
+                    self.state.collapse_tool_cards = !self.state.collapse_tool_cards;
+                    self.state.ui_config.compact_tool_cards = self.state.collapse_tool_cards;
+                    self.state.notice = format!(
+                        "Tool cards: {}",
+                        if self.state.collapse_tool_cards { "compact" } else { "expanded" }
+                    );
+                } else if sub == "sidebar" {
+                    self.state.ui_config.show_sidebar = !self.state.ui_config.show_sidebar;
+                    self.state.notice = format!(
+                        "Sidebar: {}",
+                        if self.state.ui_config.show_sidebar { "on" } else { "off" }
+                    );
+                } else if sub == "reload" {
+                    let ws_path = std::path::PathBuf::from(&self.state.cwd);
+                    let (cfg, loaded_from) = ui_config::UserUiConfig::load(Some(&ws_path));
+                    self.state.ui_mode = cfg.ui_mode;
+                    self.state.collapse_tool_cards = cfg.compact_tool_cards;
+                    if let Some(tname) = &cfg.theme_name {
+                        if let Some(p) = get_palette(tname) {
+                            self.state.theme = p;
+                        }
+                    }
+                    self.state.pair_mode = cfg.pair_mode.clone();
+                    self.state.executor_model = cfg.executor_model.clone();
+                    self.state.reviewer_model = cfg.reviewer_model.clone();
+                    self.state.ui_config = cfg;
+                    self.state.notice = match loaded_from {
+                        Some(p) => format!("Reloaded UI config from {}", p.display()),
+                        None => "UI config reset to defaults (no ui.json found).".into(),
+                    };
+                } else {
+                    bail!("Usage: /ui [classic|pro|cards|sidebar|reload|config]");
+                }
+            }
+            Pair => {
+                let parts: Vec<&str> = args.split_whitespace().collect();
+                if parts.is_empty() || parts[0].eq_ignore_ascii_case("status") {
+                    self.system(format!(
+                        "Orchestration: {} | planner: {} | executor: {} | L3 reviewer: {}",
+                        self.state.pair_mode.as_deref().unwrap_or("single_model"),
+                        self.state.model,
+                        self.state.executor_model.as_deref().unwrap_or("(none)"),
+                        self.state.reviewer_model.as_deref().unwrap_or("(none)"),
+                    ));
+                } else if matches!(parts[0].to_ascii_lowercase().as_str(), "off" | "single" | "none") {
+                    self.state.pair_mode = None;
+                    self.state.executor_model = None;
+                    self.state.reviewer_model = None;
+                    self.state.notice = "Orchestration: single-model mode.".into();
+                } else if matches!(parts[0], "devin_fusion" | "antigravity_orchestrator") {
+                    let exec = parts
+                        .get(1)
+                        .copied()
+                        .context("Usage: /pair <devin_fusion|antigravity_orchestrator> <executor-model> [reviewer-model]")?;
+                    let rev = parts.get(2).map(|s| (*s).to_string());
+                    self.state.pair_mode = Some(parts[0].to_string());
+                    self.state.executor_model = Some(exec.to_string());
+                    self.state.reviewer_model = rev.clone();
+                    self.state.notice = format!(
+                        "Orchestration: {} (exec={exec}{})",
+                        parts[0],
+                        rev.map(|r| format!(", L3={r}")).unwrap_or_default()
+                    );
+                } else {
+                    bail!("Usage: /pair [off|status|devin_fusion <exec> [rev]|antigravity_orchestrator <exec> [rev]]");
+                }
+            }            Exit => { self.cancel(); self.state.should_quit=true; }
         }
         self.save()?;
         Ok(None)

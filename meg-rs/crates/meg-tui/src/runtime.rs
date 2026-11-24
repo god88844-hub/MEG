@@ -1626,7 +1626,15 @@ pub fn run_app_with_services(
             break;
         }
         if dirty || controller.state.busy {
+            if controller.state.ui_config.sync_csi_2026 {
+                let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[?2026h");
+            }
             terminal.draw(|f| draw(f, &controller.state.theme, &controller.state))?;
+            if controller.state.ui_config.sync_csi_2026 {
+                let mut out = std::io::stdout();
+                let _ = std::io::Write::write_all(&mut out, b"\x1b[?2026l");
+                let _ = std::io::Write::flush(&mut out);
+            }
             dirty = false;
         }
         if crossterm::event::poll(Duration::from_millis(if controller.state.busy {
