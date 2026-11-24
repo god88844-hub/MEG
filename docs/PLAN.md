@@ -251,13 +251,13 @@
   - *Micro-Check:* `pytest meg-eval/test_metrics.py`
 - [x] **P7-03 Label-Free `TestSynth` & Trace Attribution (`meg-eval/testsynth.py`):** Generate 10 container-validated `unittest` cases per failure (banning `/empty_product` oracle scraping; serial `infra_error` repair) + `HarnessFix` `HTIR` fault attribution + `Shor` component priority ranker.
   - *Micro-Check:* `pytest meg-eval/test_testsynth.py`
-- [ ] **P7-04 Offline Controlled Candidate Evolution (`meg-eval/evolve.py`):**
+- [x] **P7-04 Offline Controlled Candidate Evolution (`meg-eval/evolve.py`):**
   - **Gated Modular Evolution (`arXiv:2611.22299`):** Mutate 1 module at a time behind held-out gates + token caps.
   - **`GUARD` Regret Control (`arXiv:2611.23476`):** Turn-0 checklists + directional regret + Soft-HURT trust-region gate (0.00 pp forgetting) + rejection ledger.
   - **`OO-HARNESS` + `HARNESSPRO` + `MAD-RSI` + `RuHarness` + `SkillAdam` + `EnvOpt`:** Cluster-only eval on `D_c` with priority decay & `add|merge|split`, 10-task DPP coreset (2 unanimous fail + 2 unanimous pass anchors), `Lite/Med/Heavy` Pareto selection, 3-config behavioral check, `fires_on_stable == False`, peak-tracking admission gate, and Dual-Rubric Governance Gauntlet (`CLEAN != GAMING`).
   - **Hard Rule:** Outputs ONLY an **unmerged GitHub PR** with before/after receipts for human sign-off. Zero auto-merge; zero live Ring-0 edits.
   - *Micro-Check:* `pytest meg-eval/test_evolve.py`
-- [ ] **P7-05 Bitter-Lesson Model-Upgrade Decay Sweep (`meg-eval/ablate.py`):** On new model checkpoints, run 3-trial single-component ablations and open a PR to delete obsolete scaffolding.
+- [x] **P7-05 Bitter-Lesson Model-Upgrade Decay Sweep (`meg-eval/ablate.py`):** On new model checkpoints, run 3-trial single-component ablations and open a PR to delete obsolete scaffolding.
   - *Micro-Check:* `pytest meg-eval/test_ablate.py`
 
 **Phase 7 Gate (Tier 2 + Tier 3 sample):** Offline eval & candidate PR dry-run green with 0 `GAMING` verdicts and 0 regressions.
