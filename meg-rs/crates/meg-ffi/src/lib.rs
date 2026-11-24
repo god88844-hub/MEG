@@ -1,3 +1,4 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 //! meg-ffi -- Bridge 1: the meg-rs hot path as a C-ABI cdylib, loaded
 //! in-process by Bun's `bun:ffi` (dlopen). Zero fork, zero subprocess:
 //! the control plane calls grep/edit/truncate/parse in ~us.
@@ -152,6 +153,38 @@ pub extern "C" fn meg_index_workspace(root_ptr: *const c_char) -> *mut c_char {
     put_str(meg_core::indexer::index_workspace(std::path::Path::new(&root), 200))
 }
 
+/// Stage-by-stage compound bash gate: returns "ok" or "error: ...".
+#[no_mangle]
+pub extern "C" fn meg_validate_compound_bash(command: *const c_char) -> *mut c_char {
+    match meg_tools::security_guards::validate_compound_bash(&take_str(command)) {
+        Ok(()) => put_str("ok".into()),
+        Err(e) => put_str(format!("error: {e}")),
+    }
+}
+
+/// SAL membrane observation scrubber: replaces secret tokens with `<SURROGATE_SECRET_N>`.
+#[no_mangle]
+pub extern "C" fn meg_scrub_sal(text: *const c_char) -> *mut c_char {
+    put_str(meg_tools::security_guards::scrub_sal_observation(&take_str(text)))
+}
+
+/// Verify `<workspace>/.meg/receipt.json` against live tree hash.
+#[no_mangle]
+pub extern "C" fn meg_verify_receipt(workspace: *const c_char) -> *mut c_char {
+    match meg_tools::ledger::verify_receipt(&ws(workspace)) {
+        Ok(v) => put_str(v),
+        Err(e) => put_str(format!("error: {e}")),
+    }
+}
+
+/// Idle-window PageRank RepoMap hook for LLM network wait windows.
+#[no_mangle]
+pub extern "C" fn meg_idle_index_workspace(root_ptr: *const c_char, max_tokens: u32) -> *mut c_char {
+    let root = take_str(root_ptr);
+    let cap = if max_tokens == 0 { 1000 } else { max_tokens as usize };
+    put_str(meg_core::indexer::build_repo_map(std::path::Path::new(&root), cap))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +249,41 @@ mod tests {
         meg_free(ptr2);
         assert!(ls_out.contains("dir  src/"), "{ls_out}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn p1_12_security_sal_receipt_and_idle_repomap_ffi() {
+        let ok_cmd = CString::new("echo hi").unwrap();
+        let p1 = meg_validate_compound_bash(ok_cmd.as_ptr());
+        assert_eq!(take_str(p1), "ok");
+        meg_free(p1);
+
+        let bad_cmd = CString::new("echo hi && git push --force").unwrap();
+        let p2 = meg_validate_compound_bash(bad_cmd.as_ptr());
+        assert!(take_str(p2).starts_with("error:"));
+        meg_free(p2);
+
+        let secret = CString::new("key=sk-proj-1234567890abcdef1234567890").unwrap();
+        let p3 = meg_scrub_sal(secret.as_ptr());
+        let scrubbed = take_str(p3);
+        meg_free(p3);
+        assert!(scrubbed.contains("<SURROGATE_SECRET_1>"), "{scrubbed}");
+
+        let dir = std::env::temp_dir().join(format!("meg-ffi-rcpt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), "pub fn entry() {}\n").unwrap();
+        meg_tools::ledger::write_receipt(&dir, "ffi-t1", true).unwrap();
+
+        let ws_c = CString::new(dir.to_string_lossy().to_string()).unwrap();
+        let p4 = meg_verify_receipt(ws_c.as_ptr());
+        assert!(take_str(p4).starts_with("verified:ffi-t1:"));
+        meg_free(p4);
+
+        let p5 = meg_idle_index_workspace(ws_c.as_ptr(), 1000);
+        assert!(take_str(p5).contains("<repo_map"));
+        meg_free(p5);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

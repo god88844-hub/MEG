@@ -49,19 +49,19 @@
   - Auto-lock `.env*` in `.gitignore`, block direct `.env` reads/writes, run Shannon-entropy + token-prefix (`sk-`, `ghp_`, `AIza`) pre-commit scanner, and scrub observations into `<SURROGATE_...>` tokens (`SAL` membrane; `disable_codebase_upload = true`).
   - Implement `ChildAuthority::clamp` bitmask intersection (`Child = Parent & Requested`).
   - *Micro-Check:* `cargo test -p meg-tools security_guards`
-- [ ] **P1-10 Competitor Bug Guards & Sealed-File Wall (`meg-tools/src/deliverable_guard.rs`):**
+- [x] **P1-10 Competitor Bug Guards & Sealed-File Wall (`meg-tools/src/deliverable_guard.rs`):**
   - `AHE` Publish-State Shell Guard: parse passing check commands and hard-block `rm`/`git reset`/`git clean` on non-`/tmp` deliverables.
   - `gh` target-repo privacy pin (block external `--repo` leaks & autonomous `gh pr merge`, `git push --force`, `git tag`, `npm publish`).
   - Ring-0 `read_only_lock` flipped outside the LLM on `Esc` or stop phrases.
   - SHA-256 sealed-file hash manifest (`scalar-loop`) + post-run `git checkout base -- PROTECTED` wall (`tests/`, `migrations/`, `scripts/check.*`).
   - Lauren Tan `.hot.*` zero-allocation / zero-unseeded-random 60-FPS frame linter.
   - *Micro-Check:* `cargo test -p meg-tools deliverable_guard`
-- [ ] **P1-11 AEPN Petri-Net Supervisor & Undo-Price Gate (`meg-core/src/finish_hook.rs`):**
+- [x] **P1-11 AEPN Petri-Net Supervisor & Undo-Price Gate (`meg-core/src/finish_hook.rs`):**
   - Implement P-invariant Petri-net transitions (`p_contract_locked`, `p_selftest_red`, `p_tests_green`, `p_critic_approved`, `p_human_approval_token`, `p_turn_budget`); editing code resets `tests_green` & `critic_approved` to `0`.
   - Classify actions by Undo-Price (`ONE_CLICK_UNDO` | `CLEANUP_UNDO` | `NO_UNDO`) + Timeout Destination Pre-Check before retrying external writes.
   - Add `atif-scan` single-model / single-effort lock when `--pinned-model` is active.
   - *Micro-Check:* `cargo test -p meg-core finish_hook`
-- [ ] **P1-12 Event Ledger, Signed Receipt & FFI Bridge (`meg-tools/src/ledger.rs`, `meg-ffi/src/lib.rs`):**
+- [x] **P1-12 Event Ledger, Signed Receipt & FFI Bridge (`meg-tools/src/ledger.rs`, `meg-ffi/src/lib.rs`):**
   - Append-only event stream (`session.vN.jsonl.zstd` / SQLite) logging failed generations off-history as `assistant/attempt`; OpenTelemetry (`OTel`) span exporter; tree-hash bound `.meg/receipt.json` verifier.
   - Export clean FFI functions to `meg-plane/src/ffi-bridge.ts` + idle-window GC/indexing hook during LLM network waits.
   - *Micro-Check:* `cargo test -p meg-ffi`

@@ -1,6 +1,6 @@
 // Bridge 1 -- Bun FFI into the meg-rs cdylib (in-process, zero fork).
-// The hot path (search/grep/list/edit/read/truncate/parse/index) calls Rust
-// directly in ~us; strings cross as UTF-8 pointers and are released via meg_free.
+// The hot path (search/grep/list/edit/read/truncate/parse/index/security/receipt)
+// calls Rust directly in ~us; strings cross as UTF-8 pointers and are released via meg_free.
 
 import { dlopen, FFIType, CString } from "bun:ffi";
 import path from "node:path";
@@ -15,6 +15,10 @@ export interface FfiLib {
   truncateObservation(text: string, limit: number): string;
   parseActionVariant(raw: string): string | null;
   indexWorkspace(root: string): string;
+  validateCompoundBash(command: string): string;
+  scrubSal(text: string): string;
+  verifyReceipt(workspace: string): string;
+  idleIndexWorkspace(root: string, maxTokens?: number): string;
 }
 
 let lib: FfiLib | null = null;
@@ -58,6 +62,10 @@ export function loadFfi(): FfiLib {
     meg_truncate_observation: { args: [FFIType.cstring, FFIType.u32], returns: FFIType.ptr },
     meg_parse_action_variant: { args: [FFIType.cstring], returns: FFIType.ptr },
     meg_index_workspace: { args: [FFIType.cstring], returns: FFIType.ptr },
+    meg_validate_compound_bash: { args: [FFIType.cstring], returns: FFIType.ptr },
+    meg_scrub_sal: { args: [FFIType.cstring], returns: FFIType.ptr },
+    meg_verify_receipt: { args: [FFIType.cstring], returns: FFIType.ptr },
+    meg_idle_index_workspace: { args: [FFIType.cstring, FFIType.u32], returns: FFIType.ptr },
     meg_free: { args: [FFIType.ptr], returns: FFIType.void },
   });
   const ownedString = (value: unknown): string => {
@@ -67,7 +75,6 @@ export function loadFfi(): FfiLib {
     finally { symbols.meg_free(pointer); }
   };
   lib = {
-    // Bun FFI contract: cstring args must be JS strings (auto null-terminated).
     searchFiles: (ws, pattern) => ownedString(symbols.meg_search_files(ws, pattern)),
     grepFiles: (ws, pattern, glob = "", maxResults = 50) =>
       ownedString(symbols.meg_grep_files(ws, pattern, glob, maxResults)),
@@ -78,10 +85,15 @@ export function loadFfi(): FfiLib {
     truncateObservation: (text, limit) => ownedString(symbols.meg_truncate_observation(text, limit)),
     parseActionVariant: (raw) => {
       const p: number = symbols.meg_parse_action_variant(raw) as unknown as number;
-      if (!p) return null; // null pointer = no parseable action
+      if (!p) return null;
       return ownedString(p);
     },
     indexWorkspace: (root) => ownedString(symbols.meg_index_workspace(root)),
+    validateCompoundBash: (cmd) => ownedString(symbols.meg_validate_compound_bash(cmd)),
+    scrubSal: (text) => ownedString(symbols.meg_scrub_sal(text)),
+    verifyReceipt: (ws) => ownedString(symbols.meg_verify_receipt(ws)),
+    idleIndexWorkspace: (root, maxTokens = 1000) =>
+      ownedString(symbols.meg_idle_index_workspace(root, maxTokens)),
   };
   return lib;
 }

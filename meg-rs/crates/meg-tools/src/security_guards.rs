@@ -298,7 +298,7 @@ mod tests {
         assert!(scrubbed.contains("<SURROGATE_SECRET_1>"), "{scrubbed}");
         assert!(scrubbed.contains("<SURROGATE_SECRET_2>"), "{scrubbed}");
         assert!(!scrubbed.contains("sk-proj-"));
-        assert!(DISABLE_CODEBASE_UPLOAD);
+        const { assert!(DISABLE_CODEBASE_UPLOAD) };
     }
 
     #[test]

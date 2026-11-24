@@ -88,11 +88,11 @@ fn link_cache_entry(src: &Path, dst: &Path) -> bool {
             if status.is_ok_and(|o| o.status.success()) {
                 return true;
             }
-            return std::os::windows::fs::symlink_dir(src, dst).is_ok();
+            std::os::windows::fs::symlink_dir(src, dst).is_ok()
         } else {
-            return std::fs::hard_link(src, dst)
+            std::fs::hard_link(src, dst)
                 .or_else(|_| std::fs::copy(src, dst).map(|_| ()))
-                .is_ok();
+                .is_ok()
         }
     }
     #[cfg(unix)]

@@ -451,3 +451,232 @@ mod closure_guard_tests {
         assert!(!re.is_match("cargo test --workspace"));
     }
 }
+
+// ===========================================================================
+// P1-11: AEPN Petri-Net Supervisor, Undo-Price Gate & ATIF Pinned-Model Lock
+// ===========================================================================
+
+/// P-invariant Petri-net marking for deterministic task completion gating.
+/// Any code edit resets `p_tests_green` and `p_critic_approved` to `0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AepnSupervisor {
+    pub p_contract_locked: u8,
+    pub p_selftest_red: u8,
+    pub p_tests_green: u8,
+    pub p_critic_approved: u8,
+    pub p_human_approval_token: u8,
+    pub p_turn_budget: u32,
+}
+
+impl AepnSupervisor {
+    pub fn new(turn_budget: u32) -> Self {
+        Self {
+            p_contract_locked: 0,
+            p_selftest_red: 0,
+            p_tests_green: 0,
+            p_critic_approved: 0,
+            p_human_approval_token: 0,
+            p_turn_budget: turn_budget,
+        }
+    }
+
+    pub fn lock_contract(&mut self) {
+        self.p_contract_locked = 1;
+    }
+
+    pub fn record_selftest_red(&mut self) {
+        self.p_selftest_red = 1;
+    }
+
+    /// Transition: code edit invalidates prior test and critic approvals.
+    pub fn on_code_edit(&mut self) -> Result<(), String> {
+        if self.p_turn_budget == 0 {
+            return Err("AEPN: p_turn_budget exhausted".into());
+        }
+        self.p_turn_budget -= 1;
+        self.p_tests_green = 0;
+        self.p_critic_approved = 0;
+        Ok(())
+    }
+
+    pub fn record_tests_green(&mut self) -> Result<(), String> {
+        if self.p_contract_locked == 0 {
+            return Err("AEPN: cannot mark tests_green before p_contract_locked == 1".into());
+        }
+        self.p_tests_green = 1;
+        Ok(())
+    }
+
+    pub fn record_critic_approved(&mut self) -> Result<(), String> {
+        if self.p_tests_green == 0 {
+            return Err("AEPN: cannot mark critic_approved while p_tests_green == 0".into());
+        }
+        self.p_critic_approved = 1;
+        Ok(())
+    }
+
+    pub fn grant_human_approval(&mut self) {
+        self.p_human_approval_token = 1;
+    }
+
+    /// Fire the final completion transition only when all invariants hold.
+    pub fn can_complete(&self, require_human_token: bool) -> Result<(), Vec<String>> {
+        let mut missing = Vec::new();
+        if self.p_contract_locked == 0 {
+            missing.push("p_contract_locked == 0".into());
+        }
+        if self.p_selftest_red == 0 {
+            missing.push("p_selftest_red == 0".into());
+        }
+        if self.p_tests_green == 0 {
+            missing.push("p_tests_green == 0".into());
+        }
+        if self.p_critic_approved == 0 {
+            missing.push("p_critic_approved == 0".into());
+        }
+        if require_human_token && self.p_human_approval_token == 0 {
+            missing.push("p_human_approval_token == 0".into());
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(missing)
+        }
+    }
+}
+
+/// Undo-Price action taxonomy for external/stateful side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndoPrice {
+    OneClickUndo,
+    CleanupUndo,
+    NoUndo,
+}
+
+pub fn classify_undo_price(action: &str) -> UndoPrice {
+    let low = action.to_ascii_lowercase();
+    if [
+        "push --force",
+        "gh pr merge",
+        "publish",
+        "drop table",
+        "delete_prod",
+        "send_email",
+        "wire_transfer",
+        "deploy_prod",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+    {
+        return UndoPrice::NoUndo;
+    }
+    if [
+        "create_pr",
+        "create_branch",
+        "write_file",
+        "edit_file",
+        "mkdir",
+        "docker run",
+        "git commit",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+    {
+        return UndoPrice::CleanupUndo;
+    }
+    UndoPrice::OneClickUndo
+}
+
+/// Timeout Destination Pre-Check: before retrying an external write after a
+/// timeout, verify whether the destination already recorded the effect.
+pub fn should_retry_after_timeout(
+    price: UndoPrice,
+    destination_already_applied: bool,
+) -> Result<bool, String> {
+    if destination_already_applied {
+        return Ok(false);
+    }
+    if price == UndoPrice::NoUndo {
+        return Err(
+            "UNDO_PRICE_GATE: NO_UNDO action timed out; destination pre-check required with explicit human confirmation before retry".into(),
+        );
+    }
+    Ok(true)
+}
+
+/// ATIF single-model / single-effort lock active under `--pinned-model`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtifPinnedModelLock {
+    pub pinned_model: String,
+    pub pinned_effort: Option<String>,
+}
+
+impl AtifPinnedModelLock {
+    pub fn new(model: impl Into<String>, effort: Option<String>) -> Self {
+        Self {
+            pinned_model: model.into(),
+            pinned_effort: effort,
+        }
+    }
+
+    pub fn validate(&self, requested_model: &str, requested_effort: Option<&str>) -> Result<(), String> {
+        if requested_model != self.pinned_model {
+            return Err(format!(
+                "ATIF_PINNED_MODEL_LOCK: model switch '{requested_model}' denied (pinned to '{}')",
+                self.pinned_model
+            ));
+        }
+        if let Some(ref locked_effort) = self.pinned_effort {
+            if requested_effort != Some(locked_effort.as_str()) {
+                return Err(format!(
+                    "ATIF_PINNED_MODEL_LOCK: effort change '{requested_effort:?}' denied (pinned to '{locked_effort}')"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod p1_11_tests {
+    use super::*;
+
+    #[test]
+    fn aepn_petri_net_resets_tests_and_critic_on_edit() {
+        let mut net = AepnSupervisor::new(10);
+        assert!(net.record_tests_green().is_err());
+        net.lock_contract();
+        net.record_selftest_red();
+        net.record_tests_green().unwrap();
+        net.record_critic_approved().unwrap();
+        assert!(net.can_complete(false).is_ok());
+        assert!(net.can_complete(true).is_err());
+
+        // Any code edit resets tests_green & critic_approved to 0.
+        net.on_code_edit().unwrap();
+        assert_eq!(net.p_tests_green, 0);
+        assert_eq!(net.p_critic_approved, 0);
+        assert!(net.can_complete(false).is_err());
+
+        net.record_tests_green().unwrap();
+        net.record_critic_approved().unwrap();
+        net.grant_human_approval();
+        assert!(net.can_complete(true).is_ok());
+    }
+
+    #[test]
+    fn undo_price_timeout_precheck_and_atif_lock() {
+        assert_eq!(classify_undo_price("read_file"), UndoPrice::OneClickUndo);
+        assert_eq!(classify_undo_price("edit_file"), UndoPrice::CleanupUndo);
+        assert_eq!(classify_undo_price("gh pr merge 1"), UndoPrice::NoUndo);
+
+        assert!(!should_retry_after_timeout(UndoPrice::CleanupUndo, true).unwrap());
+        assert!(should_retry_after_timeout(UndoPrice::CleanupUndo, false).unwrap());
+        assert!(should_retry_after_timeout(UndoPrice::NoUndo, false).is_err());
+
+        let lock = AtifPinnedModelLock::new("claude-sonnet-4", Some("medium".into()));
+        assert!(lock.validate("claude-sonnet-4", Some("medium")).is_ok());
+        assert!(lock.validate("gpt-4o", Some("medium")).is_err());
+        assert!(lock.validate("claude-sonnet-4", Some("high")).is_err());
+    }
+}

@@ -422,3 +422,340 @@ mod closure_guard_tests {
         let _ = std::fs::remove_dir(&dir);
     }
 }
+
+// ===========================================================================
+// P1-10: Competitor Bug Guards, Sealed-File Wall, Privacy Pin & .hot.* Linter
+// ===========================================================================
+
+/// Pure-Rust SHA-256 digest (hex lowercase), zero external crate dependencies.
+pub fn sha256_hex(input: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut msg = input.to_vec();
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[4 * i],
+                chunk[4 * i + 1],
+                chunk[4 * i + 2],
+                chunk[4 * i + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, delta) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *slot = slot.wrapping_add(delta);
+        }
+    }
+    let mut out = String::with_capacity(64);
+    for word in h {
+        out.push_str(&format!("{word:08x}"));
+    }
+    out
+}
+
+/// Protected path prefixes restored by the post-run wall (`git checkout <base> -- PROTECTED`).
+pub const PROTECTED_PATHS: &[&str] = &["tests/", "migrations/", "scripts/check."];
+
+/// Ring-0 read-only lock flipped outside the LLM on Esc or stop phrases.
+#[derive(Default)]
+pub struct ReadOnlyLock {
+    locked: std::sync::atomic::AtomicBool,
+}
+
+impl ReadOnlyLock {
+    pub const fn new() -> Self {
+        Self {
+            locked: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    pub fn engage(&self) {
+        self.locked.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn release(&self) {
+        self.locked.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn is_locked(&self) -> bool {
+        self.locked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Inspect user input outside the LLM for stop phrases and flip lock immediately.
+    pub fn check_stop_phrase(&self, text: &str) -> bool {
+        let low = text.trim().to_ascii_lowercase();
+        let triggered = matches!(
+            low.as_str(),
+            "stop" | "halt" | "abort" | "freeze" | "read-only" | "read only" | "stop editing"
+        ) || low.starts_with("stop ")
+            || low.starts_with("do not edit");
+        if triggered {
+            self.engage();
+        }
+        triggered
+    }
+    pub fn guard_mutation(&self, tool: &str) -> Result<(), String> {
+        if self.is_locked() && matches!(tool, "write_file" | "edit_file" | "bash") {
+            return Err(format!(
+                "RING0_READ_ONLY_LOCK: tool '{tool}' blocked until operator unlocks"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// AHE Publish-State Shell Guard: hard-blocks `rm`, `git reset`, `git clean`
+/// targeting non-`/tmp` verified deliverables.
+pub fn check_publish_state_shell(command: &str, deliverables: &[std::path::PathBuf]) -> Result<(), String> {
+    let low = command.to_ascii_lowercase();
+    if low.contains("git reset --hard") || low.contains("git clean -f") || low.contains("git clean -fd") {
+        return Err("PUBLISH_STATE_GUARD: destructive git reset/clean blocked after verification".into());
+    }
+    let is_rm = low.contains("rm ") || low.contains("remove-item ") || low.contains("del ");
+    if is_rm {
+        for d in deliverables {
+            let s = d.to_string_lossy().replace('\\', "/");
+            if s.starts_with("/tmp/") || s.starts_with("tmp/") {
+                continue;
+            }
+            let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if (!name.is_empty() && command.contains(name)) || command.contains(&s) {
+                return Err(format!(
+                    "PUBLISH_STATE_GUARD: refusing destructive shell command targeting verified deliverable '{s}'"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `gh` target-repo privacy pin & irreversible remote/publish command blocker.
+pub fn check_gh_privacy_and_publish(command: &str, allowed_repo: Option<&str>) -> Result<(), String> {
+    let low = command.to_ascii_lowercase();
+    for banned in [
+        "gh pr merge",
+        "git push --force",
+        "git push -f",
+        "git tag",
+        "npm publish",
+        "cargo publish",
+    ] {
+        if low.contains(banned) {
+            return Err(format!(
+                "PRIVACY_PUBLISH_GUARD: autonomous '{banned}' is blocked; requires human operator"
+            ));
+        }
+    }
+    // Pin `gh ... --repo <owner/name>` or `-R <owner/name>` to allowed_repo.
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.first().copied() == Some("gh") {
+        for (i, tok) in tokens.iter().enumerate() {
+            let repo_arg = if *tok == "--repo" || *tok == "-R" {
+                tokens.get(i + 1).copied()
+            } else if let Some(rest) = tok.strip_prefix("--repo=") {
+                Some(rest)
+            } else {
+                None
+            };
+            if let Some(target) = repo_arg {
+                let target_clean = target.trim_matches(|c| c == '"' || c == '\'');
+                match allowed_repo {
+                    Some(allowed) if allowed.eq_ignore_ascii_case(target_clean) => {}
+                    Some(allowed) => {
+                        return Err(format!(
+                            "GH_PRIVACY_PIN: external --repo '{target_clean}' blocked (pinned to '{allowed}')"
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "GH_PRIVACY_PIN: explicit --repo '{target_clean}' blocked when no target repo is pinned"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// SHA-256 sealed-file hash manifest (`scalar-loop`) protecting immutable files.
+#[derive(Debug, Clone, Default)]
+pub struct SealedManifest {
+    hashes: std::collections::BTreeMap<String, String>,
+}
+
+impl SealedManifest {
+    pub fn seal(workspace: &std::path::Path, rel_paths: &[&str]) -> anyhow::Result<Self> {
+        let mut hashes = std::collections::BTreeMap::new();
+        for &rel in rel_paths {
+            let full = workspace.join(rel);
+            let bytes = std::fs::read(&full)?;
+            hashes.insert(rel.replace('\\', "/"), sha256_hex(&bytes));
+        }
+        Ok(Self { hashes })
+    }
+
+    pub fn verify(&self, workspace: &std::path::Path) -> Result<(), Vec<String>> {
+        let mut violations = Vec::new();
+        for (rel, expected) in &self.hashes {
+            let full = workspace.join(rel);
+            match std::fs::read(&full) {
+                Ok(bytes) => {
+                    let actual = sha256_hex(&bytes);
+                    if &actual != expected {
+                        violations.push(format!("sealed file modified: {rel}"));
+                    }
+                }
+                Err(_) => violations.push(format!("sealed file missing/deleted: {rel}")),
+            }
+        }
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+}
+
+/// Build the post-run restore argv (`git checkout <base> -- <protected_paths>`).
+pub fn protected_restore_argv(base_ref: &str, paths: &[String]) -> Vec<String> {
+    let mut argv = vec!["git".into(), "checkout".into(), base_ref.into(), "--".into()];
+    argv.extend(paths.iter().cloned());
+    argv
+}
+
+/// Lauren Tan `.hot.*` 60-FPS frame linter: flags heap allocations and unseeded
+/// RNG inside `.hot.*` hot-loop files.
+pub fn lint_hot_frame_file(path: &std::path::Path, content: &str) -> Vec<String> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if !name.contains(".hot.") {
+        return Vec::new();
+    }
+    const FORBIDDEN: &[(&str, &str)] = &[
+        ("Math.random(", "unseeded RNG (Math.random) in .hot.* frame path"),
+        ("rand::random", "unseeded RNG (rand::random) in .hot.* frame path"),
+        ("thread_rng(", "unseeded RNG (thread_rng) in .hot.* frame path"),
+        ("new Array(", "per-frame heap allocation (new Array) in .hot.*"),
+        ("new Map(", "per-frame heap allocation (new Map) in .hot.*"),
+        ("new Set(", "per-frame heap allocation (new Set) in .hot.*"),
+        ("Vec::new(", "per-frame heap allocation (Vec::new) in .hot.*"),
+        ("HashMap::new(", "per-frame heap allocation (HashMap::new) in .hot.*"),
+        ("JSON.parse(", "per-frame allocation (JSON.parse) in .hot.*"),
+    ];
+    let mut hits = Vec::new();
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        for (pat, reason) in FORBIDDEN {
+            if trimmed.contains(pat) {
+                hits.push(format!("{name}:{}: {reason}", idx + 1));
+            }
+        }
+    }
+    hits
+}
+
+#[cfg(test)]
+mod p1_10_tests {
+    use super::*;
+
+    #[test]
+    fn sha256_matches_nist_vector_and_sealed_manifest_detects_tampering() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let ws = std::env::temp_dir().join(format!("meg-seal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("tests")).unwrap();
+        std::fs::write(ws.join("tests/spec.rs"), "assert!(true);\n").unwrap();
+
+        let manifest = SealedManifest::seal(&ws, &["tests/spec.rs"]).unwrap();
+        assert!(manifest.verify(&ws).is_ok());
+
+        std::fs::write(ws.join("tests/spec.rs"), "// weakened\n").unwrap();
+        let err = manifest.verify(&ws).unwrap_err();
+        assert!(err[0].contains("sealed file modified"), "{err:?}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn privacy_pin_publish_guard_readonly_lock_and_hot_linter() {
+        assert!(check_gh_privacy_and_publish("gh issue list --repo god88844-hub/MEG", Some("god88844-hub/MEG")).is_ok());
+        assert!(check_gh_privacy_and_publish("gh issue create --repo other/public", Some("god88844-hub/MEG")).is_err());
+        assert!(check_gh_privacy_and_publish("gh pr merge 5", Some("god88844-hub/MEG")).is_err());
+        assert!(check_gh_privacy_and_publish("git push --force", None).is_err());
+
+        let deliv = vec![std::path::PathBuf::from("dist/app.bin")];
+        assert!(check_publish_state_shell("rm -f dist/app.bin", &deliv).is_err());
+        assert!(check_publish_state_shell("git reset --hard", &deliv).is_err());
+        assert!(check_publish_state_shell("rm -f /tmp/scratch.txt", &deliv).is_ok());
+
+        let lock = ReadOnlyLock::new();
+        assert!(lock.guard_mutation("edit_file").is_ok());
+        assert!(lock.check_stop_phrase("stop editing"));
+        assert!(lock.guard_mutation("edit_file").is_err());
+        assert!(lock.guard_mutation("read_file").is_ok());
+
+        let hot_hits = lint_hot_frame_file(
+            std::path::Path::new("physics.hot.ts"),
+            "const r = Math.random();\nconst a = new Array(16);\n",
+        );
+        assert_eq!(hot_hits.len(), 2, "{hot_hits:?}");
+        assert!(lint_hot_frame_file(std::path::Path::new("setup.ts"), "const r = Math.random();").is_empty());
+    }
+}

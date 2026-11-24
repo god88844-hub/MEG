@@ -193,7 +193,7 @@ pub fn apply_hashline_patch(workspace: &Path, args: &Value) -> Result<String> {
     }
 
     // Reject overlapping ranges and apply bottom-up so line indices stay stable.
-    parsed_ops.sort_by(|a, b| a.0.cmp(&b.0));
+    parsed_ops.sort_by_key(|a| a.0);
     for w in parsed_ops.windows(2) {
         ensure!(
             w[0].1 < w[1].0,
