@@ -2,8 +2,8 @@
 
 - **Plan Version:** v1.2 (Micro-Tasked for Single-Builder Agent)
 - **Active Phase:** Phase 5 -- Multi-Agent Graphs, Goal/Motion Engineering & GitHub/CI (`meg-plane/`)
-- **Last Completed TODO:** `P4-05` (Phase 4 Complete)
-- **Next TODO:** `P5-01` (Algebraic Orchestration `Maestro Order` & Code-Routed DAG in `meg-plane/src/graphs.ts`)
+- **Last Completed TODO:** `P5-03`
+- **Next TODO:** `P5-04` (Goal & Motion Engineering in `meg-plane/src/goals_motions.ts`)
 - **Frozen Path:** `meg-rs/crates/meg-tui/` (frozen until Phase 8)
 
 ## Completed Phases
@@ -13,9 +13,7 @@
 - [x] **Phase 3** -- Memory, 8-Layer Skills & `CLI > MCP` Gateway (`P3-01` through `P3-06`)
 - [x] **Phase 4** -- Zero-Trust Verification Gauntlet & Loop Engineering (`P4-01` through `P4-05`)
 
-## Completed Phase 4 TODOs
-- [x] `P4-01` -- `Loop 2` verifier loop (`check_cannot_fail`, `phi(e)`, `.loop/state.json`, 3-pattern loop detector, `EFC`, `MAX_SAME=2`, Karpathy Clean-Slate Replay, 4-layer router & `DeclineCraft`)
-- [x] `P4-02` -- Patched `RISEHARNESS` 4-stage handshake (Unified `+SE/+OO` fail-open, `spec_check_failure_ledger`, `+DI`, `+IR`, `MAX_WITHHOLDS=1`)
-- [x] `P4-03` -- `L0`-`L5` gate (`>=L4`), Maker-Blinded `CHECKS.md`, `>30%` ground-truth delta, cross-tenant scan, `MiRL` 8-misbehavior gate & `CAAF` monotonic locks
-- [x] `P4-04` -- Disabled `L2`, `L1` reminders (`<=4/run`), Cold Cross-Model `L3` Critic (`Width=1..4`, conclusion-blind, `/tmp` probes, `PROXY`/`SHARED MISTAKE` bans, non-mutation)
-- [x] `P4-05` -- `Poteto Pyramid` anti-stub/false-zero scanner, `[REMEDIATION FIX]` linter, fast mutation gate, BFS statechart verifier & `>300`-line comprehension quiz
+## Completed Phase 5 TODOs
+- [x] `P5-01` -- `Maestro Order` algebraic orchestration (Early-Start independence, 4 combinators, Blackboard, streaming `pipeline()`, code-routed DAG, LIFO Saga & partitioned budgets)
+- [x] `P5-02` -- Bash-less `GlobalRouter`, 4-Shape Swarm, `TeamCreate` 1-File-1-Owner locks, Unit-Only Return Edge, Long Learning Edge, `Planfence` & Loop-Until-Dry `seen`
+- [x] `P5-03` -- 7-Rule File Swarm (`BOARD.md`, pairwise disjoint `tasks/T[n].md`, `END` sentinel outputs, `CONFLICTS.md`, `[T#]` provenance `FINAL.md`, `<=30`-line `LESSONS.md`)

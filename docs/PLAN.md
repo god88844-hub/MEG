@@ -177,17 +177,17 @@
 ## PHASE 5 -- Multi-Agent Graphs, Goal/Motion Engineering & GitHub/CI (`meg-plane/`)
 **Language:** TypeScript on Bun (`meg-plane/src/`)
 
-- [ ] **P5-01 Algebraic Orchestration (`Maestro Order`) & Code-Routed DAG (`src/graphs.ts`):**
+- [x] **P5-01 Algebraic Orchestration (`Maestro Order`) & Code-Routed DAG (`src/graphs.ts`):**
   - Single-agent default; Early-Start independence test required before fan-out.
   - 4 combinators (`Sequential`, `Parallel`, `Verify`, `Recurse`) + `Blackboard` (`logodds, calls, coverage, ABSTAIN`).
   - Default to streaming `pipeline()` over blocking `parallel()` barriers; plain code (`if/switch`) routes typed node contracts; LIFO Saga rollback stack + partitioned parent budgets.
   - *Micro-Check:* `bun test test/graphs.test.ts`
-- [ ] **P5-02 DeepSeek Router-Worker, 4-Shape Swarm & Return Edges (`src/agents.ts`):**
+- [x] **P5-02 DeepSeek Router-Worker, 4-Shape Swarm & Return Edges (`src/agents.ts`):**
   - Persistent Bash-less Global Router (Trigger prefill batching + Thread Subscription direct pass + Full-Duplex `start()`/`stop()`).
   - 4-Shape classifier (`FAN-OUT <=10 items/worker`, `CHAIN`, `DEBATE` [independent proposals before interaction], `SUPERVISOR`) + 7-field handoff JSON + `TeamCreate` 1-File-1-Owner locks (`<=5` teammates, early shutdown).
   - **Unit-Only Return Edge** (freezes passed slices read-only; returns ONLY failed unit with file fence) + **Long Learning Edge** to Splitter + **`Planfence`** input-hash rebuilds + **Loop-Until-Dry `seen`** deduplication (`confirmed U rejected`).
   - *Micro-Check:* `bun test test/agents.test.ts`
-- [ ] **P5-03 7-Rule File Swarm (`src/file_swarm.ts`):**
+- [x] **P5-03 7-Rule File Swarm (`src/file_swarm.ts`):**
   - Enforce `BOARD.md`, pairwise scope-tightened `tasks/T[n].md`, `outputs/T[n].md` requiring final-line `END` sentinel, `checks/CONFLICTS.md`, `[T#]` paragraph provenance in `FINAL.md`, and `<=30`-line `LESSONS.md`.
   - *Micro-Check:* `bun test test/file_swarm.test.ts`
 - [ ] **P5-04 Goal & Motion Engineering (`src/goals_motions.ts`):**
