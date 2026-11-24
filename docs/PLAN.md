@@ -83,18 +83,18 @@
   - Probe OS/shell, git state, compilers, RAM, and DB/API schema pre-checks before Turn 1.
   - `Kimi K3` Turn-0 Ambiguity Gate: pause for `<=2` concise MCQ questions when high-impact ambiguities exist; write minor reversible assumptions to non-blocking `assumptions.md`.
   - *Micro-Check:* `bun test test/bootstrap.test.ts`
-- [ ] **P2-04 Universal Model Adapter & Governance Locks (`src/router.ts`, `meg-core/src/providers.rs`):**
+- [x] **P2-04 Universal Model Adapter & Governance Locks (`src/router.ts`, `meg-core/src/providers.rs`):**
   - Normalize OpenAI/Codex, Anthropic, Google, OpenRouter, and local Ollama/vLLM/OpenAI-compatible endpoints behind one `ModelClient` with capability probing (`tools`, `vision`, `context`, `reasoning_levels`, `ZDR noLog`).
   - Enforce `disabledProviders` *after* `--model` pin resolution (fixes `oh-my-pi #13079`) + `--pinned-model` single-model lock.
   - Provider-aware Thinking Preservation (keep thinking tokens within same model family thread; strip on cross-family handoff) + `verified` reasoning directive for local/mid models.
   - *Micro-Check:* `bun test test/router.test.ts`
-- [ ] **P2-05 5-Profile Budget Classifier, 3-Gear Thickness & Fusion (`src/fusion.ts`):**
+- [x] **P2-05 5-Profile Budget Classifier, 3-Gear Thickness & Fusion (`src/fusion.ts`):**
   - Implement `HARNESSPRO` 5-profile classifier (`compact | lean [upgrade to standard if conf<0.9] | standard | deep | research`) with exact Lite/Medium/Heavy tool budgets (`econ / strict / final / rem`).
   - 3-Gear Adaptive Thickness: Gear 1 (4B-14B local: pre-action ledger + structured tools + `SELT`), Gear 2 (20B-35B open: `verified` + handshakes), Gear 3 (Frontier: thin bash-first freedom + `Reuse Base`).
   - Dual-Cache Model Fusion (Head thread + Sidekick thread with 240s keep-alive heartbeat) + `AgentBaton` 3-criterion readiness handoff (logfile transfer for hidden-CoT models like GPT-Sol; in-context transfer for Opus/Kimi/Gemini).
   - EPAM Circuit Breaker: halt/compact if single turn burns `>8,000` reasoning tokens with 0 tool calls or `>100:1` input:output ratio without test progress.
   - *Micro-Check:* `bun test test/fusion.test.ts`
-- [ ] **P2-06 5-Move `CONTEXT.md` Compiler & Short-Context `SSSM` (`src/context.ts`):**
+- [x] **P2-06 5-Move `CONTEXT.md` Compiler & Short-Context `SSSM` (`src/context.ts`):**
   - `Cut` (`<=15` top rules, `<=6` tools, `<=2` examples, `AGENTS.md <= 60-100` lines, `MEMORY.md <= 2200` chars, `USER.md <= 1375` chars).
   - `Order` (byte-sorted static prefix stripping `<!-- -->` comments for `>90%` KV cache; `todo.md` + `PIN` recency override + `GOAL` at very bottom + every-4-turn Tail Goal Anchor).
   - `Fetch` (newest-first `mtime` sort, `<=3` hits); `Compress` (`EoCC`/`SAC` 5-part handoff briefs keeping current-attempt errors visible, stripping raw tracebacks across fresh attempts, `<40%` active context cap); `Split` (`>20`-page / `40K`-char reads -> 5-line reader subagent).

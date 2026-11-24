@@ -698,3 +698,83 @@ mod tests {
         assert!(!removed.profiles.iter().any(|v| v.id == p.id));
     }
 }
+
+// ===========================================================================
+// P2-04: Governance Locks (disabledProviders post-pin check & --pinned-model)
+// ===========================================================================
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderGovernance {
+    pub disabled_providers: Vec<String>,
+    pub pinned_model: Option<String>,
+    pub zdr_no_log: bool,
+}
+
+/// Resolve an effective `(provider_id, model_id)` while enforcing:
+/// 1. `--pinned-model` single-model lock (blocks silent switches), and
+/// 2. `disabled_providers` evaluated AFTER `--model` pin resolution (fixes oh-my-pi #13079).
+pub fn resolve_provider_with_governance(
+    requested_provider: &str,
+    requested_model: &str,
+    gov: &ProviderGovernance,
+) -> Result<(String, String)> {
+    let effective_model = match &gov.pinned_model {
+        Some(pin) if !pin.trim().is_empty() => {
+            if !requested_model.is_empty() && requested_model != pin {
+                anyhow::bail!(
+                    "GOVERNANCE_LOCK: model '{}' rejected because --pinned-model is locked to '{}'",
+                    requested_model,
+                    pin
+                );
+            }
+            pin.clone()
+        }
+        _ => requested_model.to_string(),
+    };
+    let effective_provider = if let Some((prefix, _)) = effective_model.split_once('/') {
+        if requested_provider.is_empty() {
+            prefix.to_string()
+        } else {
+            requested_provider.to_string()
+        }
+    } else {
+        requested_provider.to_string()
+    };
+    if gov
+        .disabled_providers
+        .iter()
+        .any(|d| d.eq_ignore_ascii_case(&effective_provider))
+    {
+        anyhow::bail!(
+            "GOVERNANCE_LOCK: provider '{}' is disabled (checked after --model pin resolution)",
+            effective_provider
+        );
+    }
+    Ok((effective_provider, effective_model))
+}
+
+#[cfg(test)]
+mod p2_04_governance_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_providers_enforced_after_pin_resolution_and_pinned_model_locks() {
+        let gov = ProviderGovernance {
+            disabled_providers: vec!["openai".into()],
+            pinned_model: Some("openai/gpt-4o".into()),
+            zdr_no_log: true,
+        };
+        // Even with --pinned-model, disabled provider is caught AFTER pin resolution.
+        let err = resolve_provider_with_governance("", "openai/gpt-4o", &gov).unwrap_err();
+        assert!(err.to_string().contains("disabled"), "{err}");
+
+        // Switching away from pinned model is rejected.
+        let gov2 = ProviderGovernance {
+            disabled_providers: vec![],
+            pinned_model: Some("anthropic/claude-sonnet".into()),
+            zdr_no_log: false,
+        };
+        assert!(resolve_provider_with_governance("anthropic", "anthropic/claude-sonnet", &gov2).is_ok());
+        assert!(resolve_provider_with_governance("anthropic", "deepseek/r1", &gov2).is_err());
+    }
+}

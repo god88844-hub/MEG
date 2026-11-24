@@ -190,3 +190,175 @@ function inferRolesFor(model: string): string[] {
   if (m.includes("reason") || m.includes("r1")) return ["reasoning"];
   return ["general", "coding"];
 }
+// ===========================================================================
+// P2-04: Universal Model Adapter, Governance Locks & Thinking Preservation
+// ===========================================================================
+
+export type ModelFamily = "openai" | "anthropic" | "google" | "openrouter" | "local" | "other";
+
+export interface ModelCapabilities {
+  tools: boolean;
+  vision: boolean;
+  contextWindow: number;
+  reasoningLevels: ("none" | "low" | "medium" | "high")[];
+  zdrNoLog: boolean;
+}
+
+export interface GovernancePolicy {
+  disabledProviders?: string[];
+  pinnedModel?: string;
+  requireZdr?: boolean;
+}
+
+export interface NormalizedMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string;
+  thinking?: string;
+  sourceFamily?: ModelFamily;
+}
+
+export interface NormalizedModelClient {
+  provider: string;
+  family: ModelFamily;
+  model: string;
+  baseUrl: string;
+  capabilities: ModelCapabilities;
+  headers: Record<string, string>;
+  reasoningDirective?: string;
+}
+
+export function detectModelFamily(provider: string, model: string): ModelFamily {
+  const p = provider.toLowerCase();
+  const m = model.toLowerCase();
+  if (p === "anthropic" || m.includes("claude")) return "anthropic";
+  if (p === "openai" || p === "codex" || m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3")) return "openai";
+  if (p === "google" || p === "gemini" || m.includes("gemini")) return "google";
+  if (p === "openrouter") return "openrouter";
+  if (p === "ollama" || p === "vllm" || p === "local" || m.includes(":7b") || m.includes(":14b") || m.includes(":32b")) return "local";
+  return "other";
+}
+
+export function probeModelCapabilities(
+  provider: string,
+  model: string,
+  zdrNoLog = false,
+): ModelCapabilities {
+  const family = detectModelFamily(provider, model);
+  const m = model.toLowerCase();
+  const vision =
+    m.includes("vision") ||
+    m.includes("vl") ||
+    m.includes("moondream") ||
+    m.includes("llava") ||
+    m.includes("gpt-4o") ||
+    m.includes("claude-3") ||
+    m.includes("claude-sonnet") ||
+    m.includes("claude-opus") ||
+    m.includes("gemini");
+  const contextWindow =
+    family === "google"
+      ? 1_000_000
+      : family === "anthropic"
+        ? 200_000
+        : family === "openai"
+          ? 128_000
+          : family === "local"
+            ? 32_768
+            : 128_000;
+  const reasoningLevels: ModelCapabilities["reasoningLevels"] =
+    family === "anthropic" || family === "openai" || family === "google" || m.includes("r1") || m.includes("qwen")
+      ? ["low", "medium", "high"]
+      : ["none"];
+  return {
+    tools: true,
+    vision,
+    contextWindow,
+    reasoningLevels,
+    zdrNoLog: zdrNoLog || family === "local",
+  };
+}
+
+/**
+ * Normalize OpenAI/Codex, Anthropic, Google, OpenRouter, and local Ollama/vLLM
+ * profiles behind one `NormalizedModelClient` while enforcing:
+ * - `--pinned-model` single-model lock
+ * - `disabledProviders` checked AFTER `--model` pin resolution (oh-my-pi #13079)
+ * - ZDR (`noLog`) header propagation when enabled
+ * - `verified` reasoning directive for local/mid-tier models
+ */
+export function createNormalizedModelClient(
+  profile: StoredProviderProfile,
+  requestedModel: string | undefined,
+  policy: GovernancePolicy = {},
+): NormalizedModelClient {
+  const candidateModel = (requestedModel ?? profile.default_model ?? "").trim();
+  const effectiveModel = policy.pinnedModel?.trim() || candidateModel;
+  if (policy.pinnedModel && candidateModel && candidateModel !== policy.pinnedModel) {
+    throw new Error(
+      `Pinned model lock active: cannot switch from '${policy.pinnedModel}' to '${candidateModel}'`,
+    );
+  }
+  if (!effectiveModel) {
+    throw new Error(`Provider '${profile.id}' has no resolved model`);
+  }
+
+  // Enforce disabledProviders AFTER pin resolution (oh-my-pi #13079).
+  const inferredProvider = effectiveModel.includes("/")
+    ? effectiveModel.split("/")[0]!.toLowerCase()
+    : profile.id.toLowerCase();
+  const disabled = new Set((policy.disabledProviders ?? []).map((d) => d.toLowerCase()));
+  if (disabled.has(profile.id.toLowerCase()) || disabled.has(inferredProvider)) {
+    throw new Error(
+      `Provider '${profile.id}' (resolved '${inferredProvider}') is disabled by governance policy`,
+    );
+  }
+
+  const family = detectModelFamily(profile.id, effectiveModel);
+  const capabilities = probeModelCapabilities(profile.id, effectiveModel, Boolean(policy.requireZdr));
+  if (policy.requireZdr && !capabilities.zdrNoLog) {
+    throw new Error(`Provider '${profile.id}' does not satisfy ZDR noLog policy`);
+  }
+
+  const headers: Record<string, string> = {};
+  if (capabilities.zdrNoLog && family === "openrouter") {
+    headers["X-OpenRouter-ZDR"] = "true";
+  }
+  if (family === "anthropic") {
+    headers["anthropic-version"] = "2023-06-01";
+  }
+
+  const isLocalOrMid =
+    family === "local" ||
+    /\b(7b|8b|14b|20b|24b|27b|30b|32b|35b|mini|flash|haiku)\b/i.test(effectiveModel);
+
+  return {
+    provider: profile.id,
+    family,
+    model: effectiveModel,
+    baseUrl: profile.base_url.replace(/\/+$/, ""),
+    capabilities,
+    headers,
+    reasoningDirective: isLocalOrMid
+      ? "verified: state assumptions, verify with tool output before claiming success"
+      : undefined,
+  };
+}
+
+/**
+ * Provider-aware Thinking Preservation:
+ * - Preserves thinking tokens inside the same model family thread.
+ * - Strips thinking tokens on cross-family handoff to avoid format/signature errors.
+ */
+export function prepareMessagesForFamily(
+  messages: readonly NormalizedMessage[],
+  targetFamily: ModelFamily,
+): NormalizedMessage[] {
+  return messages.map((msg) => {
+    if (!msg.thinking) return { ...msg };
+    if (msg.sourceFamily === targetFamily) {
+      return { ...msg };
+    }
+    const { thinking: _dropped, ...rest } = msg;
+    return rest;
+  });
+}
