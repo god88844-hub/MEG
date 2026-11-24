@@ -131,3 +131,30 @@ def test_oo_harness_clusters_dpp_10_coreset_and_pareto_frontier():
         ]
     )
     assert [c.candidate_id for c in frontier] == ["med-1", "lite-1"]
+
+def test_exact_dpp_logdet_soft_hurt_and_skill_adam():
+    import math
+    from evolve import SkillAdamOptimizer, compute_soft_hurt_objective, log_determinant, select_dpp_gram_coreset
+
+    # Exact log det of 2x2 diagonal matrix [[2, 0], [0, 3]] == ln(6)
+    assert math.isclose(log_determinant([[2.0, 0.0], [0.0, 3.0]], jitter=0.0), math.log(6.0), rel_tol=1e-6)
+
+    # DPP Gram selector picks orthogonal basis vectors over duplicates
+    ids = ["orth_x", "dup_x", "orth_y", "orth_z"]
+    feats = [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    quals = [1.0, 1.0, 1.0, 1.0]
+    chosen, score = select_dpp_gram_coreset(ids, feats, quals, k=3, pinned_indices=[0])
+    assert set(chosen) == {"orth_x", "orth_y", "orth_z"}
+    assert score > -1e-5
+
+    # Exact GUARD Soft-HURT penalty
+    ok = compute_soft_hurt_objective(gain_pp=4.0, forgetting_pp=0.0)
+    assert ok["admitted"] is True and ok["soft_hurt_score"] == 4.0
+    bad = compute_soft_hurt_objective(gain_pp=4.0, forgetting_pp=1.0, lambda_hurt=10.0)
+    assert bad["admitted"] is False and bad["soft_hurt_score"] == -6.0
+
+    # Exact SkillAdam bias-corrected update (at t=1, m_hat=g, v_hat=g^2 => delta ~= lr * sign(g))
+    opt = SkillAdamOptimizer(lr=0.1)
+    w1 = opt.step({"skill_a": 1.0, "skill_b": 1.0}, {"skill_a": 2.0, "skill_b": -2.0})
+    assert math.isclose(w1["skill_a"], 1.1, abs_tol=1e-4)
+    assert math.isclose(w1["skill_b"], 0.9, abs_tol=1e-4)

@@ -1,3 +1,4 @@
+import { scanSkillSupplyChain } from "./security-router";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -61,7 +62,7 @@ export class WorkspaceExtensions{
     return {catalog:await this.catalog(),message:`MCP ${action}: ${names.join(", ")}`};
   }
   async tool(alias:string,args:Record<string,unknown>,readOnly:boolean,signal?:AbortSignal){const tool=this.host.allTools().find(t=>t.alias===alias);if(!tool)throw new Error("MCP tool is not connected; use /mcp start <server>");if(readOnly&&!tool.readOnly)throw new Error("MCP tool is disabled in Plan mode: no read-only annotation");const result:any=await this.host.callTool(tool.server,tool.name,args,signal);if(result?.isError)throw new Error((result.content??[]).filter((p:any)=>p.type==="text").map((p:any)=>p.text).join("\n")||"MCP tool failed");return result;}
-  async readSkill(name:string){const skill=(await this.catalog()).skills.find(s=>s.name===name);if(!skill)throw new Error("Unknown skill");return skill;}
+  async readSkill(name:string){const skill=(await this.catalog()).skills.find(s=>s.name===name);if(!skill)throw new Error("Unknown skill");const scan=scanSkillSupplyChain(skill.body??"",skill.path??skill.name);if(!scan.safe)throw new Error(`DDIPE_BLOCKED: skill '${skill.name}' failed supply-chain scan (${scan.findings.map(f=>f.rule).join(", ")})`);return skill;}
 }
 
 // ===========================================================================

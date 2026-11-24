@@ -9,7 +9,7 @@ import { AgentManager } from "./agents";
 import { dispatchSlashCommand, dropBacklogTicket, routeMagnitude, type PstackMode } from "./commands";
 import { evaluateAmbiguityGate, runTurn0Bootstrap } from "./bootstrap";
 import { buildCompressedHandoff, compactProcessedMedia, compileContext } from "./context";
-import { checkEpamCircuitBreaker, classifyBudgetProfile, evaluateAgentBaton, selectHarnessGear } from "./fusion";
+import { checkEpamCircuitBreaker, classifyBudgetProfile, evaluateAgentBaton, loadDefaultPairSettings, saveDefaultPairSettings, selectHarnessGear } from "./fusion";
 import { BiTemporalMemoryStore, lexicalSearchWorkspace, stairTocLeafRetrieve } from "./memory";
 import { OmnigraphStore } from "./omnigraph";
 import { scanSkillSupplyChain } from "./security-router";
@@ -203,6 +203,8 @@ const handlers: Record<string, Handler> = {
     selectHarnessGear(p.paramBillions),
   "fusion.checkEpam": (p: any) => checkEpamCircuitBreaker(p),
   "fusion.baton": (p: any) => evaluateAgentBaton(p),
+  "fusion.pairSettings.save": (p: { workspace: string; settings: any }) => ({ file: saveDefaultPairSettings(p.workspace, p.settings) }),
+  "fusion.pairSettings.load": (p: { workspace: string }) => loadDefaultPairSettings(p.workspace),
   "memory.record": (p: { workspace: string; key: string; value: string; epistemic: any; sourceFile?: string }) =>
     getMemoryStore(p.workspace).recordFact(p),
   "memory.query": (p: { workspace: string; key: string; validAt?: number }) =>

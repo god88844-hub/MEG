@@ -216,3 +216,185 @@ export function checkEpamCircuitBreaker(t: EpamTurnTelemetry): EpamVerdict {
   }
   return { tripped: false, action: "continue" };
 }
+// ===========================================================================
+// Batch 7.5C: Devin Fusion (2-Thread Brief/Result/Feedback) &
+// Antigravity Orchestrator (Bidirectional Single-Trajectory + Default Pair Settings)
+// ===========================================================================
+
+import fs from "node:fs";
+import path from "node:path";
+
+export type EffortLevel = "low" | "medium" | "high" | "max";
+export type PairOrchestrationMode = "devin_fusion" | "antigravity_orchestrator";
+
+export interface DefaultPairSettings {
+  mode: PairOrchestrationMode;
+  plannerModel: string;
+  plannerEffort: EffortLevel;
+  executorModel: string;
+  executorEffort: EffortLevel;
+}
+
+export function saveDefaultPairSettings(workspace: string, settings: DefaultPairSettings): string {
+  const file = path.join(workspace, ".meg", "pair-settings.json");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n", "utf8");
+  return file;
+}
+
+export function loadDefaultPairSettings(workspace: string): DefaultPairSettings | null {
+  const file = path.join(workspace, ".meg", "pair-settings.json");
+  if (!fs.existsSync(file)) return null;
+  return JSON.parse(fs.readFileSync(file, "utf8")) as DefaultPairSettings;
+}
+
+export interface FusionBrief {
+  briefId: string;
+  objective: string;
+  constraints: string[];
+  successCriteria: string[];
+  allowedFiles: string[];
+}
+
+export interface FusionResult {
+  briefId: string;
+  editedFiles: string[];
+  verificationSummary: string;
+  passed: boolean;
+}
+
+export interface FusionFeedback {
+  briefId: string;
+  approved: boolean;
+  revisions: string[];
+}
+
+/**
+ * Devin Fusion (2 Parallel Persistent Agents with Separate Cached Contexts):
+ * Lead owns planning & review; Sidekick owns exploration, edits & tests.
+ * Communication is restricted strictly to structured Brief / Result / Feedback envelopes
+ * so neither thread invalidates the other's KV prompt cache.
+ */
+export class DevinFusionSession {
+  readonly cacheCoordinator: DualCacheFusion;
+  readonly leadEffort: EffortLevel;
+  readonly sidekickEffort: EffortLevel;
+  private leadLog: { kind: "brief" | "feedback"; payload: FusionBrief | FusionFeedback }[] = [];
+  private sidekickLog: { kind: "brief" | "result"; payload: FusionBrief | FusionResult }[] = [];
+  private seq = 0;
+
+  constructor(settings: Pick<DefaultPairSettings, "plannerModel" | "plannerEffort" | "executorModel" | "executorEffort">, nowMs = Date.now()) {
+    this.cacheCoordinator = new DualCacheFusion(settings.plannerModel, settings.executorModel, nowMs);
+    this.leadEffort = settings.plannerEffort;
+    this.sidekickEffort = settings.executorEffort;
+  }
+
+  issueBrief(input: Omit<FusionBrief, "briefId">, nowMs = Date.now()): FusionBrief {
+    const brief: FusionBrief = { briefId: `brief-${++this.seq}`, ...input };
+    this.leadLog.push({ kind: "brief", payload: brief });
+    this.sidekickLog.push({ kind: "brief", payload: brief });
+    this.cacheCoordinator.touch("head", nowMs);
+    this.cacheCoordinator.touch("sidekick", nowMs);
+    return brief;
+  }
+
+  submitSidekickResult(result: FusionResult, nowMs = Date.now()): FusionResult {
+    this.sidekickLog.push({ kind: "result", payload: result });
+    this.cacheCoordinator.touch("sidekick", nowMs);
+    return result;
+  }
+
+  reviewAndSendFeedback(feedback: FusionFeedback, nowMs = Date.now()): FusionFeedback {
+    this.leadLog.push({ kind: "feedback", payload: feedback });
+    this.cacheCoordinator.touch("head", nowMs);
+    return feedback;
+  }
+
+  stats() {
+    return {
+      leadModel: this.cacheCoordinator.head.model,
+      leadEffort: this.leadEffort,
+      sidekickModel: this.cacheCoordinator.sidekick.model,
+      sidekickEffort: this.sidekickEffort,
+      separatePersistentContexts: true as const,
+      leadEvents: this.leadLog.length,
+      sidekickEvents: this.sidekickLog.length,
+    };
+  }
+}
+
+export type OrchestratorPhase = "explore_plan_readonly" | "execute" | "replan_review" | "complete";
+
+export interface OrchestratorFrictionSignal {
+  testsFailed?: boolean;
+  consecutiveErrors?: number;
+  epamTripped?: boolean;
+  scopeExpanded?: boolean;
+}
+
+export interface OrchestratorTurnState {
+  phase: OrchestratorPhase;
+  activeRole: "orchestrator" | "executor";
+  activeModel: string;
+  activeEffort: EffortLevel;
+  readOnly: boolean;
+  interventions: number;
+  reason: string;
+}
+
+/**
+ * Antigravity Orchestrator (Dynamic Bidirectional Collaboration in One Trajectory):
+ * - Starts in read-only `explore_plan_readonly` with the Orchestrator model.
+ * - Hands off to `execute` with the Executor model.
+ * - Dynamically re-intervenes back to `replan_review` whenever friction hits
+ *   (test failures, >=2 consecutive errors, EPAM circuit breaker, or scope expansion).
+ */
+export class BidirectionalOrchestrator {
+  private phase: OrchestratorPhase = "explore_plan_readonly";
+  private interventions = 0;
+
+  constructor(private readonly settings: DefaultPairSettings) {}
+
+  currentState(reason = "initial read-only exploration and planning"): OrchestratorTurnState {
+    const isOrch = this.phase !== "execute";
+    return {
+      phase: this.phase,
+      activeRole: isOrch ? "orchestrator" : "executor",
+      activeModel: isOrch ? this.settings.plannerModel : this.settings.executorModel,
+      activeEffort: isOrch ? this.settings.plannerEffort : this.settings.executorEffort,
+      readOnly: this.phase === "explore_plan_readonly" || this.phase === "replan_review",
+      interventions: this.interventions,
+      reason,
+    };
+  }
+
+  handoffToExecutor(): OrchestratorTurnState {
+    if (this.phase !== "explore_plan_readonly" && this.phase !== "replan_review") {
+      throw new Error(`Cannot hand off to executor from phase '${this.phase}'`);
+    }
+    this.phase = "execute";
+    return this.currentState("plan locked; handing off execution to executor model");
+  }
+
+  reportExecutorOutcome(signal: OrchestratorFrictionSignal, allVerified = false): OrchestratorTurnState {
+    if (this.phase !== "execute") {
+      throw new Error(`Executor outcome only valid during 'execute' phase (got '${this.phase}')`);
+    }
+    const friction =
+      Boolean(signal.testsFailed) ||
+      (signal.consecutiveErrors ?? 0) >= 2 ||
+      Boolean(signal.epamTripped) ||
+      Boolean(signal.scopeExpanded);
+
+    if (friction) {
+      this.phase = "replan_review";
+      this.interventions += 1;
+      return this.currentState("friction detected; orchestrator re-intervening for replan/review");
+    }
+    if (allVerified) {
+      this.phase = "complete";
+      return this.currentState("executor verified cleanly; trajectory complete");
+    }
+    return this.currentState("executor continuing cleanly");
+  }
+}

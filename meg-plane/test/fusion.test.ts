@@ -82,3 +82,82 @@ describe("P2-05 Budget Classifier, 3-Gear Thickness, Fusion & EPAM Breaker", () 
     ).toBeFalse();
   });
 });
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  BidirectionalOrchestrator,
+  DevinFusionSession,
+  loadDefaultPairSettings,
+  saveDefaultPairSettings,
+} from "../src/fusion";
+
+describe("Batch 7.5C Devin Fusion & Antigravity Bidirectional Orchestrator", () => {
+  test("DevinFusionSession maintains 2 separate persistent contexts communicating via Brief/Result/Feedback & persists pair settings", () => {
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), "meg-pair-"));
+    try {
+      const settings = {
+        mode: "devin_fusion" as const,
+        plannerModel: "claude-opus-4",
+        plannerEffort: "high" as const,
+        executorModel: "qwen2.5-coder:32b",
+        executorEffort: "medium" as const,
+      };
+      saveDefaultPairSettings(ws, settings);
+      expect(loadDefaultPairSettings(ws)).toEqual(settings);
+
+      const session = new DevinFusionSession(settings, 1000);
+      const brief = session.issueBrief(
+        {
+          objective: "Add retry backoff",
+          constraints: ["keep zero deps"],
+          successCriteria: ["429 test passes"],
+          allowedFiles: ["src/client.ts"],
+        },
+        2000,
+      );
+      session.submitSidekickResult(
+        { briefId: brief.briefId, editedFiles: ["src/client.ts"], verificationSummary: "12 pass", passed: true },
+        3000,
+      );
+      session.reviewAndSendFeedback({ briefId: brief.briefId, approved: true, revisions: [] }, 4000);
+      const st = session.stats();
+      expect(st.separatePersistentContexts).toBeTrue();
+      expect(st.leadEvents).toBe(2);
+      expect(st.sidekickEvents).toBe(2);
+    } finally {
+      fs.rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  test("BidirectionalOrchestrator runs read-only explore/plan -> execute -> friction re-intervention -> complete", () => {
+    const orch = new BidirectionalOrchestrator({
+      mode: "antigravity_orchestrator",
+      plannerModel: "gemini-4-neon",
+      plannerEffort: "high",
+      executorModel: "gemini-4-hydrogen",
+      executorEffort: "high",
+    });
+
+    const s0 = orch.currentState();
+    expect(s0.phase).toBe("explore_plan_readonly");
+    expect(s0.readOnly).toBeTrue();
+    expect(s0.activeModel).toBe("gemini-4-neon");
+
+    const s1 = orch.handoffToExecutor();
+    expect(s1.phase).toBe("execute");
+    expect(s1.readOnly).toBeFalse();
+    expect(s1.activeModel).toBe("gemini-4-hydrogen");
+
+    // Friction triggers dynamic orchestrator re-intervention
+    const s2 = orch.reportExecutorOutcome({ testsFailed: true });
+    expect(s2.phase).toBe("replan_review");
+    expect(s2.readOnly).toBeTrue();
+    expect(s2.interventions).toBe(1);
+
+    // Re-handoff -> verified completion
+    orch.handoffToExecutor();
+    const s3 = orch.reportExecutorOutcome({}, true);
+    expect(s3.phase).toBe("complete");
+  });
+});

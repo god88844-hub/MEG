@@ -407,3 +407,131 @@ def run_controlled_evolution_dry_run(
         "gauntlet": gauntlet,
         "pr": pr,
     }
+
+# ===========================================================================
+# Batch 7.5C Exact Mathematical Formulations:
+# 1. Exact Gram-Matrix DPP log det(L_S) MAP Selection
+# 2. Exact GUARD Soft-HURT Trust-Region Objective
+# 3. Exact SkillAdam Bias-Corrected Adaptive Moment Optimizer
+# ===========================================================================
+
+import math
+
+
+def log_determinant(matrix: Sequence[Sequence[float]], jitter: float = 1e-9) -> float:
+    """Exact log det(M) via partial-pivoted Gaussian elimination (pure Python, zero deps)."""
+    n = len(matrix)
+    if n == 0:
+        return 0.0
+    a = [[float(matrix[i][j]) + (jitter if i == j else 0.0) for j in range(n)] for i in range(n)]
+    log_det = 0.0
+    for col in range(n):
+        pivot_row = max(range(col, n), key=lambda r: abs(a[r][col]))
+        pivot = abs(a[pivot_row][col])
+        if pivot <= 1e-15:
+            return float("-inf")
+        if pivot_row != col:
+            a[col], a[pivot_row] = a[pivot_row], a[col]
+        log_det += math.log(abs(a[col][col]))
+        diag = a[col][col]
+        for r in range(col + 1, n):
+            factor = a[r][col] / diag
+            for c in range(col + 1, n):
+                a[r][c] -= factor * a[col][c]
+    return log_det
+
+
+def build_dpp_kernel(features: Sequence[Sequence[float]], qualities: Sequence[float]) -> List[List[float]]:
+    """Build PSD DPP L-ensemble kernel L_ij = q_i * q_j * <phi_i, phi_j> with L2-normalized features."""
+    n = len(features)
+    normed: List[List[float]] = []
+    for vec in features:
+        norm = math.sqrt(sum(x * x for x in vec))
+        normed.append([x / norm for x in vec] if norm > 1e-12 else [0.0 for _ in vec])
+    kernel: List[List[float]] = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            dot = sum(a * b for a, b in zip(normed[i], normed[j]))
+            kernel[i][j] = qualities[i] * qualities[j] * dot
+    return kernel
+
+
+def select_dpp_gram_coreset(
+    task_ids: Sequence[str],
+    features: Sequence[Sequence[float]],
+    qualities: Sequence[float],
+    k: int = 10,
+    pinned_indices: Sequence[int] = (),
+) -> Tuple[List[str], float]:
+    """Greedy MAP DPP selection maximizing log det(L_S) while pinning required anchor indices."""
+    n = len(task_ids)
+    if k > n:
+        raise ValueError(f"Cannot select k={k} items from pool of size {n}")
+    kernel = build_dpp_kernel(features, qualities)
+    selected: List[int] = list(dict.fromkeys(pinned_indices))
+    remaining = [i for i in range(n) if i not in selected]
+
+    def submatrix(idxs: Sequence[int]) -> List[List[float]]:
+        return [[kernel[i][j] for j in idxs] for i in idxs]
+
+    while len(selected) < k and remaining:
+        best_idx = remaining[0]
+        best_score = float("-inf")
+        for cand in remaining:
+            score = log_determinant(submatrix(selected + [cand]))
+            if score > best_score:
+                best_score = score
+                best_idx = cand
+        selected.append(best_idx)
+        remaining.remove(best_idx)
+
+    final_logdet = log_determinant(submatrix(selected))
+    return ([task_ids[i] for i in selected], round(final_logdet, 6))
+
+
+def compute_soft_hurt_objective(
+    gain_pp: float,
+    forgetting_pp: float,
+    lambda_hurt: float = 10.0,
+) -> Dict[str, object]:
+    """
+    GUARD Soft-HURT objective:
+      S_HURT = gain_pp - lambda_hurt * max(0, forgetting_pp)^2
+    Strict trust-region admission requires forgetting_pp == 0.0 and S_HURT >= 0.0.
+    """
+    penalty = lambda_hurt * (max(0.0, forgetting_pp) ** 2)
+    score = round(gain_pp - penalty, 6)
+    return {
+        "soft_hurt_score": score,
+        "penalty": round(penalty, 6),
+        "zero_forgetting": forgetting_pp <= 0.0,
+        "admitted": forgetting_pp <= 0.0 and score >= 0.0,
+    }
+
+
+class SkillAdamOptimizer:
+    """Exact bias-corrected Adam optimizer for offline modular skill/weight priority updates."""
+
+    def __init__(self, lr: float = 0.05, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8) -> None:
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.t = 0
+        self.m: Dict[str, float] = {}
+        self.v: Dict[str, float] = {}
+
+    def step(self, weights: Dict[str, float], gradients: Dict[str, float]) -> Dict[str, float]:
+        self.t += 1
+        updated = dict(weights)
+        for key, g in gradients.items():
+            m_prev = self.m.get(key, 0.0)
+            v_prev = self.v.get(key, 0.0)
+            m_t = self.beta1 * m_prev + (1.0 - self.beta1) * g
+            v_t = self.beta2 * v_prev + (1.0 - self.beta2) * (g * g)
+            self.m[key] = m_t
+            self.v[key] = v_t
+            m_hat = m_t / (1.0 - (self.beta1 ** self.t))
+            v_hat = v_t / (1.0 - (self.beta2 ** self.t))
+            updated[key] = round(updated.get(key, 0.0) + self.lr * m_hat / (math.sqrt(v_hat) + self.eps), 6)
+        return updated
