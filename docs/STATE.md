@@ -2,8 +2,8 @@
 
 - **Plan Version:** v1.2 (Micro-Tasked for Single-Builder Agent)
 - **Active Phase:** Phase 6 -- All 29 Software Domains, Multimodal Media & Daily Usage (`meg-plane/skills/` + `meg-eval/oracles/`)
-- **Last Completed TODO:** `P5-05` (Phase 5 Complete)
-- **Next TODO:** `P6-01` (CLI Multimodal Media & Paste Ingestion in `meg-plane/src/media.ts`)
+- **Last Completed TODO:** `P6-04`
+- **Next TODO:** `P6-05` (Pack 4 -- Graphic Design, SVG, 60-FPS Motion Video & 3D/CAD in `meg-eval/oracles/`)
 - **Frozen Path:** `meg-rs/crates/meg-tui/` (frozen until Phase 8)
 
 ## Completed Phases
@@ -14,9 +14,8 @@
 - [x] **Phase 4** -- Zero-Trust Verification Gauntlet & Loop Engineering (`P4-01` through `P4-05`)
 - [x] **Phase 5** -- Multi-Agent Graphs, Goal/Motion Engineering & GitHub/CI (`P5-01` through `P5-05`)
 
-## Completed Phase 5 TODOs
-- [x] `P5-01` -- `Maestro Order` algebraic orchestration (Early-Start independence, 4 combinators, Blackboard, streaming `pipeline()`, code-routed DAG, LIFO Saga & partitioned budgets)
-- [x] `P5-02` -- Bash-less `GlobalRouter`, 4-Shape Swarm, `TeamCreate` 1-File-1-Owner locks, Unit-Only Return Edge, Long Learning Edge, `Planfence` & Loop-Until-Dry `seen`
-- [x] `P5-03` -- 7-Rule File Swarm (`BOARD.md`, pairwise disjoint `tasks/T[n].md`, `END` sentinel outputs, `CONFLICTS.md`, `[T#]` provenance `FINAL.md`, `<=30`-line `LESSONS.md`)
-- [x] `P5-04` -- Goal & Motion Engineering (`GOAL.md`/`goal-budget.md`, quiet `update_goal`, `/goal`, Anti-Goal-Gaming floor invariants, Motion Batch Review Queue, 0-token delta routines in `dontAsk` mode)
-- [x] `P5-05` -- GitHub IssueBot 5-Stage Graph (Lethal Trifecta broken, idempotent Draft PR, human-only merge), 5-category CI triage, 4-tick watcher, conflict-only rebase, Qodo invalidation & 2-PR missed-case rule extraction
+## Completed Phase 6 TODOs
+- [x] `P6-01` -- CLI multimodal media & clipboard ingestion (`@media:`, 1fps ffmpeg scene-change keyframes, OCR/layout fallback)
+- [x] `P6-02` -- Pack 1 (`pack-vibe`): Elephant `PRD.md` + 3 Goldfish critics + 1-feature slices + `AskUserQuestion` + `/taste`
+- [x] `P6-03` -- Pack 2 (`pack-appdev`): <50ms LSP, DAP specs, Bombadil fuzzing, bootstrap order, `agent-desktop` PII scrub & `PercentCheckHarness`
+- [x] `P6-04` -- Pack 3 (`pack-games`): M5 7-Subsystem ECS, `.hot.*` lint, WebGL 0-error, BFS playtester & Kepler 100% backtest + auto-RESET

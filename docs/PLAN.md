@@ -209,19 +209,19 @@
 **Language:** TypeScript Skills (`meg-plane/skills/`) + On-Demand Domain Oracles (`meg-eval/oracles/`)
 **Rule:** Zero tools added to the default 6-tool base prompt; every pack loads lazily via `SKILL.md`.
 
-- [ ] **P6-01 CLI Multimodal Media & Paste Ingestion (`meg-plane/src/media.ts`):**
+- [x] **P6-01 CLI Multimodal Media & Paste Ingestion (`meg-plane/src/media.ts`):**
   - Handle drag-and-drop & clipboard (`Ctrl+V`) images/videos, `ffmpeg` 1fps scene-change keyframe extraction, and deterministic OCR/layout fallback for text-only local models.
   - *Micro-Check:* `bun test test/media.test.ts`
-- [ ] **P6-02 Pack 1 -- Vibe Coders, PM, Scrum & UI/UX Wireframing (Domains 1-3):**
+- [x] **P6-02 Pack 1 -- Vibe Coders, PM, Scrum & UI/UX Wireframing (Domains 1-3):**
   - Vibe-to-Spec front-end: vague prompt -> Elephant `PRD.md` -> 3 stateless Goldfish critics (Contrarian, Edge-Case, Token Economist) -> 1-feature slices in fresh contexts.
   - `AskUserQuestion` structured clarification forms + `/refactor-state-machines` (`UX/DX/AX`) + `/taste` anti-slop UI pack (`a11y`, `smell.md`, `typeset.md`, 1440px/360px responsive checks).
   - *Micro-Check:* `bun test test/pack_vibe.test.ts`
-- [ ] **P6-03 Pack 2 -- Web, Full-Stack, Backend, Mobile, Desktop, DB, Enterprise & QA (Domains 4-15):**
+- [x] **P6-03 Pack 2 -- Web, Full-Stack, Backend, Mobile, Desktop, DB, Enterprise & QA (Domains 4-15):**
   - Sub-50ms LSP diagnostics on edit + live DAP debugger (`debugpy`/`dlv`/`lldb`) + Playwright E2E live click-through + `Bombadil` property-based UI fuzzing + deployment bootstrap-ordering check.
   - Desktop GUI OS Accessibility Tree bridge (`agent-desktop` JSON tree with PII scrubbing).
   - Binary Office/Data skill (`office-doc-write` `.docx` + `s7->s30` `PercentCheckHarness` `.xlsx` `(0,1) -> *100`).
   - *Micro-Check:* `bun test test/pack_appdev.test.ts`
-- [ ] **P6-04 Pack 3 -- 2D/3D Games, Physics & ARC-AGI-3 World Models (Domains 16-17):**
+- [x] **P6-04 Pack 3 -- 2D/3D Games, Physics & ARC-AGI-3 World Models (Domains 16-17):**
   - `M5` 7-Subsystem ECS template (`SCHEMA.md` + `.hot.*` zero-alloc 60-FPS lint) + WebGL 0-console-error check + automated BFS playtester.
   - `Kepler 1.0` / `Schema` world-model (`step(state, action)` 100% `run_backtest` certification + auto-`RESET` on `GAME_OVER`).
   - *Micro-Check:* `bun test test/pack_games.test.ts`
