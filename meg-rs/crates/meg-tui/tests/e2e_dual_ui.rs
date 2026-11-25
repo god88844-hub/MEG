@@ -205,3 +205,93 @@ fn ui_popup_live_previews_pro_classic_and_double_ctrl_c_guards_exit() {
     assert!(UserUiConfig::workspace_path(&ws).is_file());
     let _ = std::fs::remove_dir_all(&ws);
 }
+#[test]
+fn smart_paste_chips_live_ctx_and_compact_tool_cards() {
+    use crossterm::event::Event;
+    use std::sync::{Arc, Mutex};
+
+    let ws = std::env::temp_dir().join(format!("meg-smart-paste-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws).unwrap();
+    let img = ws.join("sample.png");
+    std::fs::write(&img, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+
+    let captured_goals = Arc::new(Mutex::new(Vec::<String>::new()));
+    let cap = captured_goals.clone();
+    let runner: Arc<meg_tui::GoalRunner> = Arc::new(move |req, tx| {
+        cap.lock().unwrap().push(req.goal);
+        tx.send(meg_tui::RunnerMsg::Usage {
+            input: 32_000,
+            output: 6_400,
+            cached: 0,
+        })
+        .unwrap();
+        Ok(Some("ok".into()))
+    });
+
+    let state = WorkstationState {
+        cwd: ws.to_string_lossy().into_owned(),
+        ui_mode: UiMode::Pro,
+        ..Default::default()
+    };
+    let mut c = Controller::new(state, Some(runner)).unwrap();
+
+    // 1. Pasting an existing image path inserts an [Image #1: sample.png] chip
+    c.handle_event(Event::Paste(format!("\"{}\"", img.display())))
+        .unwrap();
+    assert!(
+        c.state.input.contains("[Image #1: sample.png]"),
+        "Expected image chip in composer: {}",
+        c.state.input
+    );
+
+    // 2. Pasting long multi-line text collapses into [Pasted text #1 · 8 lines]
+    let long_paste = (1..=8)
+        .map(|i| format!("line-{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    c.handle_event(Event::Paste(long_paste)).unwrap();
+    assert!(
+        c.state.input.contains("[Pasted text #1 · 8 lines]"),
+        "Expected collapsed paste chip: {}",
+        c.state.input
+    );
+
+    // 3. Submitting expands both chips into real multimodal marker + full text & updates ctx%
+    c.handle_event(Event::Key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    )))
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while c.state.busy {
+        c.poll(0.01).unwrap();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let goal = captured_goals.lock().unwrap()[0].clone();
+    assert!(goal.contains("[[MEG_IMAGE:"), "Expected multimodal marker: {goal}");
+    assert!(goal.contains("line-8"), "Expected expanded paste text: {goal}");
+    assert!(
+        c.state.context_percent >= 25,
+        "Expected live ctx% gauge to update, got {}",
+        c.state.context_percent
+    );
+
+    // 4. Multi-line [tool ok] stderr dump folds into 1 compact line in Pro UI
+    c.state
+        .transcript
+        .push("[tool ok] exit code: 0\n[stderr]\nError line 1\nError line 2\nError line 3".into());
+    let backend = TestBackend::new(110, 28);
+    let mut term = Terminal::new(backend).unwrap();
+    term.draw(|f| draw(f, &c.state.theme, &c.state)).unwrap();
+    let rendered = buffer_text(&term);
+    assert!(
+        rendered.contains("+4 lines"),
+        "Expected folded compact tool card:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Error line 3"),
+        "Compact tool card should hide verbose stderr lines:\n{rendered}"
+    );
+    let _ = std::fs::remove_dir_all(&ws);
+}

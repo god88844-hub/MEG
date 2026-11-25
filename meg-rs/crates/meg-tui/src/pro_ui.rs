@@ -24,18 +24,18 @@ use unicode_width::UnicodeWidthStr;
 /// Titanium Dark palette for `/ui pro` (kept separate from `ALL_PALETTES` to preserve Classic tests).
 pub const TITANIUM_DARK: Palette = Palette {
     name: "Titanium Dark",
-    chrome_bg: Color::Rgb(11, 14, 20),
-    chrome_fg: Color::Rgb(148, 163, 184),
-    titlebar_bg: Color::Rgb(17, 22, 32),
-    titlebar_fg: Color::Rgb(241, 245, 249),
-    panel_border: Color::Rgb(46, 55, 72),
-    panel_title: Color::Rgb(56, 189, 248),
-    viewport_bg: Color::Rgb(15, 19, 28),
-    viewport_fg: Color::Rgb(226, 232, 240),
-    accent: Color::Rgb(56, 189, 248),
-    success: Color::Rgb(52, 211, 153),
-    error: Color::Rgb(248, 113, 113),
-    warning: Color::Rgb(251, 191, 36),
+    chrome_bg: Color::Rgb(0, 0, 0),
+    chrome_fg: Color::Rgb(168, 178, 192),
+    titlebar_bg: Color::Rgb(16, 18, 22),
+    titlebar_fg: Color::Rgb(245, 247, 250),
+    panel_border: Color::Rgb(62, 70, 82),
+    panel_title: Color::Rgb(0, 229, 255),
+    viewport_bg: Color::Rgb(8, 9, 12),
+    viewport_fg: Color::Rgb(242, 245, 249),
+    accent: Color::Rgb(0, 229, 255),
+    success: Color::Rgb(74, 222, 128),
+    error: Color::Rgb(255, 92, 92),
+    warning: Color::Rgb(250, 204, 21),
 };
 
 pub struct ProFrontend;
@@ -148,7 +148,7 @@ fn render_pro_header(f: &mut Frame, area: Rect, st: &WorkstationState, pal: &Pal
         );
         lines.push(Line::from(Span::styled(
             fit_text(&meta, w),
-            Style::default().fg(pal.chrome_fg),
+            Style::default().fg(pal.titlebar_fg),
         )));
     }
 
@@ -160,11 +160,21 @@ fn render_pro_header(f: &mut Frame, area: Rect, st: &WorkstationState, pal: &Pal
 
 fn is_tool_card_line(raw: &str) -> bool {
     let trimmed = raw.trim_start();
-    trimmed.starts_with("[tool]")
+    trimmed.starts_with("[tool")
         || trimmed.starts_with("Tool ")
         || trimmed.starts_with("▸ ")
         || trimmed.starts_with("✓ ")
         || trimmed.starts_with("✗ ")
+}
+
+fn compact_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
 }
 
 fn render_pro_transcript(f: &mut Frame, area: Rect, st: &WorkstationState, pal: &Palette) {
@@ -217,9 +227,22 @@ fn render_pro_transcript(f: &mut Frame, area: Rect, st: &WorkstationState, pal: 
             if is_tool_card_line(&clean) {
                 if st.collapse_tool_cards {
                     collapsed_run += 1;
-                    let card_color = if clean.contains("✗") || clean.to_ascii_lowercase().contains("fail") {
+                    let raw_lines: Vec<&str> = clean.lines().collect();
+                    let first = raw_lines.first().copied().unwrap_or("");
+                    let extra = raw_lines.len().saturating_sub(1);
+                    let summary = if extra > 0 {
+                        format!("{first}  (+{extra} lines · /ui cards to expand)")
+                    } else {
+                        first.to_string()
+                    };
+                    let lower = clean.to_ascii_lowercase();
+                    let card_color = if clean.starts_with("[tool err]")
+                        || clean.contains("✗")
+                        || lower.contains("[stderr]")
+                        || lower.contains("failed")
+                    {
                         pal.error
-                    } else if clean.contains("✓") {
+                    } else if clean.starts_with("[tool ok]") || clean.contains("✓") {
                         pal.success
                     } else {
                         pal.accent
@@ -227,7 +250,7 @@ fn render_pro_transcript(f: &mut Frame, area: Rect, st: &WorkstationState, pal: 
                     lines.push(Line::from(vec![
                         Span::styled("▎ ", Style::default().fg(card_color).add_modifier(Modifier::BOLD)),
                         Span::styled(
-                            fit_text(&clean, w.saturating_sub(3)),
+                            fit_text(&summary, w.saturating_sub(3)),
                             Style::default().fg(pal.chrome_fg),
                         ),
                     ]));
@@ -341,8 +364,10 @@ fn render_pro_rail(f: &mut Frame, area: Rect, st: &WorkstationState, pal: &Palet
         Line::from(Span::styled(
             fit_text(
                 &format!(
-                    "Tok : {}in/{}out ({}c)",
-                    st.usage.input_tokens, st.usage.output_tokens, st.usage.cached_tokens
+                    "Tok : {}/{} ({}c)",
+                    compact_tokens(st.usage.input_tokens),
+                    compact_tokens(st.usage.output_tokens),
+                    compact_tokens(st.usage.cached_tokens)
                 ),
                 rw,
             ),
@@ -470,14 +495,14 @@ fn render_pro_footer(f: &mut Frame, area: Rect, st: &WorkstationState, pal: &Pal
     let text = if !st.notice.is_empty() {
         format!(" {} ", sanitize_ansi(&st.notice))
     } else {
-        " Tab mode │ /ui layout │ /theme colors │ /roles models │ Ctrl+C x2 exit ".to_string()
+        " Tab mode │ /ui layout │ /theme colors │ Alt+V paste img │ Ctrl+C x2 exit ".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             fit_text(&text, w),
-            Style::default().fg(pal.chrome_fg),
+            Style::default().fg(pal.titlebar_fg),
         )))
-        .style(Style::default().bg(pal.titlebar_bg)),
+        .style(Style::default().bg(pal.titlebar_bg).fg(pal.titlebar_fg)),
         area,
     );
 }

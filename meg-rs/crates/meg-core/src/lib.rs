@@ -920,7 +920,24 @@ pub fn compact_transcript(
     dropped_groups
 }
 
+fn strip_image_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(s) = rest.find("[[MEG_IMAGE:") {
+        out.push_str(&rest[..s]);
+        if let Some(e) = rest[s..].find("]]") {
+            out.push_str("[image attached]");
+            rest = &rest[s + e + 2..];
+        } else {
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn system_prompt(goal: &str) -> String {
+    let goal = strip_image_markers(goal);
     format!(
         "You are MEG, a coding agent operating in the selected workspace.\n\
          On EACH turn output ONE valid JSON object and nothing else.\n\

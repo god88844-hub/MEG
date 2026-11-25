@@ -668,9 +668,140 @@ fn build_openai_messages(messages: &[crate::ChatMessage], use_native_tools: bool
                 continue;
             }
         }
-        out.push(json!({ "role": m.role, "content": m.content }));
+        let content_val = if m.role == "user" { openai_user_content(&m.content) } else { Value::String(m.content.clone()) };
+        out.push(json!({ "role": m.role, "content": content_val }));
     }
     out
+}
+
+const IMAGE_MARKER_PREFIX: &str = "[[MEG_IMAGE:";
+const IMAGE_MARKER_SUFFIX: &str = "]]";
+const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(triple & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else {
+        None
+    }
+}
+
+/// Extract `[[MEG_IMAGE:<path>]]` markers from a user message and encode them as `(mime, base64)`.
+fn read_validated_image(path: &std::path::Path) -> Option<(&'static str, String)> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let mime = detect_image_mime(&bytes)?;
+    Some((mime, base64_encode(&bytes)))
+}
+
+fn parse_multimodal_user_content(content: &str) -> Option<(String, Vec<(&'static str, String)>)> {
+    if !content.contains(IMAGE_MARKER_PREFIX) {
+        return None;
+    }
+    let mut clean = String::with_capacity(content.len());
+    let mut images = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find(IMAGE_MARKER_PREFIX) {
+        clean.push_str(&rest[..start]);
+        let after_prefix = &rest[start + IMAGE_MARKER_PREFIX.len()..];
+        if let Some(end) = after_prefix.find(IMAGE_MARKER_SUFFIX) {
+            let raw_path = after_prefix[..end].trim();
+            let path = std::path::Path::new(raw_path);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "image".into());
+            if let Some((mime, b64)) = read_validated_image(path) {
+                images.push((mime, b64));
+                clean.push_str(&format!("[Attached image: {name}]"));
+                rest = &after_prefix[end + IMAGE_MARKER_SUFFIX.len()..];
+                continue;
+            }
+            clean.push_str(&format!("[Unreadable image: {raw_path}]"));
+            rest = &after_prefix[end + IMAGE_MARKER_SUFFIX.len()..];
+        } else {
+            clean.push_str(&rest[start..]);
+            rest = "";
+            break;
+        }
+    }
+    clean.push_str(rest);
+    if images.is_empty() {
+        None
+    } else {
+        Some((clean.trim().to_string(), images))
+    }
+}
+
+fn openai_user_content(content: &str) -> Value {
+    if let Some((text, images)) = parse_multimodal_user_content(content) {
+        let mut parts = Vec::with_capacity(images.len() + 1);
+        if !text.is_empty() {
+            parts.push(json!({ "type": "text", "text": text }));
+        }
+        for (mime, b64) in images {
+            parts.push(json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{mime};base64,{b64}") }
+            }));
+        }
+        Value::Array(parts)
+    } else {
+        Value::String(content.to_string())
+    }
+}
+
+fn anthropic_user_content(content: &str) -> Value {
+    if let Some((text, images)) = parse_multimodal_user_content(content) {
+        let mut parts = Vec::with_capacity(images.len() + 1);
+        if !text.is_empty() {
+            parts.push(json!({ "type": "text", "text": text }));
+        }
+        for (mime, b64) in images {
+            parts.push(json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": mime, "data": b64 }
+            }));
+        }
+        Value::Array(parts)
+    } else {
+        Value::String(content.to_string())
+    }
 }
 
 fn build_anthropic_messages(messages: &[crate::ChatMessage], use_native_tools: bool) -> Vec<Value> {
@@ -738,7 +869,8 @@ fn build_anthropic_messages(messages: &[crate::ChatMessage], use_native_tools: b
             }
             continue;
         }
-        out.push(json!({ "role": m.role, "content": m.content }));
+        let content_val = if m.role == "user" { anthropic_user_content(&m.content) } else { Value::String(m.content.clone()) };
+        out.push(json!({ "role": m.role, "content": content_val }));
         i += 1;
     }
     out
@@ -1442,5 +1574,37 @@ mod streaming_regressions {
 impl Default for ShimClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod multimodal_tests {
+    use super::*;
+
+    #[test]
+    fn multimodal_image_markers_encode_for_openai_and_anthropic() {
+        let dir = std::env::temp_dir().join(format!("meg-mm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("pixel.png");
+        let png_bytes: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        ];
+        std::fs::write(&img, png_bytes).unwrap();
+        let prompt = format!("Describe this [[MEG_IMAGE:{}]]", img.display());
+        let oa = openai_user_content(&prompt);
+        let oa_arr = oa.as_array().expect("OpenAI multimodal array");
+        assert_eq!(oa_arr.len(), 2);
+        assert_eq!(oa_arr[1]["type"], "image_url");
+        assert!(oa_arr[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+
+        let an = anthropic_user_content(&prompt);
+        let an_arr = an.as_array().expect("Anthropic multimodal array");
+        assert_eq!(an_arr.len(), 2);
+        assert_eq!(an_arr[1]["type"], "image");
+        assert_eq!(an_arr[1]["source"]["media_type"], "image/png");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
