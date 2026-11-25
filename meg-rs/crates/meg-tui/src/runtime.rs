@@ -1098,7 +1098,18 @@ impl Controller {
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
                     .filter(|&n| n > 0)
-                    .unwrap_or(128_000);
+                    .unwrap_or_else(|| {
+                        let m = self.state.model.to_ascii_lowercase();
+                        if m.contains("gemini") {
+                            1_000_000
+                        } else if m.contains("claude") {
+                            200_000
+                        } else if m.contains(":7b") || m.contains(":8b") || m.contains(":14b") || m.contains("qwen2.5-coder:7b") {
+                            32_768
+                        } else {
+                            128_000
+                        }
+                    });
                 let turn_tokens = input.saturating_add(output);
                 if turn_tokens > 0 {
                     let pct = (turn_tokens.saturating_mul(100) / ctx_window).min(100) as u8;

@@ -331,6 +331,7 @@ pub(crate) fn is_ignored_name(name: &str) -> bool {
             | ".venv"
             | "venv"
             | ".meg"
+            | ".loop"
             | ".cache"
     )
 }

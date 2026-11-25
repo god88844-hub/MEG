@@ -545,8 +545,15 @@ impl ShimClient {
                         data.push_str(payload.trim_start());
                     }
                 }
-                if !data.trim().is_empty() && data.trim() != "[DONE]" {
+                if data.trim() == "[DONE]" {
+                    done = true;
+                } else if !data.trim().is_empty() {
                     decoder.value(&serde_json::from_str::<Value>(&data)?, on_delta)?;
+                }
+                if !done && !decoder.saw_terminal {
+                    anyhow::bail!(
+                        "Model stream ended unexpectedly before terminal event (truncated response)"
+                    );
                 }
             }
         }
@@ -980,6 +987,7 @@ struct FunctionCall {
 }
 #[derive(Default)]
 struct CompletionDecoder {
+    saw_terminal: bool,
     full: String,
     splitter: ThinkSplitter,
     usage: Option<(u64, u64, u64)>,
@@ -1002,6 +1010,9 @@ impl CompletionDecoder {
                     .as_u64()
                     .unwrap_or(0),
             ));
+        }
+        if value["choices"][0]["finish_reason"].is_string() {
+            self.saw_terminal = true;
         }
         let delta = &value["choices"][0]["delta"];
         let message = &value["choices"][0]["message"];
@@ -1042,6 +1053,11 @@ impl CompletionDecoder {
         callback: &mut (dyn FnMut(Delta) + Send),
     ) -> Result<()> {
         let kind = value["type"].as_str().unwrap_or("");
+        if matches!(kind, "message_stop" | "message")
+            || (kind == "message_delta" && value["delta"]["stop_reason"].is_string())
+        {
+            self.saw_terminal = true;
+        }
         anyhow::ensure!(
             kind != "error",
             "Anthropic endpoint reported a streaming error"
@@ -1220,6 +1236,34 @@ mod protocol_regressions {
             .to_string();
         assert!(error.contains("rate limit") && error.contains("30 seconds"));
         assert!(!error.contains("do-not-echo"));
+    }
+
+    #[tokio::test]
+    async fn adversarial_truncated_sse_stream_without_terminal_event_errors() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let truncated_sse = "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(truncated_sse, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ShimClient::with(format!("{}/v1", server.uri()), "fixture".into());
+        let err = client
+            .chat(&[crate::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }])
+            .await
+            .expect_err("Truncated SSE stream must not be accepted as a final answer");
+        assert!(
+            err.to_string().contains("truncated response"),
+            "Unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

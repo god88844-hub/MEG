@@ -59,10 +59,17 @@ def run_aegis_benchmark_suite(root_tmp: Path) -> Dict[str, object]:
     ws1 = root_tmp / "t1_crlf_fix"
     ws1.mkdir(parents=True)
     (ws1 / "math_ops.py").write_bytes(b"def mul(a, b):\r\n    return a + b\r\n")
+    (ws1 / "test_math_ops.py").write_text(
+        "import math_ops\n\ndef test_mul():\n    assert math_ops.mul(3, 4) == 12\n",
+        encoding="utf-8",
+    )
 
     def s1(turn: int, _req: str) -> str:
         if turn == 1:
             return json.dumps({"thought": "fix mul", "tool": "edit_file", "args": {"path": "math_ops.py", "old_string": "return a + b", "new_string": "return a * b"}})
+        if turn == 2:
+            import sys as _sys
+            return json.dumps({"thought": "verify mul", "tool": "bash", "args": {"command": f'"{_sys.executable}" -m pytest -q -p no:cacheprovider test_math_ops.py'}})
         return json.dumps({"thought": "done", "final": "Fixed mul() preserving CRLF."})
 
     srv, st = _serve_scripted_openai(s1)

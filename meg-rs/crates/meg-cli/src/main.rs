@@ -1291,7 +1291,9 @@ async fn run_request_detailed(
                 let _ = aepn.lock().unwrap().record_critic_approved();
                 reviewer_verdict_out = Some(verdict);
             }
-            let _ = meg_tools::ledger::write_receipt(&receipt_workspace, "meg-run", true);
+            let real_checks_passed =
+                extras.verify_cmd.is_some() || aepn.lock().unwrap().p_tests_green > 0;
+            meg_tools::ledger::write_receipt(&receipt_workspace, "meg-run", real_checks_passed)?;
         }
     }
     let telemetry = RunTelemetry {
@@ -1311,10 +1313,32 @@ fn default_max_steps() -> usize {
 }
 
 fn is_verification_command(cmd: &str) -> bool {
-    let low = cmd.to_ascii_lowercase();
+    let low = cmd.trim().to_ascii_lowercase();
+    if low.starts_with("echo ") || low.starts_with("printf ") {
+        return false;
+    }
     [
-        "test", "check", "verify", "pytest", "cargo ", "bun ", "npm ", "gcc ", "clang ",
-        "rustc ", "python", "node ", "go test",
+        "pytest",
+        "python -m pytest",
+        "python -m unittest",
+        "cargo test",
+        "cargo check",
+        "cargo clippy",
+        "bun test",
+        "npm test",
+        "npm run test",
+        "pnpm test",
+        "yarn test",
+        "vitest",
+        "jest",
+        "go test",
+        "dotnet test",
+        "ctest",
+        "make test",
+        "tsc --noemit",
+        "mypy",
+        "ruff check",
+        "eslint",
     ]
     .iter()
     .any(|k| low.contains(k))
@@ -1922,22 +1946,28 @@ async fn run_loop_headless(workspace: &std::path::Path, options: &LoopOptions) -
             Err(e) => format!("error: {}", e.to_string().chars().take(160).collect::<String>()),
         };
 
-        let (ok_now, out_now) = run_external_check_cmd(workspace, &options.check_cmd);
+        let inner_ok = matches!(&attempt, Ok((_, Some(_), _)));
+        let (check_ok, out_now) = run_external_check_cmd(workspace, &options.check_cmd);
+        let ok_now = check_ok && inner_ok;
         let fp = if ok_now {
             "00000000".to_string()
+        } else if !inner_ok {
+            "inner_rejected".to_string()
         } else {
             mask_failure_fingerprint(&out_now)
         };
         runs_log.push(serde_json::json!({
             "n": run_idx,
             "ok": ok_now,
+            "inner_ok": inner_ok,
+            "check_ok": check_ok,
             "failure": fp,
             "tried": tried_note,
         }));
 
         if ok_now {
-            let receipt = meg_tools::ledger::write_receipt(workspace, "meg-loop", true)?;
             write_state("green", &runs_log)?;
+            let receipt = meg_tools::ledger::write_receipt(workspace, "meg-loop", true)?;
             if options.base.json_output {
                 println!(
                     "{}",
@@ -2430,6 +2460,16 @@ mod tests {
         assert!(parse_run_options(&bad_steps).is_err());
     }
 
+    #[test]
+    fn adversarial_verification_classifier_rejects_decoys() {
+        assert!(!is_verification_command("echo test passed"));
+        assert!(!is_verification_command("python -c \"open('a.txt','w').write('ok')\""));
+        assert!(!is_verification_command("node -e \"console.log('check')\""));
+        assert!(is_verification_command("cargo test --locked"));
+        assert!(is_verification_command("pytest -q"));
+        assert!(is_verification_command("bun test"));
+        assert!(is_verification_command("go test ./..."));
+    }
     #[test]
     fn adversarial_mcp_names_and_bridge_mode_fail_closed() {
         let safe = sanitize_mcp_tool_name("mcp:github.server:create/issue");
@@ -3117,9 +3157,26 @@ mod native_integration {
             )
             .await
             .unwrap();
-        // Passing verification command locks verified deliverable.
+        // Decoy echo command must NOT lock the deliverable.
         engine
             .execute_tool("bash", &json!({"command": "echo verify ok"}))
+            .await
+            .unwrap();
+        engine
+            .execute_tool(
+                "write_file",
+                &json!({"path": "deliverable.txt", "content": "v1 valid content"}),
+            )
+            .await
+            .unwrap();
+        // Genuine passing test command locks verified deliverable.
+        std::fs::write(
+            target.parent().unwrap().join("verify.test.ts"),
+            "import { test, expect } from 'bun:test'; test('ok', () => expect(1).toBe(1));\n",
+        )
+        .unwrap();
+        engine
+            .execute_tool("bash", &json!({"command": "bun test verify.test.ts"}))
             .await
             .unwrap();
         // Subsequent overwrite without unlock_deliverable is blocked.

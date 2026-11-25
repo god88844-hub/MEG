@@ -180,8 +180,8 @@ def test_live_meg_exe_subprocess_enforces_airlock_edits_file_and_writes_receipt(
     rcpt = res["receipt"]
     assert rcpt["version"] == 1
     assert rcpt["task_id"] == "meg-run"
-    assert rcpt["checks_passed"] is True
+    assert rcpt["checks_passed"] is False
     expected_sig = hashlib.sha256(
-        f"v1|{rcpt['task_id']}|{rcpt['tree_hash']}|true".encode("utf-8")
+        f"v1|{rcpt['task_id']}|{rcpt['tree_hash']}|false".encode("utf-8")
     ).hexdigest()
     assert rcpt["receipt_hash"] == expected_sig

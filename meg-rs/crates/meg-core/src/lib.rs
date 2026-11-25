@@ -832,8 +832,30 @@ pub fn compact_transcript(
         return 0;
     }
     let total_len = |msgs: &[ChatMessage]| -> usize { msgs.iter().map(|m| m.content.len()).sum() };
-    if total_len(messages) <= max_chars || messages.len() <= goal_msg_idx + 3 {
+    if total_len(messages) <= max_chars {
         return 0;
+    }
+
+    // Pass 0: If retained prior conversation history (indices 1..goal_msg_idx) pushes the
+    // transcript over budget, drop the oldest prior turns first so long chats stay bounded.
+    let mut goal_msg_idx = goal_msg_idx.min(messages.len().saturating_sub(1));
+    let mut dropped_prior = 0usize;
+    while total_len(messages) > max_chars && goal_msg_idx > 1 {
+        messages.remove(1);
+        goal_msg_idx -= 1;
+        dropped_prior += 1;
+    }
+    if dropped_prior > 0 {
+        if let Some(goal_msg) = messages.get_mut(goal_msg_idx) {
+            if !goal_msg.content.contains("[Prior history compacted:") {
+                goal_msg.content.push_str(&format!(
+                    "\n\n[Prior history compacted: {dropped_prior} earlier message(s) omitted to stay within context budget.]"
+                ));
+            }
+        }
+    }
+    if total_len(messages) <= max_chars || messages.len() <= goal_msg_idx + 3 {
+        return dropped_prior;
     }
 
     // Keep at least the last 4 messages, snapping backward so we never cut
@@ -926,7 +948,7 @@ pub fn compact_transcript(
         rebuilt.extend(tail);
         *messages = rebuilt;
     }
-    dropped_groups
+    dropped_prior + dropped_groups
 }
 
 fn strip_image_markers(text: &str) -> String {
@@ -1010,6 +1032,23 @@ mod tests {
         assert!(p.contains("native tools"));
         assert!(!p.contains("output ONE valid JSON object"));
         assert!(!p.contains("\"final\""));
+    }
+    #[test]
+    fn adversarial_compact_transcript_bounds_long_prior_history() {
+        let mut msgs = vec![
+            ChatMessage { role: "system".into(), content: "sys".into() },
+            ChatMessage { role: "user".into(), content: "u1 ".repeat(200) },
+            ChatMessage { role: "assistant".into(), content: "a1 ".repeat(200) },
+            ChatMessage { role: "user".into(), content: "u2 ".repeat(200) },
+            ChatMessage { role: "assistant".into(), content: "a2 ".repeat(200) },
+            ChatMessage { role: "user".into(), content: "GOAL: current task".into() },
+        ];
+        let dropped = compact_transcript(&mut msgs, 5, 500);
+        assert!(dropped > 0, "Expected prior history messages to be compacted");
+        let total: usize = msgs.iter().map(|m| m.content.len()).sum();
+        assert!(total <= 650, "Compacted transcript should stay near budget, got {total}");
+        assert_eq!(msgs[0].role, "system");
+        assert!(msgs.last().unwrap().content.contains("GOAL: current task"));
     }
     #[test]
     fn batch_parses() {

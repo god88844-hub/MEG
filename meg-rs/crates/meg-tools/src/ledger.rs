@@ -245,4 +245,23 @@ mod tests {
         assert!(verify_receipt(&ws).unwrap_err().to_string().contains("drifted"));
         let _ = std::fs::remove_dir_all(&ws);
     }
+
+    #[test]
+    fn adversarial_loop_state_does_not_invalidate_receipt() {
+        let dir = std::env::temp_dir().join(format!(
+            "meg-ledger-loop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join(".loop")).unwrap();
+        std::fs::write(dir.join("main.rs"), "fn main() {}\n").unwrap();
+        write_receipt(&dir, "meg-loop", true).unwrap();
+        // Updating .loop/state.json after receipt write must not cause drift
+        std::fs::write(dir.join(".loop").join("state.json"), r#"{"status":"green"}"#).unwrap();
+        verify_receipt(&dir).expect("Receipt must remain valid after .loop/state.json update");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
