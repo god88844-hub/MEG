@@ -131,6 +131,9 @@ pub fn draw_classic(f: &mut Frame, pal: &Palette, st: &WorkstationState) {
     if let Some(picker) = &st.settings_picker {
         render_picker_modal(f, area, picker, pal);
     }
+    if let Some(picker) = &st.ui_picker {
+        render_picker_modal(f, area, picker, pal);
+    }
     if let Some(picker) = &st.workspace_picker {
         render_workspace_picker(f, pal, picker);
     }

@@ -62,7 +62,7 @@ fn dual_tui_switches_between_classic_and_pro_titanium_and_renders_orchestration_
     term.draw(|f| draw(f, &c.state.theme, &c.state)).unwrap();
     let rendered = buffer_text(&term);
     assert!(rendered.contains("MEG PRO"), "Expected MEG PRO badge:\n{rendered}");
-    assert!(rendered.contains("ANTIGRAVITY"), "Expected orchestration badge:\n{rendered}");
+    assert!(rendered.contains("MULTI"), "Expected orchestration badge:\n{rendered}");
     assert!(rendered.contains("Orchestration"), "Expected right rail:\n{rendered}");
     assert!(rendered.contains("qwen-exec"), "Expected executor model:\n{rendered}");
     assert!(rendered.contains("claude-critic"), "Expected L3 reviewer:\n{rendered}");
@@ -146,4 +146,62 @@ fn pro_and_classic_frontends_survive_extreme_dimensions_and_ansi_bombs() {
             );
         }
     }
+}
+#[test]
+fn ui_popup_live_previews_pro_classic_and_double_ctrl_c_guards_exit() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let ws = std::env::temp_dir().join(format!("meg-ui-popup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws).unwrap();
+
+    let state = WorkstationState {
+        cwd: ws.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let mut c = Controller::new(state, None).unwrap();
+
+    // 1. Bare /ui opens the interactive picker modal
+    c.submit_line("/ui").unwrap();
+    assert!(c.state.ui_picker.is_some());
+    assert_eq!(c.state.ui_mode, UiMode::Classic);
+
+    // Down -> Classic, Up -> Pro live previews immediately
+    c.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+        .unwrap();
+    assert_eq!(c.state.ui_mode, UiMode::Classic);
+    c.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)))
+        .unwrap();
+    assert_eq!(c.state.ui_mode, UiMode::Pro);
+
+    // Esc cancels and restores original mode
+    c.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        .unwrap();
+    assert!(c.state.ui_picker.is_none());
+    assert_eq!(c.state.ui_mode, UiMode::Classic);
+
+    // 2. Live theme switching works inside /ui pro
+    c.submit_line("/ui pro").unwrap();
+    c.submit_line("/theme Dracula").unwrap();
+    let eff = effective_pro_palette(&c.state.theme, &c.state);
+    assert_eq!(eff.name, "Dracula");
+
+    // 3. Double Ctrl+C exit guard when idle
+    c.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    )))
+    .unwrap();
+    assert!(!c.state.should_quit, "First Ctrl+C should warn, not exit");
+    assert!(c.state.notice.contains("Ctrl+C again"));
+
+    c.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL,
+    )))
+    .unwrap();
+    assert!(c.state.should_quit, "Second Ctrl+C within 2.5s should exit");
+
+    // 4. /ui custom scaffolds .meg/ui.json
+    c.submit_line("/ui custom").unwrap();
+    assert!(UserUiConfig::workspace_path(&ws).is_file());
+    let _ = std::fs::remove_dir_all(&ws);
 }

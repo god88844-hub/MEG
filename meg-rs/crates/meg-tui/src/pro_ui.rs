@@ -51,7 +51,10 @@ impl UiFrontend for ProFrontend {
 }
 
 pub fn effective_pro_palette(pal: &Palette, st: &WorkstationState) -> Palette {
-    let base = if st.ui_config.theme_name.is_some() {
+    let base = if st.theme_snapshot.is_some()
+        || st.ui_config.theme_name.is_some()
+        || *pal != crate::DARK_SLATE
+    {
         *pal
     } else {
         TITANIUM_DARK
@@ -63,21 +66,21 @@ fn orchestration_badge(st: &WorkstationState) -> String {
     match (&st.pair_mode, &st.executor_model, &st.reviewer_model) {
         (Some(mode), Some(exec), Some(rev)) => {
             let short = if mode == "antigravity_orchestrator" {
-                "ANTIGRAVITY"
+                "MULTI"
             } else {
                 "FUSION"
             };
-            format!("{short} {} <-> {} | L3:{rev}", st.model, exec)
+            format!("{short} {} <-> {} | rev:{rev}", st.model, exec)
         }
         (Some(mode), Some(exec), None) => {
             let short = if mode == "antigravity_orchestrator" {
-                "ANTIGRAVITY"
+                "MULTI"
             } else {
                 "FUSION"
             };
             format!("{short} {} <-> {}", st.model, exec)
         }
-        (_, _, Some(rev)) => format!("SINGLE {} | L3:{rev}", st.model),
+        (_, _, Some(rev)) => format!("SINGLE {} | rev:{rev}", st.model),
         _ => format!("SINGLE {}", st.model),
     }
 }
@@ -195,16 +198,16 @@ fn render_pro_transcript(f: &mut Frame, area: Rect, st: &WorkstationState, pal: 
     if st.transcript.is_empty() && st.stream.is_none() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  MEG // Aegis-Tier Harness (Pro Titanium UI)",
+            "  MEG",
             Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
-            "  Ring-0 sandboxed tools · Loop-2 verification · Single or Multi-Model Orchestration",
+            "  Code, plan, verify, and run single or multi-model workflows in your terminal.",
             Style::default().fg(pal.chrome_fg),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Quick commands: /ui classic · /ui cards · /pair antigravity_orchestrator <exec> [rev] · /help",
+            "  Quick commands: /ui · /theme · /model · /roles · /help",
             Style::default().fg(pal.chrome_fg),
         )));
     } else {
@@ -315,7 +318,7 @@ fn render_pro_rail(f: &mut Frame, area: Rect, st: &WorkstationState, pal: &Palet
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(pal.panel_border))
         .style(Style::default().bg(pal.chrome_bg).fg(pal.viewport_fg));
-    let mode_str = st.pair_mode.as_deref().unwrap_or("single_model");
+    let mode_str = match st.pair_mode.as_deref() { Some("antigravity_orchestrator") => "multi-model", Some("devin_fusion") => "dual-fusion", Some(other) => other, None => "single-model" };
     let exec_str = st.executor_model.as_deref().unwrap_or("-");
     let rev_str = st.reviewer_model.as_deref().unwrap_or("-");
     let orch_lines = vec![
@@ -328,11 +331,11 @@ fn render_pro_rail(f: &mut Frame, area: Rect, st: &WorkstationState, pal: &Palet
             Style::default().fg(pal.viewport_fg),
         )),
         Line::from(Span::styled(
-            fit_text(&format!("Exec: {exec_str}"), rw),
+            fit_text(&format!("Build: {exec_str}"), rw),
             Style::default().fg(pal.chrome_fg),
         )),
         Line::from(Span::styled(
-            fit_text(&format!("L3  : {rev_str}"), rw),
+            fit_text(&format!("Rev  : {rev_str}"), rw),
             Style::default().fg(pal.success),
         )),
         Line::from(Span::styled(
@@ -443,7 +446,7 @@ fn render_pro_composer(f: &mut Frame, area: Rect, st: &WorkstationState, pal: &P
     let inner = block.inner(area);
     let display = if st.input.is_empty() {
         Span::styled(
-            "Ask MEG or type /ui classic, /pair, /model, /help...",
+            "Ask MEG anything or type /ui, /theme, /roles, /help...",
             Style::default().fg(pal.chrome_fg),
         )
     } else {
@@ -467,7 +470,7 @@ fn render_pro_footer(f: &mut Frame, area: Rect, st: &WorkstationState, pal: &Pal
     let text = if !st.notice.is_empty() {
         format!(" {} ", sanitize_ansi(&st.notice))
     } else {
-        " Tab mode │ /ui classic|pro|cards │ /pair off|antigravity_orchestrator │ /theme │ Ctrl+C stop ".to_string()
+        " Tab mode │ /ui layout │ /theme colors │ /roles models │ Ctrl+C x2 exit ".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -540,6 +543,9 @@ pub fn draw_pro(f: &mut Frame, pal: &Palette, st: &WorkstationState) {
         render_picker_modal(f, area, picker, &eff);
     }
     if let Some(picker) = &st.settings_picker {
+        render_picker_modal(f, area, picker, &eff);
+    }
+    if let Some(picker) = &st.ui_picker {
         render_picker_modal(f, area, picker, &eff);
     }
     if let Some(picker) = &st.workspace_picker {

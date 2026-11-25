@@ -102,6 +102,8 @@ pub struct WorkstationState {
     pub notice: String,
     pub session_picker: Option<PickerState<session::SessionRecord>>,
     pub settings_picker: Option<PickerState<String>>,
+    pub ui_picker: Option<PickerState<String>>,
+    pub ui_mode_snapshot: Option<ui_config::UiMode>,
     pub queued_count: usize,
     pub project: String,
     pub model: String,
@@ -167,6 +169,8 @@ impl Default for WorkstationState {
             notice: String::new(),
             session_picker: None,
             settings_picker: None,
+            ui_picker: None,
+            ui_mode_snapshot: None,
             queued_count: 0,
             project: String::new(),
             model: meg_core::shim_client::default_model(),
@@ -633,6 +637,7 @@ impl WorkstationState {
             ActiveModal::ThemePicker(p) => {
                 if let Some(pal) = p.commit_selection() {
                     self.theme = pal;
+                    self.ui_config.theme_name = Some(pal.name.to_string());
                     self.transcript
                         .push(format!("[system] Theme switched to {}", pal.name));
                 }

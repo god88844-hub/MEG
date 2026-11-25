@@ -18,6 +18,7 @@ struct ActiveRun {
 }
 pub struct Controller {
     notice_deadline: Option<Instant>,
+    ctrl_c_deadline: Option<Instant>,
     service_runner: Option<Arc<ServiceRunner>>,
     service_tx: mpsc::Sender<RunnerMsg>,
     service_rx: Receiver<RunnerMsg>,
@@ -37,6 +38,7 @@ impl Controller {
         let (service_tx, service_rx) = mpsc::channel();
         Self {
             notice_deadline: None,
+            ctrl_c_deadline: None,
             service_runner: None,
             service_tx,
             service_rx,
@@ -967,6 +969,10 @@ impl Controller {
                     }
                 } else if let Some(picker) = &mut self.state.workspace_picker {
                     picker.paste(&text);
+                } else if let Some(picker) = &mut self.state.ui_picker {
+                    for c in text.chars().filter(|c| !c.is_control()) {
+                        picker.type_char(c);
+                    }
                 } else if let Some(picker) = &mut self.state.settings_picker {
                     for c in text.chars().filter(|c| !c.is_control()) {
                         picker.type_char(c);
@@ -1021,14 +1027,26 @@ impl Controller {
             || self.state.workspace_picker.is_some()
             || self.state.session_picker.is_some()
             || self.state.settings_picker.is_some()
+            || self.state.ui_picker.is_some()
     }
     fn close_overlay(&mut self) {
         self.state.palette.close();
         self.state.cancel_active_modal();
         self.state.session_picker = None;
         self.state.settings_picker = None;
+        let ui_snap = if self.state.ui_picker.take().is_some() { self.state.ui_mode_snapshot.take() } else { None };
+        if let Some(mode) = ui_snap { self.state.ui_mode = mode; }
         self.state.workspace_picker = None;
         self.state.provider_dialog = None;
+    }
+    fn preview_ui_picker(&mut self, picker: &PickerState<String>) {
+        if let Some(val) = picker.clone().commit_selection() {
+            match val.as_str() {
+                "pro" => self.state.ui_mode = crate::ui_config::UiMode::Pro,
+                "classic" => self.state.ui_mode = crate::ui_config::UiMode::Classic,
+                _ => {}
+            }
+        }
     }
     fn sync_palette(&mut self) {
         if self.palette_from_composer && self.state.palette.open {
@@ -1043,17 +1061,30 @@ impl Controller {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             if self.overlay_open() {
+                self.ctrl_c_deadline = None;
                 self.close_overlay();
             } else if self.state.busy {
+                self.ctrl_c_deadline = None;
                 self.cancel();
             } else if !self.state.input.is_empty() {
+                self.ctrl_c_deadline = None;
                 self.state.input.clear();
                 self.state.cursor_position = 0;
             } else {
-                self.state.should_quit = true;
+                let now = Instant::now();
+                if self.ctrl_c_deadline.is_some_and(|d| now <= d) {
+                    self.ctrl_c_deadline = None;
+                    self.state.should_quit = true;
+                } else {
+                    let deadline = now + Duration::from_millis(2500);
+                    self.ctrl_c_deadline = Some(deadline);
+                    self.notice_deadline = Some(deadline);
+                    self.state.notice = "Press Ctrl+C again to exit (or /exit)".into();
+                }
             }
             return Ok(());
         }
+        self.ctrl_c_deadline = None;
         if key.code == KeyCode::F(10)
             || (ctrl && key.code == KeyCode::Char('d') && self.state.input.is_empty())
         {
@@ -1206,6 +1237,37 @@ impl Controller {
                 crate::provider::ProviderAction::Close => {}
                 crate::provider::ProviderAction::None => self.state.provider_dialog = Some(dialog),
             }
+            return Ok(());
+        }
+        if self.state.ui_picker.is_some() {
+            let mut picker = self.state.ui_picker.take().unwrap();
+            match key.code {
+                KeyCode::Up => {
+                    picker.move_up();
+                    self.preview_ui_picker(&picker);
+                }
+                KeyCode::Down => {
+                    picker.move_down();
+                    self.preview_ui_picker(&picker);
+                }
+                KeyCode::Backspace => {
+                    picker.backspace();
+                    self.preview_ui_picker(&picker);
+                }
+                KeyCode::Enter => {
+                    self.state.ui_mode_snapshot = None;
+                    if let Some(action) = picker.commit_selection() {
+                        self.command(&format!("/ui {action}"))?;
+                        return Ok(());
+                    }
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    picker.type_char(c);
+                    self.preview_ui_picker(&picker);
+                }
+                _ => {}
+            }
+            self.state.ui_picker = Some(picker);
             return Ok(());
         }
         if self.state.settings_picker.is_some() {

@@ -471,7 +471,7 @@ impl Controller {
                 self.system(if self.state.plan_steps.is_empty() { "No task items.".into() } else { self.state.plan_steps.iter().enumerate().map(|(i,(d,s))| format!("{}. [{}] {s}",i+1,if *d {"x"} else {" "})).collect::<Vec<_>>().join("\n") });
             }
             Status | Doctor => self.system(format!("Session: {}\nWorkspace: {}\nModel: {} · effort {} · mode {}\nRun: {} · Endpoint last checked: {}\nSession store: {}",self.state.session_id,self.state.cwd,self.state.model,self.state.effort,self.state.mode.label(),if self.state.busy {"running"} else {"idle"},if self.state.online {"reachable"} else {"offline"},self.store.as_ref().map(|s|s.root.display().to_string()).unwrap_or_else(||"unavailable".into()))),
-            Theme => { if args.is_empty() { self.state.open_theme_picker(); } else { self.state.theme=get_palette(args).context("Unknown theme; use /theme")?; self.state.notice=format!("Theme: {args}"); } }
+            Theme => { if args.is_empty() { self.state.open_theme_picker(); } else { let pal = get_palette(args).context("Unknown theme; use /theme")?; self.state.theme = pal; self.state.ui_config.theme_name = Some(pal.name.to_string()); self.state.notice = format!("Theme: {}", pal.name); } }
             Mcp => {
                 self.invoke_service("mcp.command",serde_json::json!({"command":args}))?;
             }
@@ -485,7 +485,61 @@ impl Controller {
             }
             Ui => {
                 let sub = args.trim().to_ascii_lowercase();
-                if sub.is_empty() || sub == "status" || sub == "config" {
+                if sub.is_empty() {
+                    self.state.ui_mode_snapshot = Some(self.state.ui_mode);
+                    let choices = [
+                        ("Pro", "Modern layout with collapsible tool cards and right inspector", "pro"),
+                        ("Classic", "Original MEG dashboard layout", "classic"),
+                        ("Custom (ui.json)", "Create or load .meg/ui.json to customize colors & layout live", "custom"),
+                        ("Toggle Sidebar", "Show or hide the right-side inspector panel", "sidebar"),
+                        ("Toggle Tool Cards", "Switch compact vs expanded tool execution cards", "cards"),
+                        ("Reload ui.json", "Hot-reload ~/.meg/ui.json or .meg/ui.json", "reload"),
+                    ];
+                    self.state.ui_picker = Some(PickerState::new(
+                        "Switch UI (Live Preview)".into(),
+                        choices
+                            .into_iter()
+                            .map(|(label, detail, value)| PickerItem {
+                                label: label.into(),
+                                detail: detail.into(),
+                                meta: String::new(),
+                                value: value.into(),
+                            })
+                            .collect(),
+                    ));
+                } else if sub == "custom" {
+                    let ws_path = std::path::PathBuf::from(&self.state.cwd);
+                    let cfg_path = ui_config::UserUiConfig::workspace_path(&ws_path);
+                    let created = if !cfg_path.is_file() {
+                        let mut starter = self.state.ui_config.clone();
+                        starter.ui_mode = ui_config::UiMode::Pro;
+                        if starter.colors.accent.is_none() {
+                            starter.colors.accent = Some("#38BDF8".into());
+                        }
+                        if starter.colors.viewport_bg.is_none() {
+                            starter.colors.viewport_bg = Some("#0F131C".into());
+                        }
+                        starter.save_to(&cfg_path)?;
+                        true
+                    } else {
+                        false
+                    };
+                    let (cfg, _) = ui_config::UserUiConfig::load(Some(&ws_path));
+                    self.state.ui_mode = cfg.ui_mode;
+                    self.state.collapse_tool_cards = cfg.compact_tool_cards;
+                    if let Some(tname) = &cfg.theme_name {
+                        if let Some(p) = get_palette(tname) {
+                            self.state.theme = p;
+                        }
+                    }
+                    self.state.ui_config = cfg;
+                    let verb = if created { "Created" } else { "Loaded" };
+                    self.system(format!(
+                        "{verb} custom UI config: {}\nEdit hex colors, ui_mode, show_sidebar, or roles in that file, then run /ui reload to see your changes live.",
+                        cfg_path.display()
+                    ));
+                    self.state.notice = format!("Custom UI active ({})", cfg_path.display());
+                } else if sub == "status" || sub == "config" {
                     let ws_path = std::path::PathBuf::from(&self.state.cwd);
                     let global_p = ui_config::UserUiConfig::global_path()
                         .map(|p| p.display().to_string())
@@ -535,7 +589,7 @@ impl Controller {
                         None => "UI config reset to defaults (no ui.json found).".into(),
                     };
                 } else {
-                    bail!("Usage: /ui [classic|pro|cards|sidebar|reload|config]");
+                    bail!("Usage: /ui [classic|pro|custom|cards|sidebar|reload|config]");
                 }
             }
             Pair => {
