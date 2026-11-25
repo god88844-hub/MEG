@@ -744,6 +744,7 @@ pub struct RunRequest {
     pub pair_mode: Option<String>,
     pub executor_model: Option<String>,
     pub reviewer_model: Option<String>,
+    pub attachments: Vec<meg_core::shim_client::ImageAttachment>,
 }
 
 #[derive(Debug, Clone)]
@@ -779,6 +780,7 @@ impl WorkstationState {
             pair_mode: self.pair_mode.clone(),
             executor_model: self.executor_model.clone(),
             reviewer_model: self.reviewer_model.clone(),
+            attachments: Vec::new(),
         }
     }
 }

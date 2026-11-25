@@ -215,10 +215,10 @@ fn smart_paste_chips_live_ctx_and_compact_tool_cards() {
     let img = ws.join("sample.png");
     std::fs::write(&img, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
 
-    let captured_goals = Arc::new(Mutex::new(Vec::<String>::new()));
+    let captured_goals = Arc::new(Mutex::new(Vec::<(String, usize)>::new()));
     let cap = captured_goals.clone();
     let runner: Arc<meg_tui::GoalRunner> = Arc::new(move |req, tx| {
-        cap.lock().unwrap().push(req.goal);
+        cap.lock().unwrap().push((req.goal, req.attachments.len()));
         tx.send(meg_tui::RunnerMsg::Usage {
             input: 32_000,
             output: 6_400,
@@ -268,8 +268,9 @@ fn smart_paste_chips_live_ctx_and_compact_tool_cards() {
         assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
-    let goal = captured_goals.lock().unwrap()[0].clone();
-    assert!(goal.contains("[[MEG_IMAGE:"), "Expected multimodal marker: {goal}");
+    let (goal, att_count) = captured_goals.lock().unwrap()[0].clone();
+    assert_eq!(att_count, 1, "Expected 1 snapshotted image attachment");
+    assert!(!goal.contains("[[MEG_IMAGE:"), "Raw path markers must never enter prompt text: {goal}");
     assert!(goal.contains("line-8"), "Expected expanded paste text: {goal}");
     assert!(
         c.state.context_percent >= 25,

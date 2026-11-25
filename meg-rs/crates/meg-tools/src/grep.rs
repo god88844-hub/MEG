@@ -67,6 +67,13 @@ pub fn grep_files_cancellable(
     let mut match_count = 0usize;
     let mut truncated = false;
 
+    if crate::security_guards::is_blocked_env_path(&search_root) {
+        anyhow::bail!(
+            "SECRET_AIRLOCK: grep_files of '{}' is blocked (.env* files cannot enter model context)",
+            search_root.display()
+        );
+    }
+
     for entry in walkdir::WalkDir::new(&search_root)
         .sort_by_file_name()
         .into_iter()
@@ -74,7 +81,7 @@ pub fn grep_files_cancellable(
         .filter_map(|e| e.ok())
     {
         ensure!(!cancel.load(Ordering::SeqCst), "Run cancelled");
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_file() || crate::security_guards::is_blocked_env_path(entry.path()) {
             continue;
         }
         let Ok(meta) = entry.metadata() else {
@@ -133,7 +140,7 @@ pub fn grep_files_cancellable(
                 }
             }
             let sep = if hit_set.contains(&idx) { ':' } else { '-' };
-            let snippet = clip_line(lines[idx]);
+            let snippet = crate::security_guards::scrub_sal_observation(&clip_line(lines[idx]));
             out_lines.push(format!("{rel_str}{sep}{}{sep}{snippet}", idx + 1));
             prev = Some(idx);
         }
@@ -235,5 +242,34 @@ mod tests {
             .contains("cancelled"));
         assert!(grep_files(&ws, &json!({"pattern": "x", "path": "../outside"})).is_err());
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn adversarial_grep_blocks_dotenv_and_scrubs_secrets() {
+        let dir = std::env::temp_dir().join(format!("meg-grep-sec-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "OPENAI_API_KEY=sk-proj-secret1234567890abcdef12345678\n").unwrap();
+        std::fs::write(dir.join(".env.local"), "DB_PASS=super_secret_env_local_value\n").unwrap();
+        std::fs::write(
+            dir.join("app.rs"),
+            "const TOKEN: &str = \"ghp_1234567890abcdef1234567890abcdef1234\";\n",
+        )
+        .unwrap();
+
+        // 1. Direct grep targeting .env must be rejected
+        let direct_err = grep_files(&dir, &serde_json::json!({"pattern": "OPENAI", "path": ".env"}));
+        assert!(direct_err.is_err());
+        assert!(direct_err.unwrap_err().to_string().contains("SECRET_AIRLOCK"));
+
+        // 2. Workspace-wide grep must never return .env or .env.local lines
+        let env_scan = grep_files(&dir, &serde_json::json!({"pattern": "OPENAI|DB_PASS"})).unwrap();
+        assert!(!env_scan.contains("sk-proj-"));
+        assert!(!env_scan.contains("super_secret_env_local_value"));
+
+        // 3. Hardcoded secrets in regular source files must be SAL-scrubbed
+        let src_scan = grep_files(&dir, &serde_json::json!({"pattern": "TOKEN"})).unwrap();
+        assert!(src_scan.contains("app.rs:1:"));
+        assert!(!src_scan.contains("ghp_1234567890abcdef1234567890abcdef1234"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

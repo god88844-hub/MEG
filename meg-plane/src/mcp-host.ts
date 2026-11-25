@@ -1,3 +1,13 @@
+export function sanitizeMcpAlias(server: string, tool: string): string {
+  const clean = (s: string) => s.replace(/[^a-zA-Z0-9_-]/g, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "") || "x";
+  const raw = `mcp__${clean(server)}__${clean(tool)}`;
+  if (raw.length <= 64) return raw;
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < raw.length; i++) {
+    h = Math.imul(h ^ raw.charCodeAt(i), 16777619) >>> 0;
+  }
+  return `${raw.slice(0, 55)}_${h.toString(16).padStart(8, "0")}`;
+}
 // Layer 2 owns MCP transports and their complete lifecycle.
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -41,7 +51,7 @@ export class McpHost {
       await client.connect(transport,{timeout:15_000,signal:abort.signal});
       let cursor:string|undefined;const tools:McpTool[]=[];
       do{const page=await client.listTools(cursor?{cursor}:undefined,{timeout:15_000,signal:abort.signal});
-        for(const tool of page.tools)tools.push({server:name,name:tool.name,alias:`mcp:${name}:${tool.name}`,description:tool.description,inputSchema:tool.inputSchema,readOnly:tool.annotations?.readOnlyHint===true});
+        for(const tool of page.tools)tools.push({server:name,name:tool.name,alias:sanitizeMcpAlias(name,tool.name),description:tool.description,inputSchema:tool.inputSchema,readOnly:tool.annotations?.readOnlyHint===true});
         if(tools.length>500)throw new Error("MCP server advertises too many tools");cursor=page.nextCursor;
       }while(cursor);
       entry.tools=tools;this.errors.delete(name);return tools;

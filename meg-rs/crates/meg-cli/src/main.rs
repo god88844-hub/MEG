@@ -107,7 +107,7 @@ impl LoopEngine for ShimEngine {
         let cancel = self.cancel.clone();
         let name = tool.to_string();
         let args = args.clone();
-        let connected = tool.starts_with("mcp:") || matches!(tool, "delegate" | "read_skill");
+        let connected = tool.starts_with("mcp__") || tool.starts_with("mcp:") || matches!(tool, "delegate" | "read_skill");
         let plane = self.plane.clone();
         let worker = self.worker.clone();
         let read_only = self.mode == meg_tui::Mode::Plan;
@@ -171,7 +171,7 @@ impl LoopEngine for ShimEngine {
                 }
             }
             let checkpoint = if matches!(name.as_str(), "write_file" | "edit_file") {
-                let _ = meg_tools::journal::side_git_snapshot(&workspace, &format!("pre-{name}"));
+                if let Err(e) = meg_tools::journal::side_git_snapshot(&workspace, &format!("pre-{name}")) { if events.is_none() { eprintln!("[meg] warning: pre-edit shadow snapshot skipped: {e}"); } }
                 Some(meg_tools::journal::FileCheckpoint::capture(
                     &workspace, &args,
                 )?)
@@ -181,8 +181,8 @@ impl LoopEngine for ShimEngine {
             let result = registry.execute(&name, &args);
             if result.ok {
                 if let Some(checkpoint) = checkpoint {
-                    checkpoint.commit(&workspace).map_err(|e| {
-                        anyhow::anyhow!("File changed but undo journal could not be saved: {e}")
+                    checkpoint.commit_or_rollback(&workspace).map_err(|e| {
+                        anyhow::anyhow!("Undo journal could not be saved; file edit was rolled back: {e}")
                     })?;
                     let _ = aepn.lock().unwrap().on_code_edit();
                     if let Some(raw_path) = args["path"].as_str() {
@@ -1156,6 +1156,7 @@ async fn run_request_detailed(
         workspace: Some(request.workspace.clone()),
         finish_hook,
         native_tools: !shim.tools.is_empty(),
+        user_attachments: request.attachments.clone(),
         ..meg_core::LoopConfig::default()
     };
     let receipt_workspace = request.workspace.clone();
@@ -1451,8 +1452,9 @@ fn build_tool_specs(
                     } else {
                         serde_json::json!({ "type": "object", "properties": {} })
                     };
+                    let safe_name = sanitize_mcp_tool_name(alias);
                     specs.push(meg_core::ToolSpec {
-                        name: alias.to_string(),
+                        name: safe_name,
                         description: t["description"].as_str().unwrap_or(alias).to_string(),
                         parameters: params,
                     });
@@ -1461,6 +1463,38 @@ fn build_tool_specs(
         }
     }
     specs
+}
+
+fn sanitize_mcp_tool_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(64));
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+        } else if ch == ':' {
+            out.push_str("__");
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        return "mcp_tool".into();
+    }
+    if out.len() <= 64 {
+        return out;
+    }
+    let mut h: u32 = 2166136261;
+    for b in raw.as_bytes() {
+        h = (h ^ (*b as u32)).wrapping_mul(16777619);
+    }
+    format!("{}_{h:08x}", &out[..55])
+}
+
+fn parse_bridge_mode(raw: &str) -> Result<meg_tui::Mode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "plan" | "readonly" => Ok(meg_tui::Mode::Plan),
+        "build" | "act" => Ok(meg_tui::Mode::Build),
+        other => anyhow::bail!("Invalid mode '{other}'; expected 'plan' or 'build'"),
+    }
 }
 
 fn forward_agent_event(tx: &Option<Sender<RunnerMsg>>, value: serde_json::Value) {
@@ -1986,7 +2020,7 @@ async fn run_ui_bridge(workspace: &std::path::Path) -> Result<()> {
     let mut executor_model = ui_cfg.executor_model.clone().or(ui_cfg.roles.builder.clone());
     let mut reviewer_model = ui_cfg.reviewer_model.clone().or(ui_cfg.roles.reviewer.clone());
     let mut researcher_model = ui_cfg.roles.researcher.clone();
-    let mut mode = meg_tui::Mode::Build;
+    let mut mode = meg_tui::Mode::Plan;
 
     emit(serde_json::json!({
         "event": "ready",
@@ -2041,14 +2075,15 @@ async fn run_ui_bridge(workspace: &std::path::Path) -> Result<()> {
                 }));
             }
             "set_mode" => {
-                if let Some(m) = req["mode"].as_str() {
-                    mode = if m.eq_ignore_ascii_case("plan") {
-                        meg_tui::Mode::Plan
-                    } else {
-                        meg_tui::Mode::Build
-                    };
+                match req["mode"].as_str().ok_or_else(|| anyhow::anyhow!("Missing 'mode'; expected 'plan' or 'build'")).and_then(parse_bridge_mode) {
+                    Ok(parsed) => {
+                        mode = parsed;
+                        emit(serde_json::json!({"event": "mode_updated", "mode": mode.label()}));
+                    }
+                    Err(e) => {
+                        emit(serde_json::json!({"event": "error", "message": e.to_string()}));
+                    }
                 }
-                emit(serde_json::json!({"event": "mode_updated", "mode": mode.label()}));
             }
             "set_roles" => {
                 if let Some(p) = req["planner"].as_str().filter(|s| !s.is_empty()) {
@@ -2128,6 +2163,7 @@ async fn run_ui_bridge(workspace: &std::path::Path) -> Result<()> {
                     pair_mode: pair_mode.clone(),
                     executor_model: executor_model.clone(),
                     reviewer_model: reviewer_model.clone(),
+                    attachments: Vec::new(),
                 };
                 let res = run_request_detailed(
                     run_req,
@@ -2394,6 +2430,23 @@ mod tests {
         assert!(parse_run_options(&bad_steps).is_err());
     }
 
+    #[test]
+    fn adversarial_mcp_names_and_bridge_mode_fail_closed() {
+        let safe = sanitize_mcp_tool_name("mcp:github.server:create/issue");
+        assert!(!safe.contains(':'));
+        assert!(safe.len() <= 64);
+        assert!(safe.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+
+        let long_safe = sanitize_mcp_tool_name(&format!("mcp:server:{}", "x".repeat(120)));
+        assert!(long_safe.len() <= 64);
+        assert!(long_safe.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+
+        assert_eq!(parse_bridge_mode("plan").unwrap(), meg_tui::Mode::Plan);
+        assert_eq!(parse_bridge_mode("build").unwrap(), meg_tui::Mode::Build);
+        assert_eq!(parse_bridge_mode("act").unwrap(), meg_tui::Mode::Build);
+        assert!(parse_bridge_mode("buld").is_err(), "Typo mode must fail closed");
+        assert!(parse_bridge_mode("").is_err(), "Empty mode must fail closed");
+    }
     #[test]
     fn test_parse_cli_args_unknown_command() {
         let unknown = vec!["meg".to_string(), "random-cmd".to_string()];
@@ -2796,6 +2849,7 @@ mod native_integration {
             pair_mode: None,
             executor_model: None,
             reviewer_model: None,
+            attachments: Vec::new(),
         };
         let (_outcomes, ans, telemetry) = run_request_detailed(
             req,
@@ -2869,6 +2923,7 @@ mod native_integration {
             pair_mode: None,
             executor_model: None,
             reviewer_model: None,
+            attachments: Vec::new(),
         };
         let err = run_request_detailed(
             req,
@@ -2943,6 +2998,7 @@ mod native_integration {
             pair_mode: None,
             executor_model: None,
             reviewer_model: None,
+            attachments: Vec::new(),
         };
         let (outcomes, ans) = run_request_with_options(
             req,
@@ -3009,6 +3065,7 @@ mod native_integration {
             pair_mode: None,
             executor_model: None,
             reviewer_model: None,
+            attachments: Vec::new(),
         };
         let err = run_request(req, None).await.unwrap_err();
         assert!(err.to_string().contains("SEALED_MANIFEST_VIOLATION"), "{err}");

@@ -86,6 +86,25 @@ impl FileCheckpoint {
         }
         save_entries_atomic(&journal, &entries)
     }
+
+    /// Commit the undo entry; if saving the journal fails, restore the file to its
+    /// pre-edit state so a mutation never lands without a matching undo record.
+    pub fn commit_or_rollback(self, workspace: &Path) -> Result<()> {
+        let path = self.path.clone();
+        let before = self.before.clone();
+        if let Err(err) = self.commit(workspace) {
+            match before {
+                Some(bytes) => {
+                    let _ = std::fs::write(&path, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
 }
 
 pub fn depth(workspace: &Path) -> usize {
@@ -201,10 +220,22 @@ pub fn side_git_snapshot(workspace: &Path, label: &str) -> Result<String> {
     run_side_git(
         &git_dir,
         workspace,
-        &["add", "-A", "--", ".", ":!.git", ":!.meg"],
+        &["add", "-A", "--", ".", ":!.git", ":!.meg", ":!.loop", ":!target", ":!node_modules", ":!.env", ":!.env.*"],
     )?;
     let tree = run_side_git(&git_dir, workspace, &["write-tree"])?;
     let parent = run_side_git(&git_dir, workspace, &["rev-parse", "--verify", "HEAD"]).ok();
+    if let Some(ref p) = parent {
+        if let Ok(prev_tree) = run_side_git(&git_dir, workspace, &["rev-parse", "HEAD^{tree}"]) {
+            if prev_tree == tree {
+                return Ok(p.clone());
+            }
+        }
+    }
+    let commit_count: usize = run_side_git(&git_dir, workspace, &["rev-list", "--count", "HEAD"])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let parent = if commit_count >= 20 { None } else { parent };
     let mut cmd = Command::new("git");
     cmd.env("GIT_DIR", &git_dir)
         .env("GIT_WORK_TREE", workspace)
@@ -426,5 +457,25 @@ mod tests {
         std::env::remove_var("MEG_SNAPSHOTS_DIR");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&snap_root);
+    }
+
+    #[test]
+    fn adversarial_journal_failure_rolls_back_file_edit() {
+        let dir = std::env::temp_dir().join(format!("meg-journal-rb-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("code.rs");
+        std::fs::write(&file, "fn original() {}\n").unwrap();
+        let cp = FileCheckpoint::capture(&dir, &json!({"path": "code.rs"})).unwrap();
+        // Mutate the file, then sabotage the journal path with a directory so save fails
+        std::fs::write(&file, "fn mutated() {}\n").unwrap();
+        std::fs::create_dir_all(journal_path(&dir)).unwrap();
+        let err = cp.commit_or_rollback(&dir);
+        assert!(err.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "fn original() {}\n",
+            "Failed journal commit must roll back the file mutation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

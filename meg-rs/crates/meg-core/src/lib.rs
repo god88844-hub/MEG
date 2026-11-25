@@ -288,6 +288,7 @@ pub struct LoopConfig {
     pub doom_loop_threshold: usize,
     pub finish_hook: Option<crate::finish_hook::FinishHookConfig>,
     pub native_tools: bool,
+    pub user_attachments: Vec<crate::shim_client::ImageAttachment>,
 }
 
 impl Default for LoopConfig {
@@ -300,6 +301,7 @@ impl Default for LoopConfig {
             doom_loop_threshold: 3,
             finish_hook: None,
             native_tools: false,
+            user_attachments: Vec::new(),
         }
     }
 }
@@ -373,13 +375,18 @@ pub async fn run_loop_with_config(
     messages.extend(
         history
             .iter()
-            .filter(|m| m.role == "user" || m.role == "assistant")
+            .filter(|m| m.role == "user" || m.role == "assistant" || m.role == crate::shim_client::ROLE_USER_MULTIMODAL)
             .cloned(),
     );
     let goal_msg_idx = messages.len();
-    messages.push(ChatMessage {
-        role: "user".into(),
-        content: format!("{recon}GOAL: {goal}"),
+    let goal_body = format!("{recon}GOAL: {goal}");
+    messages.push(if config.user_attachments.is_empty() {
+        ChatMessage {
+            role: "user".into(),
+            content: goal_body,
+        }
+    } else {
+        crate::shim_client::encode_user_multimodal(&goal_body, &config.user_attachments)
     });
 
     let mut outcomes = Vec::new();
