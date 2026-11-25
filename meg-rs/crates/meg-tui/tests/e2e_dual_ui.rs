@@ -92,6 +92,7 @@ fn custom_user_ui_json_overrides_palette_and_hot_reloads() {
         pair_mode: Some("devin_fusion".into()),
         executor_model: Some("fast-coder".into()),
         reviewer_model: Some("strict-l3".into()),
+        roles: Default::default(),
         colors: PaletteOverrides {
             accent: Some("#FF6B00".into()),
             viewport_bg: Some("#101018".into()),

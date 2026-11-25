@@ -544,7 +544,7 @@ fn load_recent() -> Vec<(String, i64)> {
             }
         }
     }
-    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out.sort_by_key(|a| std::cmp::Reverse(a.1));
     let mut seen = std::collections::HashSet::new();
     out = out
         .into_iter()
@@ -582,7 +582,7 @@ fn load_recent_meg() -> Vec<(String, i64)> {
                         .collect()
                 })
                 .unwrap_or_default();
-            out.sort_by(|a, b| b.1.cmp(&a.1));
+            out.sort_by_key(|a| std::cmp::Reverse(a.1));
             out.truncate(MAX_RECENT);
             if !out.is_empty() {
                 return out;
@@ -610,7 +610,7 @@ fn save_recent(ws: &Path) {
     remember(&dir, ws, load_recent());
 }
 fn remember(dir: &Path, ws: &Path, mut recent: Vec<(String, i64)>) {
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::create_dir_all(dir);
     let path_str = normalized_directory(ws)
         .map(|p| crate::friendly_path(&p))
         .unwrap_or_else(|| crate::friendly_path(ws));

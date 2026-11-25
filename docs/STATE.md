@@ -1,10 +1,9 @@
 # MEG Build State
 
 - **Plan Version:** v1.2 (Micro-Tasked for Single-Builder Agent)
-- **Active Phase:** Phase 8 (FINAL PHASE) -- Dual-TUI Excellence Upgrade (`/ui classic` preserved + `/ui pro` added) -- READY FOR USER CALL
-- **Last Completed TODO:** `Phase 7.8` (2026 RSI Safeguards in `meg-eval/`: Process-vs-Content Triage, Equal-Compute Attribution + n>=64 Held-Out Winner's Curse Gate, 10-Anchor Verifier Calibration & Poisoned-Benchmark TLS Audit)
-- **Next TODO:** `P8-01` (Dual-TUI `/ui` Switcher + CSI 2026 Differential Renderer & Titanium Theme)
-- **Frozen Path:** `meg-rs/crates/meg-tui/` (awaiting explicit user call to unfreeze and start Phase 8)
+- **Status:** ALL PHASES COMPLETE (Phases 0 through 8 + 7.5-7.8 Aegis & 2026 RSI Upgrades)
+- **Last Completed TODO:** `Phase 8` (`P8-01` through `P8-04` -- Dual-TUI `/ui classic` + `/ui pro`, Custom `~/.meg/ui.json`, Per-Role Model Freedom `/roles`, Open `meg ui-bridge` NDJSON Protocol, Zero-Warning Workspace & Release `meg.exe`)
+- **Zero-Warning Gate:** `cargo clippy --locked --no-deps --workspace -- -D warnings` (ALL 5 crates: 0 warnings)
 
 ## Completed Phases
 - [x] **Phase 0** -- GitHub Planning Lock & Repo Handshake (`P0-01` through `P0-04`)
@@ -15,11 +14,9 @@
 - [x] **Phase 5** -- Multi-Agent Graphs, Goal/Motion Engineering & GitHub/CI (`P5-01` through `P5-05`)
 - [x] **Phase 6** -- All 29 Software Domains, Multimodal Media & Daily Usage (`P6-01` through `P6-07`)
 - [x] **Phase 7** -- Offline Evaluation, Benchmarking & Controlled Evolution (`P7-01` through `P7-05`)
-- [x] **Phase 7.5** -- Live Runtime Wiring & Exact Math (`meg-tools`, `meg-core`, `meg-cli`, `meg-plane`, `meg-eval`)
-- [x] **Phase 7.6** -- Zero-Warning Ring-0 (`-D warnings`), Live `SealedManifest`/`ReadOnlyLock`/`AepnSupervisor`, Turn-0 Env, 4-Turn Tail Goal Anchor & 5-Task Suite
-- [x] **Phase 7.7** -- True End-to-End Aegis-Tier Runtime Completion (Live Anti-Stub/Verify Gate, Live `meg loop`, Live Dual-Model Pairing, Cold L3 Reviewer, 8-Task `meg.exe` Suite & `run_live_bench.py`)
-- [x] **Phase 7.8** -- 2026 RSI Evolution Safeguards (`meg-eval/rsi_guards.py` wired into `evolve.py` & `ablate.py`):
-  - Process-vs-Content failure cohort triage (Tian et al.)
-  - Equal-compute Harness-Delta Attribution + `n >= 64` untouched held-out Winner's Curse gate (Ding et al., Hu & Tang)
-  - Verifier-of-the-Verifier 10-anchor human-checked calibration blocking rubber-stamp graders (Zhang et al.)
-  - Poisoned-benchmark & candidate-diff TLS/cert/hook-bypass security audit (Roesner & Kohno)
+- [x] **Phases 7.5-7.8** -- Live End-to-End Aegis Wiring, Live `meg loop`, Dual-Model Pairing, Cold L3 Reviewer, 8-Task `meg.exe` Suite, `run_live_bench.py` & 2026 RSI Guards
+- [x] **Phase 8** -- Dual-TUI Excellence & Open UI Freedom:
+  - `/ui classic` (preserved) + `/ui pro` (Titanium Dark, CSI 2026, collapsible ToolCards, Orchestration/Plan/Jobs rail)
+  - User-editable `~/.meg/ui.json` & `.meg/ui.json` (`/ui reload`)
+  - Per-role model assignment (`/roles planner|builder|reviewer|researcher`) + `/pair`
+  - Open Bring-Your-Own-TUI NDJSON protocol (`meg ui-bridge`) + `examples/custom_tui_starter.py` + `docs/CUSTOM_UI_PROTOCOL.md`

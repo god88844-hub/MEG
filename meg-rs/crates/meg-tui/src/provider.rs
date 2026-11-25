@@ -289,11 +289,9 @@ impl ProviderDialog {
                 };
                 self.new_preset(id);
             }
-            KeyCode::Char(ch) if !ctrl => {
-                if self.query.len() < 256 {
-                    self.query.push(ch);
-                    self.selected = 0;
-                }
+            KeyCode::Char(ch) if !ctrl && self.query.len() < 256 => {
+                self.query.push(ch);
+                self.selected = 0;
             }
             _ => {}
         }

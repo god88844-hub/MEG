@@ -123,6 +123,11 @@ fn every_advertised_command_reaches_its_implementation_and_local_commands_stay_l
         "/pair status",
         "/pair antigravity_orchestrator exec-model rev-model",
         "/pair off",
+        "/roles status",
+        "/roles builder exec-model",
+        "/roles reviewer l3-model",
+        "/roles researcher fast-model",
+        "/roles clear",
     ] {
         run(&mut c, &mut seen, command);
     }

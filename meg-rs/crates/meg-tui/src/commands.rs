@@ -279,6 +279,12 @@ command_table![
         true,
         false
     ),    (
+        Roles,
+        "/roles",
+        "Assign models per role: planner, builder, reviewer, researcher",
+        true,
+        false
+    ),    (
         Exit,
         "/exit",
         "Save the session, stop owned work and exit",
@@ -403,8 +409,7 @@ impl Controller {
                 else { bail!("Effort must be low, medium, high or max"); }
             }
             Provider => {
-                if args.is_empty(){self.open_provider();}
-                else if args=="add"{self.open_provider();}
+                if args.is_empty() || args == "add" { self.open_provider(); }
                 else if args=="add custom"{self.open_provider();self.state.provider_dialog.as_mut().unwrap().new_connection(meg_core::providers::ProviderKind::OpenAi);}
                 else if let Some(preset)=args.strip_prefix("add "){self.open_provider();anyhow::ensure!(self.state.provider_dialog.as_mut().unwrap().new_preset(preset),"Unknown preset. Open /provider to search services, or use /provider add custom");}
                 else if let Some(name)=args.strip_prefix("use "){let profile=self.state.providers.iter().find(|p|p.id==name||p.name.eq_ignore_ascii_case(name)).context("Unknown provider")?.clone();self.use_provider(profile)?;}
@@ -564,6 +569,54 @@ impl Controller {
                     );
                 } else {
                     bail!("Usage: /pair [off|status|devin_fusion <exec> [rev]|antigravity_orchestrator <exec> [rev]]");
+                }
+            }            Roles => {
+                let parts: Vec<&str> = args.split_whitespace().collect();
+                if parts.is_empty() || parts[0].eq_ignore_ascii_case("status") {
+                    let r = &self.state.ui_config.roles;
+                    self.system(format!(
+                        "Model Roles:\n  planner   : {}\n  builder   : {}\n  reviewer  : {}\n  researcher: {}",
+                        r.planner.as_deref().unwrap_or(&self.state.model),
+                        r.builder.as_deref().or(self.state.executor_model.as_deref()).unwrap_or("(same as planner)"),
+                        r.reviewer.as_deref().or(self.state.reviewer_model.as_deref()).unwrap_or("(none)"),
+                        r.researcher.as_deref().unwrap_or("(same as planner)"),
+                    ));
+                } else if matches!(parts[0].to_ascii_lowercase().as_str(), "clear" | "off" | "reset") {
+                    self.state.ui_config.roles = ui_config::RoleModels::default();
+                    self.state.pair_mode = None;
+                    self.state.executor_model = None;
+                    self.state.reviewer_model = None;
+                    self.state.notice = "Roles cleared (single-model mode).".into();
+                } else if parts.len() >= 2 {
+                    let role = parts[0].to_ascii_lowercase();
+                    let model_id = parts[1].to_string();
+                    match role.as_str() {
+                        "planner" => {
+                            self.state.ui_config.roles.planner = Some(model_id.clone());
+                            self.state.select_model(model_id.clone());
+                            self.state.notice = format!("Role planner = {model_id}");
+                        }
+                        "builder" | "executor" => {
+                            self.state.ui_config.roles.builder = Some(model_id.clone());
+                            self.state.executor_model = Some(model_id.clone());
+                            if self.state.pair_mode.is_none() {
+                                self.state.pair_mode = Some("antigravity_orchestrator".into());
+                            }
+                            self.state.notice = format!("Role builder = {model_id}");
+                        }
+                        "reviewer" | "critic" => {
+                            self.state.ui_config.roles.reviewer = Some(model_id.clone());
+                            self.state.reviewer_model = Some(model_id.clone());
+                            self.state.notice = format!("Role reviewer = {model_id}");
+                        }
+                        "researcher" => {
+                            self.state.ui_config.roles.researcher = Some(model_id.clone());
+                            self.state.notice = format!("Role researcher = {model_id}");
+                        }
+                        _ => bail!("Unknown role '{role}'. Use: planner, builder, reviewer, researcher, status, clear"),
+                    }
+                } else {
+                    bail!("Usage: /roles [status|clear|planner <model>|builder <model>|reviewer <model>|researcher <model>]");
                 }
             }            Exit => { self.cancel(); self.state.should_quit=true; }
         }

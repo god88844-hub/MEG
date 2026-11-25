@@ -1512,10 +1512,8 @@ impl Controller {
                     self.state.cycle_mode();
                 }
             }
-            KeyCode::BackTab => {
-                if !self.state.busy {
-                    self.state.cycle_mode_reverse();
-                }
+            KeyCode::BackTab if !self.state.busy => {
+                self.state.cycle_mode_reverse();
             }
             _ => {}
         }

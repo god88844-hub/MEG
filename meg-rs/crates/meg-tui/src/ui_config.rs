@@ -111,6 +111,17 @@ impl PaletteOverrides {
     }
 }
 
+/// Per-role model assignment (Antigravity-style): assign any model to any job,
+/// or leave all None for single-model mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoleModels {
+    pub planner: Option<String>,
+    pub builder: Option<String>,
+    pub reviewer: Option<String>,
+    pub researcher: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -130,6 +141,7 @@ pub struct UserUiConfig {
     pub pair_mode: Option<String>,
     pub executor_model: Option<String>,
     pub reviewer_model: Option<String>,
+    pub roles: RoleModels,
     pub colors: PaletteOverrides,
 }
 
@@ -144,6 +156,7 @@ impl Default for UserUiConfig {
             pair_mode: None,
             executor_model: None,
             reviewer_model: None,
+            roles: RoleModels::default(),
             colors: PaletteOverrides::default(),
         }
     }
