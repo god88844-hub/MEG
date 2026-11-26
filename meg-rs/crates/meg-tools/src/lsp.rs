@@ -627,4 +627,66 @@ while True:
 
         let _ = std::fs::remove_dir_all(&ws);
     }
+
+    #[test]
+    fn write_file_and_edit_file_return_live_lsp_diagnostics() {
+        let ws = std::env::temp_dir().join(format!("meg-lsp-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".meg")).unwrap();
+
+        let mock_py = ws.join("mock_lsp_e2e.py");
+        std::fs::write(
+            &mock_py,
+            r#"import json, sys
+def read_msg():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line: return None
+        s = line.decode("utf-8", errors="ignore").strip()
+        if not s: break
+        if s.lower().startswith("content-length:"): length = int(s.split(":", 1)[1].strip())
+    return None if length is None else json.loads(sys.stdin.buffer.read(length).decode("utf-8"))
+def send_msg(obj):
+    raw = json.dumps(obj).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw)
+    sys.stdout.buffer.flush()
+while True:
+    msg = read_msg()
+    if msg is None: break
+    m = msg.get("method")
+    if m == "initialize":
+        send_msg({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {}}})
+    elif m in ("textDocument/didOpen", "textDocument/didChange"):
+        p = msg["params"]
+        uri = p["textDocument"]["uri"]
+        txt = p["textDocument"]["text"] if m == "textDocument/didOpen" else p["contentChanges"][0]["text"]
+        diags = [
+            {"range": {"start": {"line": i, "character": 0}, "end": {"line": i, "character": 8}}, "severity": 1, "message": "type mismatch ERR_TOKEN"}
+            for i, l in enumerate(txt.splitlines()) if "ERR_TOKEN" in l
+        ]
+        send_msg({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": uri, "diagnostics": diags}})
+"#,
+        )
+        .unwrap();
+
+        let py_bin = if cfg!(windows) { "python" } else { "python3" };
+        std::fs::write(
+            ws.join(".meg").join("lsp.json"),
+            serde_json::to_string(&json!({ "toy2": [py_bin, mock_py.display().to_string()] })).unwrap(),
+        )
+        .unwrap();
+
+        let reg = crate::ToolRegistry::with_core_tools(&ws);
+        let r1 = reg.execute("write_file", &json!({ "path": "app.toy2", "content": "let x = ERR_TOKEN;\n" }));
+        assert!(r1.ok, "{}", r1.output);
+        assert!(r1.output.contains("[LSP diagnostics ("), "{}", r1.output);
+        assert!(r1.output.contains("type mismatch ERR_TOKEN"), "{}", r1.output);
+
+        let r2 = reg.execute("edit_file", &json!({ "path": "app.toy2", "old_str": "ERR_TOKEN", "new_str": "42" }));
+        assert!(r2.ok, "{}", r2.output);
+        assert!(!r2.output.contains("[LSP diagnostics"), "diagnostics should clear after fix: {}", r2.output);
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }

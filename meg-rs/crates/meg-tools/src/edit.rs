@@ -300,7 +300,11 @@ pub fn apply_hashline_patch(workspace: &Path, args: &Value) -> Result<String> {
         bail!("HOT_FRAME_LINTER_BLOCKED:\n{}", hot_violations.join("\n"));
     }
     write_atomic(&full, &encode_with_bom(&final_text, enc))?;
-    Ok(format!("hashline-patched {path} ({op_count} edit(s))"))
+    let mut msg = format!("hashline-patched {path} ({op_count} edit(s))");
+    if let Some(diags) = crate::lsp::collect_write_through_diagnostics(workspace, &full, &final_text) {
+        msg.push_str(&diags);
+    }
+    Ok(msg)
 }
 
 /// Edit a file: dispatches to hashline patch when `edits` is present, otherwise
@@ -382,12 +386,16 @@ pub fn str_replace(workspace: &Path, args: &Value) -> Result<String> {
         bail!("HOT_FRAME_LINTER_BLOCKED:\n{}", hot_violations.join("\n"));
     }
     write_atomic(&full, &encode_with_bom(&updated, enc))?;
-    Ok(format!(
+    let mut msg = format!(
         "edited {} ({} replacement{})",
         path,
         if replace_all { count } else { 1 },
         if replace_all && count > 1 { "s" } else { "" }
-    ))
+    );
+    if let Some(diags) = crate::lsp::collect_write_through_diagnostics(workspace, &full, &updated) {
+        msg.push_str(&diags);
+    }
+    Ok(msg)
 }
 
 #[cfg(test)]
