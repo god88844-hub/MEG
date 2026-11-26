@@ -257,3 +257,22 @@ fn start_plane_defaults_to_pure_rust_native_services_without_bun() {
     );
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+#[test]
+fn nested_agents_and_claude_guidance_discovered_in_order() {
+    let ws = std::env::temp_dir().join(format!("meg-b05-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(ws.join("sub/pkg")).unwrap();
+    std::fs::create_dir_all(ws.join("node_modules/ignored")).unwrap();
+    std::fs::write(ws.join("AGENTS.md"), "ROOT_RULE").unwrap();
+    std::fs::write(ws.join("sub/CLAUDE.md"), "SUB_CLAUDE_RULE").unwrap();
+    std::fs::write(ws.join("sub/pkg/AGENTS.md"), "PKG_RULE").unwrap();
+    std::fs::write(ws.join("node_modules/ignored/AGENTS.md"), "SHOULD_IGNORE").unwrap();
+
+    let combined = crate::engine::collect_workspace_guidance(&ws);
+    assert!(combined.contains("ROOT_RULE"), "{combined}");
+    assert!(combined.contains("SUB_CLAUDE_RULE"), "{combined}");
+    assert!(combined.contains("PKG_RULE"), "{combined}");
+    assert!(!combined.contains("SHOULD_IGNORE"), "{combined}");
+    assert!(combined.find("ROOT_RULE").unwrap() < combined.find("PKG_RULE").unwrap());
+    let _ = std::fs::remove_dir_all(&ws);
+}

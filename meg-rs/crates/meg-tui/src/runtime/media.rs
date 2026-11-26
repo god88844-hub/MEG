@@ -163,6 +163,43 @@ impl Controller {
     }
 
 
+
+    pub(super) fn extract_at_tokens(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'@' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+                let start = i + 1;
+                if start < bytes.len() && (bytes[start] == b'"' || bytes[start] == b'\'') {
+                    let quote = bytes[start];
+                    let content_start = start + 1;
+                    let mut end = content_start;
+                    while end < bytes.len() && bytes[end] != quote {
+                        end += 1;
+                    }
+                    if end > content_start {
+                        out.push(text[content_start..end].to_string());
+                    }
+                    i = if end < bytes.len() { end + 1 } else { end };
+                    continue;
+                } else {
+                    let mut end = start;
+                    while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+                        end += 1;
+                    }
+                    if end > start {
+                        out.push(text[start..end].to_string());
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
     pub(super) fn expand_attachments(
         &self,
         text: &str,
@@ -209,12 +246,16 @@ impl Controller {
             }
         }
         let mut attachments = Vec::new();
-        for token in text.split_whitespace().filter_map(|t| t.strip_prefix('@')) {
+        for token in Self::extract_at_tokens(text) {
             if token.is_empty() {
                 continue;
             }
-            let path = meg_tools::fs_tools::resolve(std::path::Path::new(&self.state.cwd), token)?;
+            let path = meg_tools::fs_tools::resolve(std::path::Path::new(&self.state.cwd), &token)?;
             anyhow::ensure!(path.is_file(), "Attachment is not a file: {token}");
+            anyhow::ensure!(
+                !meg_tools::security_guards::is_blocked_env_path(&path),
+                "SECRET_AIRLOCK: cannot attach .env* file '{token}'"
+            );
             if Self::is_image_ext(&path) {
                 let att = meg_core::shim_client::load_image_attachment(&path)?;
                 image_attachments.push(att);
@@ -224,7 +265,8 @@ impl Controller {
                 path.metadata()?.len() <= 64 * 1024,
                 "Attachment exceeds 64 KiB: {token}"
             );
-            let contents = std::fs::read_to_string(path)?;
+            let raw_contents = std::fs::read_to_string(&path)?;
+            let contents = meg_tools::security_guards::scrub_sal_observation(&raw_contents);
             attachments.push(format!(
                 "<attachment path={token:?}>\n{contents}\n</attachment>"
             ));
@@ -240,4 +282,45 @@ impl Controller {
         Ok((final_text, image_attachments))
     }
 
+}
+
+#[cfg(test)]
+mod b08_tests {
+    use super::Controller;
+    use crate::WorkstationState;
+
+    #[test]
+    fn quoted_space_attachments_env_airlock_and_secret_scrubbing() {
+        let ws = std::env::temp_dir().join(format!("meg-b08-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(ws.join("my dir")).unwrap();
+        std::fs::write(
+            ws.join("my dir/note file.txt"),
+            "hello key=sk-ant-api03-1234567890abcdef1234567890abcdef",
+        )
+        .unwrap();
+        std::fs::write(ws.join(".env"), "SECRET=topsecret").unwrap();
+
+        let ctrl = Controller::in_memory(
+            WorkstationState {
+                cwd: ws.display().to_string(),
+                ..Default::default()
+            },
+            None,
+        );
+
+        let (expanded, _) = ctrl
+            .expand_attachments(r#"review @"my dir/note file.txt" please"#)
+            .unwrap();
+        assert!(expanded.contains("hello key="), "{expanded}");
+        assert!(
+            !expanded.contains("sk-ant-api03-1234567890abcdef1234567890abcdef"),
+            "raw secret leaked in @attachment: {expanded}"
+        );
+
+        let env_err = ctrl
+            .expand_attachments("inspect @.env")
+            .expect_err(".env attachment must be blocked");
+        assert!(env_err.to_string().contains("SECRET_AIRLOCK"), "{env_err}");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }

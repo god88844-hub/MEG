@@ -178,15 +178,62 @@ pub fn side_git_dir(workspace: &Path) -> PathBuf {
     base.join(fnv1a_hex(&canon.to_string_lossy()))
 }
 
+const SIDE_GIT_TIMEOUT_SECS: u64 = 10;
+
+fn run_command_bounded(mut cmd: Command, timeout_secs: u64, label: &str) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn {label}"))?;
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let t_out = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut r) = out_pipe {
+            let _ = r.take(1024 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut r) = err_pipe {
+            let _ = r.take(256 * 1024).read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{label} timed out after {timeout_secs}s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    };
+    let stdout = t_out.join().unwrap_or_default();
+    let stderr = t_err.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn run_side_git(git_dir: &Path, workspace: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .env("GIT_DIR", git_dir)
+    let mut cmd = Command::new("git");
+    cmd.env("GIT_DIR", git_dir)
         .env("GIT_WORK_TREE", workspace)
         .env("GIT_TERMINAL_PROMPT", "0")
         .args(["-c", "core.autocrlf=false"])
-        .args(args)
-        .output()
-        .context("failed to execute git for side-git snapshot")?;
+        .args(args);
+    let out = run_command_bounded(cmd, SIDE_GIT_TIMEOUT_SECS, "side-git")?;
     if !out.status.success() {
         bail!(
             "side-git {:?} failed: {}",
@@ -220,7 +267,7 @@ pub fn side_git_snapshot(workspace: &Path, label: &str) -> Result<String> {
     run_side_git(
         &git_dir,
         workspace,
-        &["add", "-A", "--", ".", ":!.git", ":!.meg", ":!.loop", ":!target", ":!node_modules", ":!.env", ":!.env.*"],
+        &["add", "-A", "--", ".", ":(exclude).git", ":(exclude).meg", ":(exclude).loop", ":(exclude)target", ":(exclude)node_modules", ":(exclude).venv", ":(exclude)venv", ":(exclude)__pycache__", ":(exclude)dist", ":(exclude)build", ":(exclude).env", ":(exclude).env.*", ":(exclude)*.pem", ":(exclude)*.key"],
     )?;
     let tree = run_side_git(&git_dir, workspace, &["write-tree"])?;
     let parent = run_side_git(&git_dir, workspace, &["rev-parse", "--verify", "HEAD"]).ok();
@@ -247,7 +294,7 @@ pub fn side_git_snapshot(workspace: &Path, label: &str) -> Result<String> {
     if let Some(p) = &parent {
         cmd.args(["-p", p]);
     }
-    let out = cmd.output()?;
+    let out = run_command_bounded(cmd, SIDE_GIT_TIMEOUT_SECS, "side-git commit-tree")?;
     if !out.status.success() {
         bail!(
             "side-git commit-tree failed: {}",
@@ -256,6 +303,9 @@ pub fn side_git_snapshot(workspace: &Path, label: &str) -> Result<String> {
     }
     let commit = String::from_utf8_lossy(&out.stdout).trim().to_string();
     run_side_git(&git_dir, workspace, &["update-ref", "HEAD", &commit])?;
+    if commit_count >= 20 {
+        let _ = run_side_git(&git_dir, workspace, &["gc", "--prune=now", "--quiet"]);
+    }
     Ok(commit)
 }
 

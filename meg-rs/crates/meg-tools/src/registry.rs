@@ -88,6 +88,63 @@ pub fn validate_copy_constrained_args(
     Ok(())
 }
 
+
+fn json_matches_type(val: &Value, expected: &str) -> bool {
+    match expected {
+        "string" => val.is_string(),
+        "boolean" => val.is_boolean(),
+        "integer" => val.is_i64() || val.is_u64(),
+        "number" => val.is_number(),
+        "array" => val.is_array(),
+        "object" => val.is_object(),
+        "null" => val.is_null(),
+        _ => true,
+    }
+}
+
+pub fn validate_args_against_schema(tool: &str, args: &Value, schema: &Value) -> Result<()> {
+    if schema.get("type").and_then(Value::as_str) == Some("object") && !args.is_object() {
+        bail!("schema validation failed for '{tool}': arguments must be a JSON object");
+    }
+    let Some(obj) = args.as_object() else {
+        return Ok(());
+    };
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        let has_edits_mode = tool == "edit_file" && obj.contains_key("edits");
+        let has_query_alias = matches!(tool, "grep_files" | "glob_grep") && obj.contains_key("query");
+        for req in required {
+            if let Some(key) = req.as_str() {
+                if has_edits_mode && matches!(key, "old_str" | "new_str") {
+                    continue;
+                }
+                if has_query_alias && key == "pattern" {
+                    continue;
+                }
+                if !obj.contains_key(key) || obj[key].is_null() {
+                    bail!("schema validation failed for '{tool}': missing required argument '{key}'");
+                }
+            }
+        }
+    }
+    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
+        for (k, v) in obj {
+            if v.is_null() {
+                continue;
+            }
+            if let Some(prop_schema) = props.get(k) {
+                if let Some(expected_type) = prop_schema.get("type").and_then(Value::as_str) {
+                    if !json_matches_type(v, expected_type) {
+                        bail!(
+                            "schema validation failed for '{tool}': argument '{k}' expected type '{expected_type}'"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn read_file_schema() -> Value {
     json!({
         "type": "object",
@@ -455,7 +512,16 @@ impl ToolRegistry {
 
     pub fn execute(&self, name: &str, args: &Value) -> ToolResult {
         match self.tools.get(name) {
-            Some(f) => match f(args) {
+            Some(f) => {
+                if let Some(schema) = self.schemas.get(name) {
+                    if let Err(err) = validate_args_against_schema(name, args, schema) {
+                        return ToolResult {
+                            ok: false,
+                            output: format!("tool error: {err}"),
+                        };
+                    }
+                }
+                match f(args) {
                 Ok(mut output) => {
                     if output.len() > self.max_output_bytes {
                         let end = output.floor_char_boundary(self.max_output_bytes);
@@ -471,7 +537,7 @@ impl ToolRegistry {
                     ok: false,
                     output: format!("tool error: {e}"),
                 },
-            },
+            }},
             None => ToolResult {
                 ok: false,
                 output: format!(
@@ -580,5 +646,29 @@ mod production_regressions {
         let registry = super::ToolRegistry::with_core_tools(&std::env::temp_dir());
         let result = registry.execute("bash", &serde_json::json!({"command":"exit 7"}));
         assert!(!result.ok, "nonzero process exit was painted as success");
+    }
+
+    #[test]
+    fn adversarial_registry_enforces_schema_types_and_required_fields() {
+        let ws = std::env::temp_dir().join(format!("meg-reg-c10-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&ws);
+        let reg = super::ToolRegistry::with_core_tools(&ws);
+
+        // Wrong type on optional integer field must be rejected rather than silently defaulted.
+        let bad_type = reg.execute("grep_files", &serde_json::json!({"pattern": "foo", "max_results": "fifty"}));
+        assert!(!bad_type.ok);
+        assert!(bad_type.output.contains("expected type 'integer'"), "{}", bad_type.output);
+
+        // Wrong type on optional boolean field must be rejected.
+        let bad_bool = reg.execute("grep_files", &serde_json::json!({"pattern": "foo", "case_insensitive": "yes"}));
+        assert!(!bad_bool.ok);
+        assert!(bad_bool.output.contains("expected type 'boolean'"), "{}", bad_bool.output);
+
+        // Missing required argument must be rejected at the registry boundary.
+        let missing = reg.execute("read_file", &serde_json::json!({}));
+        assert!(!missing.ok);
+        assert!(missing.output.contains("missing required argument 'path'"), "{}", missing.output);
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

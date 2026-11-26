@@ -90,6 +90,31 @@ pub fn line_hash3(line: &str) -> String {
     format!("{:03x}", h & 0x0fff)
 }
 
+/// Deterministic 8-hex FNV-1a hash over an inclusive 1-based line range.
+pub fn range_hash(lines: &[String], start_no: usize, end_no: usize) -> String {
+    let mut h: u32 = 0x811c9dc5;
+    for line in &lines[(start_no - 1)..end_no] {
+        let clean = line.strip_suffix('\r').unwrap_or(line);
+        for &b in clean.as_bytes() {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x01000193);
+        }
+        h ^= b'\n' as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    format!("{h:08x}")
+}
+
+/// Deterministic 8-hex FNV-1a hash over normalized file text (for compare-and-swap edits).
+pub fn file_hash8(text: &str) -> String {
+    let mut h: u32 = 0x811c9dc5;
+    for &b in text.as_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    format!("{h:08x}")
+}
+
 /// Format lines with `line#hash | content` tags (1-based `start_line`).
 pub fn format_hashlines(lines: &[&str], start_line: usize) -> String {
     let mut out = String::new();
@@ -145,6 +170,17 @@ pub fn apply_hashline_patch(workspace: &Path, args: &Value) -> Result<String> {
     } else {
         content
     };
+    let actual_file_hash = file_hash8(&normalized);
+    let expected_file_hash = args
+        .get("expected_file_hash")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase());
+    if let Some(ref exp) = expected_file_hash {
+        ensure!(
+            exp == &actual_file_hash,
+            "stale expected_file_hash '{exp}' for {path}: actual is '{actual_file_hash}'"
+        );
+    }
     let mut lines: Vec<String> = normalized.lines().map(str::to_string).collect();
 
     // Parse & validate ALL anchors up front before mutating anything.
@@ -180,6 +216,42 @@ pub fn apply_hashline_patch(workspace: &Path, args: &Value) -> Result<String> {
             actual_end == end_hash,
             "stale end_anchor '{end_no}#{end_hash}' in {path}: actual is {end_no}#{actual_end}"
         );
+
+        let mut interior_verified = expected_file_hash.is_some();
+        if let Some(rh) = op.get("range_hash").and_then(Value::as_str) {
+            let actual_rh = range_hash(&lines, start_no, end_no);
+            ensure!(
+                rh.trim().eq_ignore_ascii_case(&actual_rh),
+                "stale range_hash '{rh}' for {path} lines {start_no}..={end_no}: interior lines changed (actual '{actual_rh}')"
+            );
+            interior_verified = true;
+        }
+        if let Some(lhs) = op.get("line_hashes").and_then(Value::as_array) {
+            let expected_len = end_no - start_no + 1;
+            ensure!(
+                lhs.len() == expected_len,
+                "line_hashes length {} does not match range {start_no}..={end_no} ({expected_len} lines)",
+                lhs.len()
+            );
+            for (offset, item) in lhs.iter().enumerate() {
+                let h = item
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("line_hashes entries must be 3-hex strings"))?;
+                let ln = start_no + offset;
+                let actual = line_hash3(&lines[ln - 1]);
+                ensure!(
+                    h.trim().eq_ignore_ascii_case(&actual),
+                    "stale interior line hash '{ln}#{h}' in {path}: actual is {ln}#{actual}"
+                );
+            }
+            interior_verified = true;
+        }
+        if end_no > start_no + 1 {
+            ensure!(
+                interior_verified,
+                "HASHLINE_INTERIOR_UNVERIFIED: multi-line range {start_no}..={end_no} spans interior lines; supply 'range_hash', 'line_hashes', or 'expected_file_hash' to prevent overwriting changed interior content"
+            );
+        }
 
         let new_content = op
             .get("new_content")
@@ -513,5 +585,63 @@ mod tests {
         .expect_err("str_replace must enforce hot-frame linter on .hot.* files");
         assert!(err.to_string().contains("HOT_FRAME_LINTER_BLOCKED"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adversarial_hashline_range_protects_interior_lines() {
+        let ws = tmp();
+        std::fs::write(ws.join("range.rs"), "line1\nline2_orig\nline3\n").unwrap();
+        let orig_lines: Vec<String> = ["line1", "line2_orig", "line3"].iter().map(|s| s.to_string()).collect();
+        let h1 = line_hash3("line1");
+        let h2 = line_hash3("line2_orig");
+        let h3 = line_hash3("line3");
+        let rh_orig = range_hash(&orig_lines, 1, 3);
+
+        // Mutate interior line while keeping endpoints identical (the C02 audit probe).
+        std::fs::write(ws.join("range.rs"), "line1\nline2_MUTATED\nline3\n").unwrap();
+
+        // 1. Endpoint-only multi-line range must be rejected.
+        let unverified = apply_hashline_patch(
+            &ws,
+            &json!({
+                "path": "range.rs",
+                "edits": [{ "start_anchor": format!("1#{h1}"), "end_anchor": format!("3#{h3}"), "new_content": "replaced" }]
+            }),
+        );
+        assert!(unverified.unwrap_err().to_string().contains("HASHLINE_INTERIOR_UNVERIFIED"));
+
+        // 2. Stale range_hash must be rejected.
+        let stale_rh = apply_hashline_patch(
+            &ws,
+            &json!({
+                "path": "range.rs",
+                "edits": [{ "start_anchor": format!("1#{h1}"), "end_anchor": format!("3#{h3}"), "range_hash": rh_orig, "new_content": "replaced" }]
+            }),
+        );
+        assert!(stale_rh.unwrap_err().to_string().contains("stale range_hash"));
+
+        // 3. Stale line_hashes must be rejected.
+        let stale_lh = apply_hashline_patch(
+            &ws,
+            &json!({
+                "path": "range.rs",
+                "edits": [{ "start_anchor": format!("1#{h1}"), "end_anchor": format!("3#{h3}"), "line_hashes": [h1, h2, h3], "new_content": "replaced" }]
+            }),
+        );
+        assert!(stale_lh.unwrap_err().to_string().contains("stale interior line hash"));
+
+        // 4. Fresh range_hash succeeds.
+        let cur_lines: Vec<String> = ["line1", "line2_MUTATED", "line3"].iter().map(|s| s.to_string()).collect();
+        let rh_cur = range_hash(&cur_lines, 1, 3);
+        let ok = apply_hashline_patch(
+            &ws,
+            &json!({
+                "path": "range.rs",
+                "edits": [{ "start_anchor": format!("1#{h1}"), "end_anchor": format!("3#{h3}"), "range_hash": rh_cur, "new_content": "replaced" }]
+            }),
+        );
+        assert!(ok.is_ok(), "{ok:?}");
+        assert_eq!(std::fs::read_to_string(ws.join("range.rs")).unwrap(), "replaced\n");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

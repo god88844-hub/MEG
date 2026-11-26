@@ -14,6 +14,100 @@ const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MAX_LINE_BYTES: usize = 300;
 const BINARY_SNIFF_BYTES: usize = 8192;
 
+struct GitIgnoreRule {
+    negated: bool,
+    dir_only: bool,
+    anchored: bool,
+    matcher: regex::Regex,
+}
+
+fn compile_gitignore_pattern(pat: &str) -> Option<regex::Regex> {
+    let mut rx = String::from("^");
+    let chars: Vec<char> = pat.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' if i + 1 < chars.len() && chars[i + 1] == '*' => {
+                rx.push_str(".*");
+                i += 2;
+                if i < chars.len() && chars[i] == '/' {
+                    rx.push_str("(?:/)?");
+                    i += 1;
+                }
+            }
+            '*' => {
+                rx.push_str("[^/]*");
+                i += 1;
+            }
+            '?' => {
+                rx.push_str("[^/]");
+                i += 1;
+            }
+            c => {
+                rx.push_str(&regex::escape(&c.to_string()));
+                i += 1;
+            }
+        }
+    }
+    rx.push('$');
+    regex::Regex::new(&rx).ok()
+}
+
+fn load_gitignore_rules(workspace: &Path) -> Vec<GitIgnoreRule> {
+    let mut rules = Vec::new();
+    for name in [".gitignore", ".ignore"] {
+        let p = workspace.join(name);
+        let Ok(content) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (negated, rest) = match line.strip_prefix('!') {
+                Some(r) => (true, r.trim()),
+                None => (false, line),
+            };
+            if rest.is_empty() {
+                continue;
+            }
+            let dir_only = rest.ends_with('/');
+            let rest = rest.trim_end_matches('/');
+            let anchored = rest.starts_with('/') || rest.contains('/');
+            let clean = rest.trim_start_matches('/');
+            if let Some(matcher) = compile_gitignore_pattern(clean) {
+                rules.push(GitIgnoreRule {
+                    negated,
+                    dir_only,
+                    anchored,
+                    matcher,
+                });
+            }
+        }
+    }
+    rules
+}
+
+fn is_gitignored(rules: &[GitIgnoreRule], rel_slash: &str, is_dir: bool) -> bool {
+    let mut ignored = false;
+    let file_name = rel_slash.rsplit('/').next().unwrap_or(rel_slash);
+    for rule in rules {
+        if rule.dir_only && !is_dir {
+            continue;
+        }
+        let matched = if rule.anchored {
+            rule.matcher.is_match(rel_slash)
+        } else {
+            rule.matcher.is_match(file_name) || rule.matcher.is_match(rel_slash)
+        };
+        if matched {
+            ignored = !rule.negated;
+        }
+    }
+    ignored
+}
+
 pub fn grep_files(workspace: &Path, args: &Value) -> Result<String> {
     grep_files_cancellable(workspace, args, &AtomicBool::new(false))
 }
@@ -66,6 +160,10 @@ pub fn grep_files_cancellable(
     let mut out_lines: Vec<String> = Vec::new();
     let mut match_count = 0usize;
     let mut truncated = false;
+    let mut skipped_oversized = 0usize;
+    let mut skipped_binary = 0usize;
+    let mut skipped_non_utf8 = 0usize;
+    let mut skipped_unreadable = 0usize;
 
     if crate::security_guards::is_blocked_env_path(&search_root) {
         anyhow::bail!(
@@ -74,10 +172,26 @@ pub fn grep_files_cancellable(
         );
     }
 
+    let gitignore_rules = load_gitignore_rules(workspace);
     for entry in walkdir::WalkDir::new(&search_root)
         .sort_by_file_name()
         .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !crate::fs_tools::is_ignored(e))
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            if crate::fs_tools::is_ignored(e) {
+                return false;
+            }
+            if !gitignore_rules.is_empty() {
+                let rel = e.path().strip_prefix(workspace).unwrap_or(e.path());
+                let rel_slash = rel.to_string_lossy().replace('\\', "/");
+                if is_gitignored(&gitignore_rules, &rel_slash, e.file_type().is_dir()) {
+                    return false;
+                }
+            }
+            true
+        })
         .filter_map(|e| e.ok())
     {
         ensure!(!cancel.load(Ordering::SeqCst), "Run cancelled");
@@ -85,11 +199,9 @@ pub fn grep_files_cancellable(
             continue;
         }
         let Ok(meta) = entry.metadata() else {
+            skipped_unreadable += 1;
             continue;
         };
-        if meta.len() > MAX_FILE_BYTES {
-            continue;
-        }
         let rel = entry.path().strip_prefix(workspace).unwrap_or(entry.path());
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         if let Some(ref filter) = glob_filter {
@@ -97,13 +209,20 @@ pub fn grep_files_cancellable(
                 continue;
             }
         }
+        if meta.len() > MAX_FILE_BYTES {
+            skipped_oversized += 1;
+            continue;
+        }
         let Ok(bytes) = std::fs::read(entry.path()) else {
+            skipped_unreadable += 1;
             continue;
         };
         if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
+            skipped_binary += 1;
             continue;
         }
         let Ok(text) = std::str::from_utf8(&bytes) else {
+            skipped_non_utf8 += 1;
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
@@ -149,11 +268,30 @@ pub fn grep_files_cancellable(
         }
     }
 
+    let mut skip_parts = Vec::new();
+    if skipped_oversized > 0 {
+        skip_parts.push(format!("{skipped_oversized} oversized (>512 KiB)"));
+    }
+    if skipped_binary > 0 {
+        skip_parts.push(format!("{skipped_binary} binary"));
+    }
+    if skipped_non_utf8 > 0 {
+        skip_parts.push(format!("{skipped_non_utf8} non-UTF-8"));
+    }
+    if skipped_unreadable > 0 {
+        skip_parts.push(format!("{skipped_unreadable} unreadable"));
+    }
     if out_lines.is_empty() {
-        return Ok("no matches".into());
+        if skip_parts.is_empty() {
+            return Ok("no matches".into());
+        }
+        return Ok(format!("no matches [skipped: {}]", skip_parts.join(", ")));
     }
     if truncated {
         out_lines.push(format!("...[truncated at {max_results} matches]"));
+    }
+    if !skip_parts.is_empty() {
+        out_lines.push(format!("[note: skipped {}]", skip_parts.join(", ")));
     }
     Ok(out_lines.join("\n"))
 }
@@ -270,6 +408,26 @@ mod tests {
         let src_scan = grep_files(&dir, &serde_json::json!({"pattern": "TOKEN"})).unwrap();
         assert!(src_scan.contains("app.rs:1:"));
         assert!(!src_scan.contains("ghp_1234567890abcdef1234567890abcdef1234"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn adversarial_grep_respects_gitignore_and_reports_skipped_files() {
+        let dir = std::env::temp_dir().join(format!("meg-grep-c05-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ignored_dir")).unwrap();
+        std::fs::write(dir.join(".gitignore"), "ignored_dir/\n*.gen.txt\n").unwrap();
+        std::fs::write(dir.join("ignored_dir/a.txt"), "NEEDLE_HIDDEN\n").unwrap();
+        std::fs::write(dir.join("skip.gen.txt"), "NEEDLE_HIDDEN\n").unwrap();
+        std::fs::write(dir.join("keep.txt"), "NEEDLE_VISIBLE\n").unwrap();
+        std::fs::write(dir.join("blob.bin"), b"\x00\x01NEEDLE_BIN").unwrap();
+        std::fs::write(dir.join("huge.txt"), "A".repeat(600 * 1024)).unwrap();
+
+        let out = grep_files(&dir, &serde_json::json!({"pattern": "NEEDLE"})).unwrap();
+        assert!(out.contains("keep.txt:1:NEEDLE_VISIBLE"), "{out}");
+        assert!(!out.contains("NEEDLE_HIDDEN"), "gitignored files leaked: {out}");
+        assert!(out.contains("1 oversized"), "missing oversized skip note: {out}");
+        assert!(out.contains("1 binary"), "missing binary skip note: {out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
