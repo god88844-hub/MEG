@@ -60,6 +60,7 @@ struct StdioTransport {
     stdin: Mutex<ChildStdin>,
     child: Mutex<Child>,
     pending: PendingMap,
+    stderr_tail: Arc<Mutex<String>>,
     seq: AtomicU64,
 }
 
@@ -74,7 +75,7 @@ impl StdioTransport {
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
@@ -92,6 +93,25 @@ impl StdioTransport {
             .with_context(|| format!("Failed to launch MCP stdio command '{command}'"))?;
         let stdin = child.stdin.take().context("MCP stdio stdin unavailable")?;
         let stdout = child.stdout.take().context("MCP stdio stdout unavailable")?;
+        let stderr_tail: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        if let Some(mut stderr) = child.stderr.take() {
+            let tail_ref = stderr_tail.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = stderr.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    let chunk = String::from_utf8_lossy(&buf[..n]);
+                    let mut guard = tail_ref.lock().unwrap();
+                    guard.push_str(&chunk);
+                    if guard.len() > 2048 {
+                        let cut = guard.floor_char_boundary(guard.len() - 2048);
+                        guard.drain(..cut);
+                    }
+                }
+            });
+        }
         let pending: PendingMap =
             Default::default();
         let responses = pending.clone();
@@ -145,6 +165,7 @@ impl StdioTransport {
             stdin: Mutex::new(stdin),
             child: Mutex::new(child),
             pending,
+            stderr_tail,
             seq: AtomicU64::new(1),
         }))
     }
@@ -206,7 +227,11 @@ impl StdioTransport {
                 Ok(Err(msg)) => bail!("{msg}"),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    bail!("MCP server disconnected before answering '{method}'");
+                    let tail = self.stderr_tail.lock().unwrap().trim().to_string();
+                    if tail.is_empty() {
+                        bail!("MCP server disconnected before answering '{method}'");
+                    }
+                    bail!("MCP server disconnected before answering '{method}' (stderr: {tail})");
                 }
             }
         }

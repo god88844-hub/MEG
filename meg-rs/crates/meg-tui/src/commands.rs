@@ -372,11 +372,12 @@ impl Controller {
                     let store=self.store.as_ref().context("Persistent storage is required before compacting")?;
                     let archive=store.root.join(format!("context-{}.json",uuid::Uuid::new_v4()));
                     atomic_json(&archive,&self.state.conversation)?;
-                    let older=self.state.conversation.len()-8;
-                    let excerpts=self.state.conversation[..older].iter().map(|m|format!("{}: {}",m.role,m.content.chars().take(240).collect::<String>())).take(24).collect::<Vec<_>>().join("\n");
-                    let mut context=vec![meg_core::ChatMessage{role:"user".into(),content:format!("Earlier conversation excerpts (truncated verbatim, not a semantic summary). Full archive: {}\n{excerpts}",archive.display())}];
-                    context.extend_from_slice(&self.state.conversation[older..]);self.state.conversation=context;
-                    self.system(format!("Archived {older} older messages and retained excerpts plus the latest 8. Full context: {}",archive.display()));
+                    let older = self.state.conversation.len() - 8;
+                    let summary = build_structured_compaction_summary(&self.state.conversation[..older], &archive);
+                    let mut context = vec![meg_core::ChatMessage { role: "user".into(), content: summary }];
+                    context.extend_from_slice(&self.state.conversation[older..]);
+                    self.state.conversation = context;
+                    self.system(format!("Archived {older} older messages into structured summary + latest 8 turns. Full archive: {}", archive.display()));
                 }
             }
             Help => {
@@ -715,4 +716,79 @@ fn copy_clipboard(text: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn build_structured_compaction_summary(
+    older: &[meg_core::ChatMessage],
+    archive_path: &std::path::Path,
+) -> String {
+    use std::collections::BTreeSet;
+    let initial_goal = older
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.chars().take(400).collect::<String>())
+        .unwrap_or_default();
+
+    let mut files = BTreeSet::new();
+    let mut errors = Vec::new();
+    let mut decisions = Vec::new();
+
+    for msg in older {
+        for word in msg.content.split_whitespace() {
+            let clean = word.trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | '(' | ')' | ',' | ';' | ':'));
+            if (clean.contains('/') || clean.contains('\\'))
+                && clean.len() <= 120
+                && !clean.starts_with("http")
+                && clean.contains('.')
+            {
+                files.insert(clean.to_string());
+                if files.len() >= 24 {
+                    break;
+                }
+            }
+        }
+        for line in msg.content.lines() {
+            let trimmed = line.trim();
+            let low = trimmed.to_ascii_lowercase();
+            if errors.len() < 8
+                && (low.contains("error[") || low.contains("failed") || low.contains("panic") || low.contains("traceback"))
+            {
+                errors.push(trimmed.chars().take(180).collect::<String>());
+            }
+        }
+        if msg.role == "assistant" && decisions.len() < 8 {
+            let first_line = msg.content.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+            if !first_line.is_empty() {
+                decisions.push(first_line.trim().chars().take(180).collect::<String>());
+            }
+        }
+    }
+
+    let mut out = format!(
+        "[Structured Context Compaction ? {} older messages archived at {}]\n",
+        older.len(),
+        archive_path.display()
+    );
+    if !initial_goal.is_empty() {
+        out.push_str(&format!("Initial Goal: {initial_goal}\n"));
+    }
+    if !files.is_empty() {
+        out.push_str(&format!(
+            "Referenced Files: {}\n",
+            files.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !errors.is_empty() {
+        out.push_str("Observed Errors/Failures:\n");
+        for e in errors {
+            out.push_str(&format!("- {e}\n"));
+        }
+    }
+    if !decisions.is_empty() {
+        out.push_str("Key Prior Steps:\n");
+        for d in decisions {
+            out.push_str(&format!("- {d}\n"));
+        }
+    }
+    out
 }

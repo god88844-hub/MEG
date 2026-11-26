@@ -160,7 +160,7 @@ impl AgentManager {
             .env("MEG_PLANE_DISABLED", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -210,6 +210,14 @@ impl AgentManager {
 
         // Read bounded stdout (max 2 MiB) on a helper thread.
         let stdout = child.stdout.take().context("Worker stdout unavailable")?;
+        let stderr_pipe = child.stderr.take();
+        let stderr_reader = std::thread::spawn(move || -> String {
+            let mut buf = Vec::new();
+            if let Some(s) = stderr_pipe {
+                let _ = s.take(2048).read_to_end(&mut buf);
+            }
+            String::from_utf8_lossy(&buf).trim().to_string()
+        });
         let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ov_flag = overflowed.clone();
         let reader = std::thread::spawn(move || -> Vec<u8> {
@@ -260,9 +268,13 @@ impl AgentManager {
         };
 
         let bytes = reader.join().unwrap_or_default();
+        let stderr_tail = stderr_reader.join().unwrap_or_default();
         if !status.success() {
             emit("failed", "done", None);
-            bail!("Delegate failed or timed out");
+            if stderr_tail.is_empty() {
+                bail!("Delegate failed or timed out");
+            }
+            bail!("Delegate failed or timed out (stderr: {stderr_tail})");
         }
         let payload: Value = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow!("Native worker returned invalid JSON"))?;

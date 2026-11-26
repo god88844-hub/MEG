@@ -297,11 +297,44 @@ impl WorkspaceExtensions {
         Ok(result)
     }
 
+    fn mcp_artifact_hashes(&self, config: &McpConfig) -> Vec<String> {
+        let mut candidates = Vec::new();
+        if let Some(ref cmd) = config.command {
+            candidates.push(cmd.as_str());
+        }
+        if let Some(ref args) = config.args {
+            for arg in args.iter().take(4) {
+                if !arg.starts_with('-') {
+                    candidates.push(arg.as_str());
+                }
+            }
+        }
+        let mut hashes = Vec::new();
+        for raw in candidates {
+            let p = Path::new(raw);
+            let resolved = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.workspace.join(p)
+            };
+            if let Ok(meta) = fs::metadata(&resolved) {
+                if meta.is_file() && meta.len() <= 16 * 1024 * 1024 {
+                    if let Ok(bytes) = fs::read(&resolved) {
+                        hashes.push(format!("{}:{}", resolved.display(), sha256_hex(&bytes)));
+                    }
+                }
+            }
+        }
+        hashes
+    }
+
     fn fingerprint(&self, name: &str, config: &McpConfig) -> String {
+        let artifact_hashes = self.mcp_artifact_hashes(config);
         let payload = serde_json::to_string(&json!([
             self.workspace.display().to_string(),
             name,
-            config
+            config,
+            artifact_hashes
         ]))
         .unwrap_or_default();
         sha256_hex(payload.as_bytes())

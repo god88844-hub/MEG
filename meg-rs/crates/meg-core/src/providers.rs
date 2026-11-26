@@ -101,6 +101,17 @@ impl ProviderProfile {
             matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
             "Endpoint must use HTTP or HTTPS"
         );
+        if url.scheme() == "http"
+            && std::env::var("MEG_ALLOW_INSECURE_HTTP").as_deref() != Ok("1")
+        {
+            let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+            let is_loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]" | "0.0.0.0")
+                || host.ends_with(".localhost");
+            anyhow::ensure!(
+                is_loopback,
+                "Plaintext HTTP is only allowed for local loopback endpoints; use HTTPS for '{host}' (or set MEG_ALLOW_INSECURE_HTTP=1)"
+            );
+        }
         anyhow::ensure!(
             url.username().is_empty()
                 && url.password().is_none()
@@ -776,5 +787,17 @@ mod p2_04_governance_tests {
         };
         assert!(resolve_provider_with_governance("anthropic", "anthropic/claude-sonnet", &gov2).is_ok());
         assert!(resolve_provider_with_governance("anthropic", "deepseek/r1", &gov2).is_err());
+    }
+
+    #[test]
+    fn remote_plaintext_http_provider_is_rejected_while_loopback_is_allowed() {
+        let mut remote = ProviderProfile::environment();
+        remote.base_url = "http://api.example.com/v1".into();
+        let err = remote.validate().expect_err("remote plaintext HTTP must be blocked");
+        assert!(err.to_string().contains("Plaintext HTTP"), "{err}");
+
+        let mut local = ProviderProfile::environment();
+        local.base_url = "http://127.0.0.1:11434/v1".into();
+        assert!(local.validate().is_ok());
     }
 }
