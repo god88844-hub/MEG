@@ -620,17 +620,21 @@ pub fn check_gh_privacy_and_publish(command: &str, allowed_repo: Option<&str>) -
 #[derive(Debug, Clone, Default)]
 pub struct SealedManifest {
     hashes: std::collections::BTreeMap<String, String>,
+    originals: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 impl SealedManifest {
     pub fn seal(workspace: &std::path::Path, rel_paths: &[&str]) -> anyhow::Result<Self> {
         let mut hashes = std::collections::BTreeMap::new();
+        let mut originals = std::collections::BTreeMap::new();
         for &rel in rel_paths {
             let full = workspace.join(rel);
             let bytes = std::fs::read(&full)?;
-            hashes.insert(rel.replace('\\', "/"), sha256_hex(&bytes));
+            let key = rel.replace('\\', "/").trim_start_matches("./").to_string();
+            hashes.insert(key.clone(), sha256_hex(&bytes));
+            originals.insert(key, bytes);
         }
-        Ok(Self { hashes })
+        Ok(Self { hashes, originals })
     }
 
     pub fn verify(&self, workspace: &std::path::Path) -> Result<(), Vec<String>> {
@@ -654,6 +658,29 @@ impl SealedManifest {
         }
     }
 
+    /// Restore any modified or deleted protected files back to their pre-run bytes.
+    pub fn restore_tampered(&self, workspace: &std::path::Path) -> Vec<String> {
+        let mut restored = Vec::new();
+        for (rel, expected) in &self.hashes {
+            let full = workspace.join(rel);
+            let needs_restore = match std::fs::read(&full) {
+                Ok(bytes) => sha256_hex(&bytes) != *expected,
+                Err(_) => true,
+            };
+            if needs_restore {
+                if let Some(orig) = self.originals.get(rel) {
+                    if let Some(parent) = full.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if crate::edit::write_atomic(&full, orig).is_ok() {
+                        restored.push(rel.clone());
+                    }
+                }
+            }
+        }
+        restored
+    }
+
     pub fn len(&self) -> usize {
         self.hashes.len()
     }
@@ -663,42 +690,83 @@ impl SealedManifest {
     }
 
     pub fn contains_rel_path(&self, rel: &str) -> bool {
-        self.hashes.contains_key(&rel.replace('\\', "/"))
+        let norm = rel.replace('\\', "/");
+        let trimmed = norm.trim_start_matches("./");
+        self.hashes.contains_key(trimmed)
     }
 
-    /// Seal all existing protected files under `tests/`, `migrations/`, and `scripts/check.*`.
-    pub fn seal_protected_paths(workspace: &std::path::Path) -> Self {
-        let mut hashes = std::collections::BTreeMap::new();
-        for fixed in ["scripts/check.ps1", "scripts/check.sh", "scripts/selftest.ps1", "scripts/selftest.sh"] {
-            let full = workspace.join(fixed);
-            if full.is_file() {
-                if let Ok(bytes) = std::fs::read(&full) {
-                    hashes.insert(fixed.to_string(), sha256_hex(&bytes));
+    /// Canonical path membership check closing absolute / `./` / `..` path spellings.
+    pub fn contains_path(&self, workspace: &std::path::Path, candidate: &std::path::Path) -> bool {
+        if let Ok(rel) = candidate.strip_prefix(workspace) {
+            if self.contains_rel_path(&rel.to_string_lossy()) {
+                return true;
+            }
+        }
+        if let (Ok(canon_ws), Ok(canon_cand)) =
+            (std::fs::canonicalize(workspace), std::fs::canonicalize(candidate))
+        {
+            if let Ok(rel) = canon_cand.strip_prefix(&canon_ws) {
+                if self.contains_rel_path(&rel.to_string_lossy()) {
+                    return true;
                 }
             }
         }
+        false
+    }
+
+    /// Seal all existing protected files under `tests/`, `migrations/`, and `scripts/check.*`.
+    /// Skips symlinks/junctions and tracks visited canonical directories to prevent cycles.
+    pub fn seal_protected_paths(workspace: &std::path::Path) -> Self {
+        let mut hashes = std::collections::BTreeMap::new();
+        let mut originals = std::collections::BTreeMap::new();
+        for fixed in ["scripts/check.ps1", "scripts/check.sh", "scripts/selftest.ps1", "scripts/selftest.sh"] {
+            let full = workspace.join(fixed);
+            let is_symlink = std::fs::symlink_metadata(&full)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(true);
+            if !is_symlink && full.is_file() {
+                if let Ok(bytes) = std::fs::read(&full) {
+                    hashes.insert(fixed.to_string(), sha256_hex(&bytes));
+                    originals.insert(fixed.to_string(), bytes);
+                }
+            }
+        }
+        let mut visited_dirs = std::collections::HashSet::new();
         for dir_name in ["tests", "migrations"] {
             let root = workspace.join(dir_name);
-            if !root.is_dir() {
+            let root_symlink = std::fs::symlink_metadata(&root)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(true);
+            if root_symlink || !root.is_dir() {
                 continue;
             }
             let mut stack = vec![root];
             while let Some(dir) = stack.pop() {
+                if let Ok(canon) = std::fs::canonicalize(&dir) {
+                    if !visited_dirs.insert(canon) {
+                        continue;
+                    }
+                }
                 let Ok(entries) = std::fs::read_dir(&dir) else { continue };
                 for entry in entries.flatten() {
                     let p = entry.path();
-                    if p.is_dir() {
+                    let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+                    if meta.file_type().is_symlink() {
+                        continue;
+                    }
+                    if meta.is_dir() {
                         stack.push(p);
-                    } else if p.is_file() {
+                    } else if meta.is_file() {
                         if let (Ok(rel), Ok(bytes)) = (p.strip_prefix(workspace), std::fs::read(&p)) {
                             let key = rel.to_string_lossy().replace('\\', "/");
-                            hashes.insert(key, sha256_hex(&bytes));
+                            hashes.insert(key.clone(), sha256_hex(&bytes));
+                            originals.insert(key, bytes);
                         }
                     }
                 }
             }
         }
-        Self { hashes }
+        Self { hashes, originals }
     }
 }
 
@@ -713,6 +781,29 @@ pub fn protected_restore_argv(base_ref: &str, paths: &[String]) -> Vec<String> {
 /// Scan edited code files for incomplete stubs (`TODO`, `todo!()`, `unimplemented!()`,
 /// `NotImplementedError`, `501`) and false-zero error swallowing (`catch { return [] }`,
 /// `except: pass`). Returns actionable remediation messages.
+/// Replace contents of single- and double-quoted literals with spaces so string data
+/// like `let msg = "TODO: ...";` does not trigger false-positive stub rejections.
+fn strip_quoted_strings(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == '\\' {
+                let _ = chars.next();
+            } else if c == q {
+                quote = None;
+                out.push(q);
+            }
+        } else if c == '"' || c == '\'' {
+            quote = Some(c);
+            out.push(c);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
 pub fn scan_anti_stub_and_false_zero(path: &std::path::Path, content: &str) -> Vec<String> {
     let ext = path
         .extension()
@@ -731,13 +822,14 @@ pub fn scan_anti_stub_and_false_zero(path: &std::path::Path, content: &str) -> V
     for (idx, raw) in lines.iter().enumerate() {
         let line_no = idx + 1;
         let trimmed = raw.trim();
+        let code_no_strings = strip_quoted_strings(trimmed);
         let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
-        if trimmed.contains("todo!(")
-            || trimmed.contains("unimplemented!(")
-            || trimmed.contains("NotImplementedError")
+        if code_no_strings.contains("todo!(")
+            || code_no_strings.contains("unimplemented!(")
+            || code_no_strings.contains("NotImplementedError")
             || trimmed.contains("501 Not Implemented")
-            || trimmed.contains("TODO:")
-            || trimmed.contains("FIXME:")
+            || code_no_strings.contains("TODO:")
+            || code_no_strings.contains("FIXME:")
         {
             findings.push(format!(
                 "{name}:{line_no}: stub/placeholder detected (`{trimmed}`). [REMEDIATION FIX] Replace with complete working logic."
@@ -849,4 +941,35 @@ mod p1_10_tests {
         assert_eq!(hot_hits.len(), 2, "{hot_hits:?}");
         assert!(lint_hot_frame_file(std::path::Path::new("setup.ts"), "const r = Math.random();").is_empty());
     }
+
+        #[test]
+        fn adversarial_anti_stub_ignores_string_literals_and_sealed_restores() {
+            let clean = r#"pub fn banner() -> &'static str { "TODO: customize message" }"#;
+            let findings = scan_anti_stub_and_false_zero(std::path::Path::new("src/ui.rs"), clean);
+            assert!(findings.is_empty(), "String literal TODO must not be flagged: {findings:?}");
+
+            let real_stub = "// TODO: implement parser\npub fn parse() { todo!(\"missing\") }\n";
+            let bad = scan_anti_stub_and_false_zero(std::path::Path::new("src/parser.rs"), real_stub);
+            assert_eq!(bad.len(), 2, "Comment TODO and todo!() must still be flagged: {bad:?}");
+
+            let dir = std::env::temp_dir().join(format!(
+                "meg-sealed-restore-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            ));
+            std::fs::create_dir_all(dir.join("tests")).unwrap();
+            let test_file = dir.join("tests").join("spec.rs");
+            std::fs::write(&test_file, "assert_eq!(2 + 2, 4);\n").unwrap();
+            let manifest = SealedManifest::seal_protected_paths(&dir);
+            assert!(manifest.contains_path(&dir, &test_file));
+            assert!(manifest.contains_rel_path("./tests/spec.rs"));
+            // Tamper and verify restore_tampered recovers original bytes
+            std::fs::write(&test_file, "assert!(true);\n").unwrap();
+            assert!(manifest.verify(&dir).is_err());
+            let restored = manifest.restore_tampered(&dir);
+            assert_eq!(restored, vec!["tests/spec.rs".to_string()]);
+            assert_eq!(std::fs::read_to_string(&test_file).unwrap(), "assert_eq!(2 + 2, 4);\n");
+            assert!(manifest.verify(&dir).is_ok());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
 }

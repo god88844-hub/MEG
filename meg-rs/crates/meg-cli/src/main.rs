@@ -66,6 +66,7 @@ impl LoopEngine for ShimEngine {
                     "read_file"
                         | "search_files"
                         | "grep_files"
+                        | "glob_grep"
                         | "list_dir"
                         | "todo"
                         | "read_skill"
@@ -133,7 +134,11 @@ impl LoopEngine for ShimEngine {
             if matches!(name.as_str(), "write_file" | "edit_file") {
                 if let Some(raw_path) = args["path"].as_str() {
                     let norm = raw_path.replace('\\', "/");
-                    if sealed.contains_rel_path(&norm) {
+                    let hit_sealed = sealed.contains_rel_path(&norm)
+                        || meg_tools::fs_tools::resolve(&workspace, raw_path)
+                            .map(|resolved| sealed.contains_path(&workspace, &resolved))
+                            .unwrap_or(false);
+                    if hit_sealed {
                         return Ok(meg_tools::ToolResult {
                             ok: false,
                             output: format!(
@@ -178,7 +183,31 @@ impl LoopEngine for ShimEngine {
             } else {
                 None
             };
+            let pre_bash_snap = if name == "bash" {
+                snapshot_workspace_files(&workspace)
+            } else {
+                None
+            };
             let result = registry.execute(&name, &args);
+            if let Some(before) = pre_bash_snap {
+                if let Some(after) = snapshot_workspace_files(&workspace) {
+                    let mut shell_changed = Vec::new();
+                    for (path, sig) in &after {
+                        if before.get(path) != Some(sig) {
+                            shell_changed.push(path.clone());
+                        }
+                    }
+                    if !shell_changed.is_empty() {
+                        let _ = aepn.lock().unwrap().on_code_edit();
+                        let mut ef = edited_files.lock().unwrap();
+                        for p in shell_changed {
+                            if !ef.contains(&p) {
+                                ef.push(p);
+                            }
+                        }
+                    }
+                }
+            }
             if result.ok {
                 if let Some(checkpoint) = checkpoint {
                     checkpoint.commit_or_rollback(&workspace).map_err(|e| {
@@ -252,7 +281,7 @@ impl LoopEngine for ShimEngine {
         let mut messages = transcript.to_vec();
         if self.shim.tools.is_empty() {
             let tools = if self.mode == meg_tui::Mode::Plan {
-                "read_file {path, offset?, limit?, line_numbers?}; search_files {pattern}; grep_files {pattern, path?, glob?, case_insensitive?, context_lines?, max_results?}; list_dir {path?}; todo {items:[{text,done}]}".into()
+                "read_file {path, offset?, limit?, line_numbers?}; search_files {pattern}; grep_files {pattern, path?, glob?, case_insensitive?, context_lines?, max_results?}; glob_grep {pattern, path?, glob?, case_insensitive?, context_lines?, max_results?}; list_dir {path?}; todo {items:[{text,done}]}".into()
             } else {
                 format!(
                     "{}; todo {{items:[{{text,done}}]}}",
@@ -1032,36 +1061,103 @@ async fn run_cold_l3_reviewer(req: ColdReviewRequest<'_>) -> Result<String> {
     let reply = rev_shim
         .chat_stream_cancellable(&messages, Some(req.cancel), &mut ignore_cb)
         .await?;
-    let trimmed = reply.trim();
+    let (verdict, reason) = parse_l3_reviewer_verdict(&reply);
+    if verdict != "PASS" {
+        anyhow::bail!("L3_REVIEWER_REJECTED ({}): {reason}", req.reviewer_model);
+    }
+    Ok("PASS".into())
+}
+
+fn parse_l3_reviewer_verdict(raw: &str) -> (String, String) {
+    let trimmed = raw.trim();
     let verdict_val = serde_json::from_str::<serde_json::Value>(trimmed).ok().or_else(|| {
         trimmed
             .find('{')
             .and_then(|s| trimmed.rfind('}').map(|e| &trimmed[s..=e]))
             .and_then(|slice| serde_json::from_str::<serde_json::Value>(slice).ok())
     });
-    let verdict = verdict_val
-        .as_ref()
-        .and_then(|v| v.get("verdict"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_ascii_uppercase())
-        .unwrap_or_else(|| {
-            if trimmed.to_ascii_uppercase().contains("PASS")
-                && !trimmed.to_ascii_uppercase().contains("REJECT")
-            {
-                "PASS".into()
-            } else {
-                "REJECT".into()
-            }
-        });
-    if verdict != "PASS" {
-        let reason = verdict_val
-            .as_ref()
-            .and_then(|v| v.get("reason"))
+    if let Some(val) = verdict_val {
+        let v = val
+            .get("verdict")
             .and_then(|v| v.as_str())
-            .unwrap_or(trimmed);
-        anyhow::bail!("L3_REVIEWER_REJECTED ({}): {reason}", req.reviewer_model);
+            .map(|s| s.trim().to_ascii_uppercase())
+            .unwrap_or_else(|| "REJECT".into());
+        let reason = val
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or(trimmed)
+            .to_string();
+        return (if v == "PASS" { "PASS".into() } else { "REJECT".into() }, reason);
     }
-    Ok("PASS".into())
+    // Strict plain-text fallback: accept only an explicit standalone PASS or VERDICT: PASS line.
+    let explicit_pass = trimmed.eq_ignore_ascii_case("PASS")
+        || trimmed.lines().any(|line| {
+            let up = line.trim().to_ascii_uppercase();
+            up == "VERDICT: PASS" || up == "VERDICT:PASS"
+        });
+    if explicit_pass {
+        ("PASS".into(), trimmed.to_string())
+    } else {
+        ("REJECT".into(), trimmed.to_string())
+    }
+}
+
+fn snapshot_workspace_files(
+    workspace: &Path,
+) -> Option<std::collections::BTreeMap<std::path::PathBuf, (u64, String)>> {
+    const MAX_FILES: usize = 4_000;
+    const MAX_HASH_BYTES: u64 = 2 * 1024 * 1024;
+    let mut map = std::collections::BTreeMap::new();
+    let mut stack = vec![workspace.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(name) = entry.file_name().to_str() {
+                if matches!(
+                    name,
+                    ".git"
+                        | "target"
+                        | "node_modules"
+                        | "__pycache__"
+                        | ".venv"
+                        | "venv"
+                        | ".meg"
+                        | ".loop"
+                        | ".cache"
+                        | ".pytest_cache"
+                        | ".mypy_cache"
+                        | ".ruff_cache"
+                ) {
+                    continue;
+                }
+            }
+            let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if !meta.is_file() {
+                continue;
+            }
+            if map.len() >= MAX_FILES {
+                return None;
+            }
+            let len = meta.len();
+            let digest = if len <= MAX_HASH_BYTES {
+                std::fs::read(&p)
+                    .map(|b| meg_tools::deliverable_guard::sha256_hex(&b))
+                    .unwrap_or_default()
+            } else {
+                format!("mtime:{:?}", meta.modified().ok())
+            };
+            map.insert(p, (len, digest));
+        }
+    }
+    Some(map)
 }
 
 async fn run_request_detailed(
@@ -1218,8 +1314,9 @@ async fn run_request_detailed(
     );
     if !sealed_manifest.is_empty() {
         if let Err(tampered) = sealed_manifest.verify(&receipt_workspace) {
+            let _ = sealed_manifest.restore_tampered(&receipt_workspace);
             anyhow::bail!(
-                "SEALED_MANIFEST_VIOLATION: protected file(s) modified during run: {}",
+                "SEALED_MANIFEST_VIOLATION: protected file(s) modified during run (restored): {}",
                 tampered.join("; ")
             );
         }
@@ -1264,7 +1361,7 @@ async fn run_request_detailed(
     }
     let mut reviewer_verdict_out: Option<String> = None;
     if receipt_mode != meg_tui::Mode::Plan {
-        let mutated = result.0.iter().any(|t| match &t.action {
+        let mutated = !edited_files.lock().unwrap().is_empty() || result.0.iter().any(|t| match &t.action {
             meg_core::Action::Tool { tool, .. } => {
                 matches!(tool.as_str(), "write_file" | "edit_file")
             }
@@ -1413,7 +1510,7 @@ fn build_tool_specs(
             mode != meg_tui::Mode::Plan
                 || matches!(
                     s.name.as_str(),
-                    "read_file" | "search_files" | "grep_files" | "list_dir"
+                    "read_file" | "search_files" | "grep_files" | "glob_grep" | "list_dir"
                 )
         })
         .map(|s| meg_core::ToolSpec {
@@ -2460,6 +2557,27 @@ mod tests {
         assert!(parse_run_options(&bad_steps).is_err());
     }
 
+    #[test]
+    fn adversarial_l3_reviewer_rejects_negative_prose_and_plan_allows_glob_grep() {
+        let (v1, _) = parse_l3_reviewer_verdict("This does not pass review due to missing tests.");
+        assert_eq!(v1, "REJECT");
+        let (v2, _) = parse_l3_reviewer_verdict("FAIL: tests did not pass");
+        assert_eq!(v2, "REJECT");
+        let (v3, _) = parse_l3_reviewer_verdict(r#"{"verdict":"PASS","reason":"clean"}"#);
+        assert_eq!(v3, "PASS");
+        let (v4, _) = parse_l3_reviewer_verdict("VERDICT: PASS\nAll checks verified.");
+        assert_eq!(v4, "PASS");
+
+        let dir = std::env::temp_dir().join(format!("meg-plan-coresix-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let reg = meg_tools::ToolRegistry::with_core_six(&dir);
+        let specs = build_tool_specs(&reg, meg_tui::Mode::Plan, &serde_json::json!({}), false);
+        assert!(
+            specs.iter().any(|s| s.name == "glob_grep"),
+            "Plan mode must keep glob_grep when --core-six is enabled"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn adversarial_verification_classifier_rejects_decoys() {
         assert!(!is_verification_command("echo test passed"));

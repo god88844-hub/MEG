@@ -9,14 +9,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::fs_tools::resolve;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextEncoding {
+pub(crate) enum TextEncoding {
     Utf8,
     Utf8Bom,
     Utf16LeBom,
     Utf16BeBom,
 }
 
-fn decode_with_bom(bytes: &[u8]) -> Result<(String, TextEncoding)> {
+pub(crate) fn decode_with_bom(bytes: &[u8]) -> Result<(String, TextEncoding)> {
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         let s = std::str::from_utf8(&bytes[3..])?.to_string();
         return Ok((s, TextEncoding::Utf8Bom));
@@ -64,7 +64,7 @@ fn encode_with_bom(text: &str, enc: TextEncoding) -> Vec<u8> {
     }
 }
 
-fn write_atomic(full: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_atomic(full: &Path, bytes: &[u8]) -> Result<()> {
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let file_name = full
@@ -305,6 +305,10 @@ pub fn str_replace(workspace: &Path, args: &Value) -> Result<String> {
         _ => bail!("old_string not found in {} (check exact whitespace/casing)", path),
     };
 
+    let hot_violations = crate::deliverable_guard::lint_hot_frame_file(&full, &updated);
+    if !hot_violations.is_empty() {
+        bail!("HOT_FRAME_LINTER_BLOCKED:\n{}", hot_violations.join("\n"));
+    }
     write_atomic(&full, &encode_with_bom(&updated, enc))?;
     Ok(format!(
         "edited {} ({} replacement{})",
@@ -487,5 +491,27 @@ mod tests {
         let (decoded, _) = decode_with_bom(&after16).unwrap();
         assert_eq!(decoded, "alpha = 9\r\n");
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn adversarial_str_replace_enforces_hot_frame_linter() {
+        let dir = std::env::temp_dir().join(format!(
+            "meg-hot-replace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tick.hot.ts"), "export const x = 1;\n").unwrap();
+        let err = str_replace(
+            &dir,
+            &serde_json::json!({
+                "path": "tick.hot.ts",
+                "old_string": "export const x = 1;",
+                "new_string": "export const x = Math.random();"
+            }),
+        )
+        .expect_err("str_replace must enforce hot-frame linter on .hot.* files");
+        assert!(err.to_string().contains("HOT_FRAME_LINTER_BLOCKED"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

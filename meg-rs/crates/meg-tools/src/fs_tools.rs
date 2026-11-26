@@ -111,7 +111,8 @@ pub fn read_file_cached(
             "SECRET_AIRLOCK: direct read of '{path}' is blocked (.env* files cannot enter model context; use .env.example)"
         );
     }
-    let text = std::fs::read_to_string(&full)?;
+    let raw_bytes = std::fs::read(&full)?;
+    let (text, _) = crate::edit::decode_with_bom(&raw_bytes)?;
 
     let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as usize);
     let limit = args.get("limit").and_then(Value::as_u64).map(|n| n as usize);
@@ -216,7 +217,7 @@ pub fn write_file(workspace: &Path, args: &Value) -> Result<String> {
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&full, content)?;
+    crate::edit::write_atomic(&full, content.as_bytes())?;
     Ok(format!("wrote {} bytes to {}", content.len(), path))
 }
 
@@ -333,6 +334,9 @@ pub(crate) fn is_ignored_name(name: &str) -> bool {
             | ".meg"
             | ".loop"
             | ".cache"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".ruff_cache"
     )
 }
 
@@ -515,5 +519,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn adversarial_read_file_decodes_utf16le_bom() {
+        let dir = std::env::temp_dir().join(format!(
+            "meg-utf16-read-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = vec![0xFFu8, 0xFEu8];
+        for u in "hello utf16\r\nline 2\r\n".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(dir.join("note.txt"), &bytes).unwrap();
+        let out = read_file(&dir, &serde_json::json!({ "path": "note.txt" }))
+            .expect("read_file must support UTF-16LE BOM files");
+        assert!(out.contains("hello utf16"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

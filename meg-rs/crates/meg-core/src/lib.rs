@@ -138,7 +138,7 @@ pub fn parse_model_output(raw: &str) -> Option<Action> {
 pub fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
-        "read_file" | "search_files" | "grep_files" | "list_dir" | "read_skill"
+        "read_file" | "search_files" | "grep_files" | "glob_grep" | "list_dir" | "read_skill"
     )
 }
 
@@ -448,6 +448,15 @@ pub async fn run_loop_with_config(
                         });
                         continue;
                     }
+                    outcomes.push(TurnOutcome {
+                        action: Action::Final {
+                            thought: String::new(),
+                            answer,
+                        },
+                        observation: Some(verdict.detail),
+                        ok: false,
+                    });
+                    return Ok((outcomes, None));
                 }
                 if verify_withholds_used < 1 {
                     if let Some(feedback) = engine.verify_before_finish(&answer).await? {
@@ -673,6 +682,15 @@ pub async fn run_loop_with_config(
                             });
                             continue;
                         }
+                        outcomes.push(TurnOutcome {
+                            action: Action::Final {
+                                thought: String::new(),
+                                answer,
+                            },
+                            observation: Some(verdict.detail),
+                            ok: false,
+                        });
+                        return Ok((outcomes, None));
                     }
                     if verify_withholds_used < 1 {
                         if let Some(feedback) = engine.verify_before_finish(&answer).await? {
@@ -1217,6 +1235,43 @@ mod tests {
         assert!(err.to_string().contains("Doom loop detected"), "{err}");
     }
 
+    #[tokio::test]
+    async fn adversarial_finish_hook_never_accepts_missing_deliverable() {
+        let dir = std::env::temp_dir().join(format!("meg-loop-a04-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing_target = dir.join("never_written.txt");
+
+        struct StubbornEngine;
+        #[async_trait::async_trait]
+        impl LoopEngine for StubbornEngine {
+            async fn generate(&self, _messages: &[ChatMessage]) -> anyhow::Result<String> {
+                Ok(r#"{"thought":"done","final":"All finished!"}"#.into())
+            }
+            async fn execute_tool(&self, _name: &str, _args: &Value) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        let cfg = LoopConfig {
+            max_steps: 6,
+            finish_hook: Some(crate::finish_hook::FinishHookConfig {
+                timeout_budget_secs: 600,
+                max_turns: 6,
+                simulated_elapsed_secs: Some(5),
+                target_deliverables: vec![missing_target],
+            }),
+            ..LoopConfig::default()
+        };
+        let (outcomes, answer) = run_loop_with_config(&StubbornEngine, "write never_written.txt", &[], &cfg)
+            .await
+            .unwrap();
+        assert!(
+            answer.is_none(),
+            "Finish hook must reject completion when deliverable is still missing after reprompt"
+        );
+        assert!(outcomes.iter().all(|o| !o.ok));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[tokio::test]
     async fn finish_hook_reprompts_once_when_deliverable_missing_then_approves() {
         let dir = std::env::temp_dir().join(format!("meg-loop-fh-{}", uuid::Uuid::new_v4()));
