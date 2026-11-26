@@ -276,3 +276,83 @@ fn nested_agents_and_claude_guidance_discovered_in_order() {
     assert!(combined.find("ROOT_RULE").unwrap() < combined.find("PKG_RULE").unwrap());
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+#[test]
+fn deferred_mcp_loading_withholds_large_catalogs_and_activates_on_demand() {
+    let dir = std::env::temp_dir().join(format!("meg-defer-mcp-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let reg = meg_tools::ToolRegistry::with_core_six(&dir);
+
+    let mut tools = Vec::new();
+    for i in 0..10 {
+        tools.push(serde_json::json!({
+            "alias": format!("mcp:github:tool_{i}"),
+            "description": format!("GitHub helper action {i}"),
+            "readOnly": i % 2 == 0,
+            "inputSchema": {
+                "type": "object",
+                "properties": { "repo": { "type": "string" } },
+                "required": ["repo"]
+            }
+        }));
+    }
+    let catalog = serde_json::json!({ "tools": tools });
+
+    // Above threshold (10 > 6): full MCP schemas withheld, single load_mcp_tool exposed
+    let deferred_specs = crate::engine::build_tool_specs_with_threshold(
+        &reg,
+        meg_tui::Mode::default(),
+        &catalog,
+        true,
+        6,
+    );
+    assert!(
+        deferred_specs.iter().any(|s| s.name == "load_mcp_tool"),
+        "expected load_mcp_tool when MCP tools exceed threshold"
+    );
+    assert!(
+        !deferred_specs.iter().any(|s| s.name.starts_with("mcp__")),
+        "deferred mode must not dump raw MCP schemas up front"
+    );
+
+    // At or below threshold (10 <= 10): eager loading includes all 10 MCP tools, no loader
+    let eager_specs = crate::engine::build_tool_specs_with_threshold(
+        &reg,
+        meg_tui::Mode::default(),
+        &catalog,
+        true,
+        10,
+    );
+    assert!(!eager_specs.iter().any(|s| s.name == "load_mcp_tool"));
+    assert_eq!(
+        eager_specs.iter().filter(|s| s.name.starts_with("mcp__")).count(),
+        10
+    );
+
+    // On-demand query loads matching tools and ShimClient deduplicates dynamic registration
+    let (out, specs) = crate::engine::resolve_deferred_mcp_tools(
+        &catalog,
+        meg_tui::Mode::default(),
+        &serde_json::json!({ "names": ["mcp:github:tool_2", "mcp__github__tool_3"] }),
+    )
+    .unwrap();
+    assert_eq!(specs.len(), 2, "{out}");
+    let mut shim = meg_core::shim_client::ShimClient::with("http://127.0.0.1:1".into(), "m".into());
+    shim.tools = deferred_specs;
+    assert!(shim.register_dynamic_tool(specs[0].clone()));
+    assert!(!shim.register_dynamic_tool(specs[0].clone()), "duplicate load must be ignored");
+    assert!(shim.effective_tools().iter().any(|t| t.name == "mcp__github__tool_2"));
+
+    // Plan mode blocks mutating MCP tools (odd indices have readOnly=false)
+    let (plan_out, plan_specs) = crate::engine::resolve_deferred_mcp_tools(
+        &catalog,
+        meg_tui::Mode::Plan,
+        &serde_json::json!({ "names": ["mcp:github:tool_1", "mcp:github:tool_2"] }),
+    )
+    .unwrap();
+    assert_eq!(plan_specs.len(), 1, "{plan_out}");
+    assert_eq!(plan_specs[0].name, "mcp__github__tool_2");
+    assert!(plan_out.contains("mcp:github:tool_1"), "expected blocked_in_plan notice: {plan_out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

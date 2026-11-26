@@ -138,6 +138,7 @@ pub struct ShimClient {
     pub reasoning_effort: Option<String>,
     pub kind: crate::providers::ProviderKind,
     pub tools: Vec<ToolSpec>,
+    dynamic_tools: std::sync::Mutex<Vec<ToolSpec>>,
     pub prompt_caching: bool,
     pub max_retries: u32,
     pub base_retry_ms: u64,
@@ -175,6 +176,7 @@ impl ShimClient {
             reasoning_effort: None,
             kind: crate::providers::ProviderKind::OpenAi,
             tools: Vec::new(),
+            dynamic_tools: std::sync::Mutex::new(Vec::new()),
             prompt_caching: false,
             max_retries: 2,
             base_retry_ms: 500,
@@ -196,6 +198,29 @@ impl ShimClient {
     }
     pub fn native_tools_active(&self) -> bool {
         !self.tools.is_empty() && !self.tools_rejected.load(Ordering::Relaxed)
+    }
+    /// Register a deferred tool schema for subsequent turns (deduplicated by tool name).
+    pub fn register_dynamic_tool(&self, spec: ToolSpec) -> bool {
+        if self.tools.iter().any(|t| t.name == spec.name) {
+            return false;
+        }
+        let mut dyn_tools = self.dynamic_tools.lock().unwrap();
+        if dyn_tools.iter().any(|t| t.name == spec.name) {
+            return false;
+        }
+        dyn_tools.push(spec);
+        true
+    }
+    /// Return base tools combined with any dynamically loaded deferred tools.
+    pub fn effective_tools(&self) -> Vec<ToolSpec> {
+        let mut combined = self.tools.clone();
+        let dyn_tools = self.dynamic_tools.lock().unwrap();
+        for t in dyn_tools.iter() {
+            if !combined.iter().any(|existing| existing.name == t.name) {
+                combined.push(t.clone());
+            }
+        }
+        combined
     }
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let request = self
@@ -337,8 +362,8 @@ impl ShimClient {
                 });
             }
             if use_native_tools && !self.tools.is_empty() {
-                let mut tools_json: Vec<Value> = self
-                    .tools
+                let active_tools = self.effective_tools();
+                let mut tools_json: Vec<Value> = active_tools
                     .iter()
                     .map(|t| {
                         json!({
@@ -365,8 +390,8 @@ impl ShimClient {
                 "stream_options": { "include_usage": true }
             });
             if use_native_tools && !self.tools.is_empty() {
-                let tools_json: Vec<Value> = self
-                    .tools
+                let active_tools = self.effective_tools();
+                let tools_json: Vec<Value> = active_tools
                     .iter()
                     .map(|t| {
                         json!({

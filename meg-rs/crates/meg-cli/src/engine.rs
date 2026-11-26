@@ -65,6 +65,7 @@ impl LoopEngine for ShimEngine {
                         | "glob_grep"
                         | "list_dir"
                         | "web_fetch"
+                        | "load_mcp_tool"
                         | "todo"
                         | "read_skill"
                         | "delegate"
@@ -112,6 +113,36 @@ impl LoopEngine for ShimEngine {
                 ok,
                 output,
             });
+            return res;
+        }
+        if tool == "load_mcp_tool" {
+            let id = format!(
+                "tool-{}",
+                self.next_tool
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            self.emit(RunnerMsg::ToolStarted {
+                id: id.clone(),
+                name: tool.into(),
+                args: meg_tui::fit_text(&args.to_string(), 120),
+            });
+            let res = resolve_deferred_mcp_tools(&self.catalog, self.mode, args).map(
+                |(text, specs)| {
+                    for spec in specs {
+                        self.shim.register_dynamic_tool(spec.clone());
+                        if let Some(exec_shim) = &self.executor_shim {
+                            exec_shim.register_dynamic_tool(spec);
+                        }
+                    }
+                    text
+                },
+            );
+            let ok = res.is_ok();
+            let output = match &res {
+                Ok(out) => meg_tui::fit_text(out, 160),
+                Err(err) => meg_tui::fit_text(&err.to_string(), 160),
+            };
+            self.emit(RunnerMsg::ToolFinished { id, ok, output });
             return res;
         }
         let id = format!(
@@ -360,7 +391,8 @@ impl LoopEngine for ShimEngine {
                         .join("\n")
                 })
                 .unwrap_or_default();
-            let tools = self.catalog["tools"]
+            let defer_threshold = mcp_defer_threshold();
+            let eligible_mcp: Vec<&serde_json::Value> = self.catalog["tools"]
                 .as_array()
                 .map(|v| {
                     v.iter()
@@ -368,21 +400,47 @@ impl LoopEngine for ShimEngine {
                             self.mode != meg_tui::Mode::Plan
                                 || t["readOnly"].as_bool() == Some(true)
                         })
-                        .map(|t| {
-                            let alias = t["alias"].as_str().unwrap_or("");
-                            let desc: String = t["description"].as_str().unwrap_or("").chars().take(160).collect();
-                            if self.shim.tools.is_empty() {
-                                format!("{alias}: {desc}; args schema {}", t["inputSchema"])
-                            } else {
-                                format!("{alias}: {desc}")
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                        .collect()
                 })
                 .unwrap_or_default();
+            let deferred_mcp = eligible_mcp.len() > defer_threshold;
+            let tools = eligible_mcp
+                .iter()
+                .map(|t| {
+                    let alias = t["alias"].as_str().unwrap_or("");
+                    if deferred_mcp {
+                        let desc: String = t["description"]
+                            .as_str()
+                            .unwrap_or("")
+                            .chars()
+                            .take(72)
+                            .collect();
+                        format!("{alias}: {desc}")
+                    } else {
+                        let desc: String = t["description"]
+                            .as_str()
+                            .unwrap_or("")
+                            .chars()
+                            .take(160)
+                            .collect();
+                        if self.shim.tools.is_empty() {
+                            format!("{alias}: {desc}; args schema {}", t["inputSchema"])
+                        } else {
+                            format!("{alias}: {desc}")
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             if !tools.is_empty() {
-                messages[0].content.push_str(&format!("\nConnected MCP tools:\n{tools}\n"));
+                if deferred_mcp {
+                    messages[0].content.push_str(&format!(
+                        "\nDeferred MCP tools ({} connected; schemas withheld to save context - call load_mcp_tool with query or names before invoking):\n{tools}\n",
+                        eligible_mcp.len()
+                    ));
+                } else {
+                    messages[0].content.push_str(&format!("\nConnected MCP tools:\n{tools}\n"));
+                }
             }
             if !skills.is_empty() {
                 messages[0].content.push_str(&format!("\nAvailable skills (use read_skill when relevant):\n{skills}\n"));
@@ -714,11 +772,152 @@ pub(crate) fn extract_finish_deliverables(
 }
 
 
+pub(crate) const DEFAULT_MCP_DEFER_THRESHOLD: usize = 6;
+const MAX_DEFERRED_MCP_LOAD_BATCH: usize = 12;
+
+pub(crate) fn mcp_defer_threshold() -> usize {
+    std::env::var("MEG_MCP_DEFER_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MCP_DEFER_THRESHOLD)
+}
+
+fn mcp_entry_to_tool_spec(t: &serde_json::Value) -> Option<meg_core::ToolSpec> {
+    let alias = t["alias"].as_str()?;
+    let params = if t["inputSchema"].is_object() {
+        t["inputSchema"].clone()
+    } else {
+        serde_json::json!({ "type": "object", "properties": {} })
+    };
+    Some(meg_core::ToolSpec {
+        name: sanitize_mcp_tool_name(alias),
+        description: t["description"].as_str().unwrap_or(alias).to_string(),
+        parameters: params,
+    })
+}
+
+pub(crate) fn resolve_deferred_mcp_tools(
+    catalog: &serde_json::Value,
+    mode: meg_tui::Mode,
+    args: &serde_json::Value,
+) -> Result<(String, Vec<meg_core::ToolSpec>)> {
+    let all_tools = catalog["tools"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    if all_tools.is_empty() {
+        return Ok(("No MCP tools are connected in the current session.".into(), Vec::new()));
+    }
+
+    let mut requested_names: Vec<String> = Vec::new();
+    if let Some(arr) = args.get("names").and_then(|v| v.as_array()) {
+        for v in arr {
+            if let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                requested_names.push(s.to_ascii_lowercase());
+            }
+        }
+    } else if let Some(s) = args
+        .get("names")
+        .or_else(|| args.get("name"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        requested_names.push(s.to_ascii_lowercase());
+    }
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
+    let mut blocked_in_plan: Vec<String> = Vec::new();
+    let mut eligible: Vec<&serde_json::Value> = Vec::new();
+    for t in all_tools {
+        let alias = t["alias"].as_str().unwrap_or("");
+        let safe = sanitize_mcp_tool_name(alias);
+        let is_ro = t["readOnly"].as_bool() == Some(true);
+        if mode == meg_tui::Mode::Plan && !is_ro {
+            if requested_names
+                .iter()
+                .any(|n| n == &alias.to_ascii_lowercase() || n == &safe.to_ascii_lowercase())
+            {
+                blocked_in_plan.push(alias.to_string());
+            }
+            continue;
+        }
+        eligible.push(t);
+    }
+
+    if requested_names.is_empty() && query.is_none() {
+        let available: Vec<String> = eligible
+            .iter()
+            .take(64)
+            .filter_map(|t| t["alias"].as_str().map(str::to_string))
+            .collect();
+        return Ok((
+            serde_json::to_string_pretty(&serde_json::json!({
+                "available": available,
+                "total_available": eligible.len(),
+                "hint": "Call load_mcp_tool with 'names' or 'query' to load full schemas."
+            }))?,
+            Vec::new(),
+        ));
+    }
+
+    let mut loaded_specs: Vec<meg_core::ToolSpec> = Vec::new();
+    let mut loaded_docs: Vec<serde_json::Value> = Vec::new();
+    for t in &eligible {
+        if loaded_specs.len() >= MAX_DEFERRED_MCP_LOAD_BATCH {
+            break;
+        }
+        let alias = t["alias"].as_str().unwrap_or("");
+        let safe = sanitize_mcp_tool_name(alias);
+        let alias_lc = alias.to_ascii_lowercase();
+        let safe_lc = safe.to_ascii_lowercase();
+        let desc_lc = t["description"].as_str().unwrap_or("").to_ascii_lowercase();
+
+        let name_hit = requested_names
+            .iter()
+            .any(|n| n == &alias_lc || n == &safe_lc);
+        let query_hit = query
+            .as_deref()
+            .is_some_and(|q| alias_lc.contains(q) || safe_lc.contains(q) || desc_lc.contains(q));
+
+        if name_hit || query_hit {
+            if let Some(spec) = mcp_entry_to_tool_spec(t) {
+                loaded_docs.push(serde_json::json!({
+                    "alias": alias,
+                    "tool_name": spec.name,
+                    "description": spec.description,
+                    "parameters": spec.parameters,
+                }));
+                loaded_specs.push(spec);
+            }
+        }
+    }
+
+    let payload = serde_json::json!({
+        "loaded_count": loaded_docs.len(),
+        "loaded": loaded_docs,
+        "blocked_in_plan": blocked_in_plan,
+        "total_available": eligible.len(),
+    });
+    Ok((serde_json::to_string_pretty(&payload)?, loaded_specs))
+}
+
 pub(crate) fn build_tool_specs(
     registry: &ToolRegistry,
     mode: meg_tui::Mode,
     catalog: &serde_json::Value,
     has_plane: bool,
+) -> Vec<meg_core::ToolSpec> {
+    build_tool_specs_with_threshold(registry, mode, catalog, has_plane, mcp_defer_threshold())
+}
+
+pub(crate) fn build_tool_specs_with_threshold(
+    registry: &ToolRegistry,
+    mode: meg_tui::Mode,
+    catalog: &serde_json::Value,
+    has_plane: bool,
+    defer_threshold: usize,
 ) -> Vec<meg_core::ToolSpec> {
     let mut specs: Vec<meg_core::ToolSpec> = registry
         .tool_schemas()
@@ -786,22 +985,37 @@ pub(crate) fn build_tool_specs(
             }),
         });
         if let Some(mcp_tools) = catalog["tools"].as_array() {
-            for t in mcp_tools {
-                if mode == meg_tui::Mode::Plan && t["readOnly"].as_bool() != Some(true) {
-                    continue;
-                }
-                if let Some(alias) = t["alias"].as_str() {
-                    let params = if t["inputSchema"].is_object() {
-                        t["inputSchema"].clone()
-                    } else {
-                        serde_json::json!({ "type": "object", "properties": {} })
-                    };
-                    let safe_name = sanitize_mcp_tool_name(alias);
-                    specs.push(meg_core::ToolSpec {
-                        name: safe_name,
-                        description: t["description"].as_str().unwrap_or(alias).to_string(),
-                        parameters: params,
-                    });
+            let eligible: Vec<&serde_json::Value> = mcp_tools
+                .iter()
+                .filter(|t| mode != meg_tui::Mode::Plan || t["readOnly"].as_bool() == Some(true))
+                .collect();
+            if eligible.len() > defer_threshold {
+                specs.push(meg_core::ToolSpec {
+                    name: "load_mcp_tool".into(),
+                    description: format!(
+                        "Load full JSON input schemas for deferred MCP tools ({} available) on demand by exact 'names' or keyword 'query'.",
+                        eligible.len()
+                    ),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "names": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Exact MCP tool aliases or sanitized names to activate."
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "Keyword to search available MCP tool names and descriptions."
+                            }
+                        }
+                    }),
+                });
+            } else {
+                for t in eligible {
+                    if let Some(spec) = mcp_entry_to_tool_spec(t) {
+                        specs.push(spec);
+                    }
                 }
             }
         }
