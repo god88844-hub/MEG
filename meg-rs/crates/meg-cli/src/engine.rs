@@ -64,6 +64,7 @@ impl LoopEngine for ShimEngine {
                         | "grep_files"
                         | "glob_grep"
                         | "list_dir"
+                        | "web_fetch"
                         | "todo"
                         | "read_skill"
                         | "delegate"
@@ -88,6 +89,30 @@ impl LoopEngine for ShimEngine {
             }
             self.emit(RunnerMsg::TodoList(steps));
             return Ok("Task checklist updated".into());
+        }
+        if tool == "web_fetch" {
+            let id = format!(
+                "tool-{}",
+                self.next_tool
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            self.emit(RunnerMsg::ToolStarted {
+                id: id.clone(),
+                name: tool.into(),
+                args: meg_tui::fit_text(&args.to_string(), 120),
+            });
+            let res = meg_core::web_fetch::fetch_url(args).await;
+            let ok = res.is_ok();
+            let output = match &res {
+                Ok(out) => meg_tui::fit_text(out, 160),
+                Err(err) => meg_tui::fit_text(&err.to_string(), 160),
+            };
+            self.emit(RunnerMsg::ToolFinished {
+                id,
+                ok,
+                output,
+            });
+            return res;
         }
         let id = format!(
             "tool-{}",
@@ -277,10 +302,10 @@ impl LoopEngine for ShimEngine {
         let mut messages = transcript.to_vec();
         if self.shim.tools.is_empty() {
             let tools = if self.mode == meg_tui::Mode::Plan {
-                "read_file {path, offset?, limit?, line_numbers?}; search_files {pattern}; grep_files {pattern, path?, glob?, case_insensitive?, context_lines?, max_results?}; glob_grep {pattern, path?, glob?, case_insensitive?, context_lines?, max_results?}; list_dir {path?}; todo {items:[{text,done}]}".into()
+                "read_file {path, offset?, limit?, line_numbers?}; search_files {pattern}; grep_files {pattern, path?, glob?, case_insensitive?, context_lines?, max_results?}; glob_grep {pattern, path?, glob?, case_insensitive?, context_lines?, max_results?}; list_dir {path?}; web_fetch {url, max_chars?, timeout_seconds?}; todo {items:[{text,done}]}".into()
             } else {
                 format!(
-                    "{}; todo {{items:[{{text,done}}]}}",
+                    "{}; web_fetch {{url, max_chars?, timeout_seconds?}}; todo {{items:[{{text,done}}]}}",
                     self.registry
                         .stubs
                         .iter()
@@ -686,6 +711,12 @@ pub(crate) fn build_tool_specs(
             parameters: s.parameters,
         })
         .collect();
+    let wf_schema = meg_core::web_fetch::tool_schema();
+    specs.push(meg_core::ToolSpec {
+        name: "web_fetch".into(),
+        description: "Fetch a public http/https URL (SSRF-safe, blocks private/loopback/metadata IPs) and return cleaned text.".into(),
+        parameters: wf_schema,
+    });
     specs.push(meg_core::ToolSpec {
         name: "todo".into(),
         description: "Update the task checklist: {items: [{text, done}]}.".into(),

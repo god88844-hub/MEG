@@ -16,6 +16,7 @@ pub mod finish_hook;
 pub mod indexer;
 pub mod json_repair;
 pub mod truncate;
+pub mod web_fetch;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
