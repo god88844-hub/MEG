@@ -7,6 +7,7 @@ pub mod fs_tools;
 pub mod grep;
 pub mod journal;
 pub mod ledger;
+pub mod lsp;
 pub mod registry;
 pub mod security_guards;
 pub mod worktree;

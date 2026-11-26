@@ -218,7 +218,11 @@ pub fn write_file(workspace: &Path, args: &Value) -> Result<String> {
         std::fs::create_dir_all(parent)?;
     }
     crate::edit::write_atomic(&full, content.as_bytes())?;
-    Ok(format!("wrote {} bytes to {}", content.len(), path))
+    let mut msg = format!("wrote {} bytes to {}", content.len(), path);
+    if let Some(diags) = crate::lsp::collect_write_through_diagnostics(workspace, &full, content) {
+        msg.push_str(&diags);
+    }
+    Ok(msg)
 }
 
 /// Bounded directory listing confined to the workspace.
