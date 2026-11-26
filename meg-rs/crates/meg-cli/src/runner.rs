@@ -52,7 +52,7 @@ pub(crate) struct ColdReviewRequest<'a> {
 pub(crate) async fn run_request_with_plane(
     request: meg_tui::RunRequest,
     tx: Option<Sender<RunnerMsg>>,
-    plane: Option<Arc<meg_core::plane_client::PlaneClient>>,
+    plane: Option<Arc<meg_core::services::ServicePlane>>,
 ) -> Result<(Vec<meg_core::TurnOutcome>, Option<String>)> {
     run_request_with_options(request, tx, plane, RunExtras::default()).await
 }
@@ -61,7 +61,7 @@ pub(crate) async fn run_request_with_plane(
 pub(crate) async fn run_request_with_options(
     request: meg_tui::RunRequest,
     tx: Option<Sender<RunnerMsg>>,
-    plane: Option<Arc<meg_core::plane_client::PlaneClient>>,
+    plane: Option<Arc<meg_core::services::ServicePlane>>,
     extras: RunExtras,
 ) -> Result<(Vec<meg_core::TurnOutcome>, Option<String>)> {
     let (outcomes, answer, _telemetry) = run_request_detailed(request, tx, plane, extras).await?;
@@ -157,7 +157,7 @@ pub(crate) fn parse_l3_reviewer_verdict(raw: &str) -> (String, String) {
 pub(crate) async fn run_request_detailed(
     request: meg_tui::RunRequest,
     tx: Option<Sender<RunnerMsg>>,
-    plane: Option<Arc<meg_core::plane_client::PlaneClient>>,
+    plane: Option<Arc<meg_core::services::ServicePlane>>,
     extras: RunExtras,
 ) -> Result<(Vec<meg_core::TurnOutcome>, Option<String>, RunTelemetry)> {
     anyhow::ensure!(
@@ -445,7 +445,12 @@ pub(crate) fn default_max_steps() -> usize {
 }
 
 
-pub(crate) fn start_plane() -> Result<Arc<meg_core::plane_client::PlaneClient>> {
+pub(crate) fn start_plane() -> Result<Arc<meg_core::services::ServicePlane>> {
+    let use_legacy_bun = std::env::var("MEG_LEGACY_BUN_PLANE").as_deref() == Ok("1")
+        || std::env::var_os("MEG_PLANE_ENTRY").is_some();
+    if !use_legacy_bun {
+        return Ok(meg_core::services::ServicePlane::native());
+    }
     let exe = std::env::current_exe()?;
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -464,7 +469,8 @@ pub(crate) fn start_plane() -> Result<Arc<meg_core::plane_client::PlaneClient>> 
         })
         .context("MEG control-plane bundle is missing")?;
     let builtin = builtin_skills_path(&entry, repo);
-    meg_core::plane_client::PlaneClient::spawn(&entry, &exe, Some(&builtin))
+    let client = meg_core::plane_client::PlaneClient::spawn(&entry, &exe, Some(&builtin))?;
+    Ok(meg_core::services::ServicePlane::external(client))
 }
 
 
@@ -618,7 +624,9 @@ pub(crate) async fn run_goal_headless(workspace: &Path, goal: &str, options: &Tu
     if options.core_six {
         std::env::set_var("MEG_CORE_SIX", "1");
     }
-    let plane = if std::env::var("MEG_NO_PLANE").as_deref() == Ok("1") {
+    let plane = if std::env::var("MEG_NO_PLANE").as_deref() == Ok("1")
+        || std::env::var("MEG_PLANE_DISABLED").as_deref() == Ok("1")
+    {
         None
     } else {
         Some(start_plane()?)

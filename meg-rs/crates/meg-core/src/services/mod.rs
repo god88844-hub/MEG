@@ -133,3 +133,52 @@ impl Drop for NativeServices {
         self.shutdown();
     }
 }
+
+/// Unified service backend: pure-Rust `NativeServices` by default, or an opt-in
+/// external Bun `PlaneClient` when `MEG_LEGACY_BUN_PLANE=1` / `MEG_PLANE_ENTRY` is set.
+pub enum ServicePlane {
+    Native(Arc<NativeServices>),
+    External(Arc<crate::plane_client::PlaneClient>),
+}
+
+impl ServicePlane {
+    pub fn native() -> Arc<Self> {
+        Arc::new(Self::Native(Arc::new(NativeServices::new())))
+    }
+
+    pub fn external(client: Arc<crate::plane_client::PlaneClient>) -> Arc<Self> {
+        Arc::new(Self::External(client))
+    }
+
+    pub fn is_native(&self) -> bool {
+        matches!(self, Self::Native(_))
+    }
+
+    pub fn call(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        match self {
+            Self::Native(svc) => svc.call(method, params, cancel),
+            Self::External(plane) => plane.call(method, params, cancel),
+        }
+    }
+
+    pub fn call_with_events<F>(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: &CancellationToken,
+        on_event: F,
+    ) -> Result<Value>
+    where
+        F: FnMut(Value),
+    {
+        match self {
+            Self::Native(svc) => svc.call_with_events(method, params, cancel, on_event),
+            Self::External(plane) => plane.call_with_events(method, params, cancel, on_event),
+        }
+    }
+}

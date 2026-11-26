@@ -235,3 +235,25 @@ fn test_parse_cli_args_unknown_command() {
     let unknown = vec!["meg".to_string(), "random-cmd".to_string()];
     assert!(matches!(parse_cli_args(&unknown), CliCommand::Unknown(_)));
 }
+
+#[test]
+fn start_plane_defaults_to_pure_rust_native_services_without_bun() {
+    let plane = start_plane().expect("native services must initialize without Bun");
+    assert!(plane.is_native(), "default plane must be pure-Rust NativeServices");
+    let cancel = meg_core::CancellationToken::default();
+    let ws = std::env::temp_dir().join(format!("meg-native-default-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws).unwrap();
+    let cat = plane
+        .call(
+            "runtime.catalog",
+            serde_json::json!({"workspace": ws.display().to_string()}),
+            &cancel,
+        )
+        .unwrap();
+    let skills = cat["catalog"]["skills"].as_array().unwrap();
+    assert!(
+        skills.iter().any(|s| s["name"] == "tdd-discipline"),
+        "embedded builtin skills must be available in pure-Rust mode"
+    );
+    let _ = std::fs::remove_dir_all(&ws);
+}

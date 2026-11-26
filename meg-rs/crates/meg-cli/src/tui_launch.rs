@@ -126,7 +126,7 @@ pub(crate) fn launch_tui(workspace: &Path) -> Result<()> {
         }
         let plane = plane
             .as_ref()
-            .context("MEG control plane unavailable; install Bun and the MEG runtime bundle")?;
+            .context("MEG native service runtime unavailable")?;
         let mut params = request.params;
         params["workspace"] = serde_json::to_value(request.workspace)?;
         plane.call_with_events(&request.method, params, &cancel, |value| {

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 /// One request owns its cancellation token, registry and event stream.
 pub(crate) struct ShimEngine {
-    pub(crate) plane: Option<Arc<meg_core::plane_client::PlaneClient>>,
+    pub(crate) plane: Option<Arc<meg_core::services::ServicePlane>>,
     pub(crate) catalog: serde_json::Value,
     pub(crate) worker: serde_json::Value,
     pub(crate) shim: ShimClient,

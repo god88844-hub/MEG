@@ -117,7 +117,9 @@ pub(crate) async fn run_loop_headless(workspace: &std::path::Path, options: &Loo
     if options.base.core_six {
         std::env::set_var("MEG_CORE_SIX", "1");
     }
-    let plane = if std::env::var("MEG_NO_PLANE").as_deref() == Ok("1") {
+    let plane = if std::env::var("MEG_NO_PLANE").as_deref() == Ok("1")
+        || std::env::var("MEG_PLANE_DISABLED").as_deref() == Ok("1")
+    {
         None
     } else {
         Some(start_plane()?)
