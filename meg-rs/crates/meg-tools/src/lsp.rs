@@ -683,7 +683,7 @@ while True:
         assert!(r1.output.contains("[LSP diagnostics ("), "{}", r1.output);
         assert!(r1.output.contains("type mismatch ERR_TOKEN"), "{}", r1.output);
 
-        let r2 = reg.execute("edit_file", &json!({ "path": "app.toy2", "old_str": "ERR_TOKEN", "new_str": "42" }));
+        let r2 = reg.execute("edit_file", &json!({ "path": "app.toy2", "old_string": "ERR_TOKEN", "new_string": "42" }));
         assert!(r2.ok, "{}", r2.output);
         assert!(!r2.output.contains("[LSP diagnostics"), "diagnostics should clear after fix: {}", r2.output);
 
