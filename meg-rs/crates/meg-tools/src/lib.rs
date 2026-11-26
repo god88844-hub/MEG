@@ -9,6 +9,7 @@ pub mod journal;
 pub mod ledger;
 pub mod lsp;
 pub mod registry;
+pub mod sandbox;
 pub mod security_guards;
 pub mod worktree;
 

@@ -111,7 +111,7 @@ fn bounded_output<R: Read>(mut reader: R) -> String {
 struct ProcessJob(windows_sys::Win32::Foundation::HANDLE);
 #[cfg(windows)]
 impl ProcessJob {
-    fn attach(child: &std::process::Child) -> Result<Self> {
+    fn attach(child: &std::process::Child, apply_ui_limits: bool) -> Result<Self> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::*;
         unsafe {
@@ -128,8 +128,13 @@ impl ProcessJob {
                 &limits as *const _ as *const _,
                 std::mem::size_of_val(&limits) as u32,
             ) == 0
-                || AssignProcessToJobObject(handle, child.as_raw_handle() as _) == 0
             {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if apply_ui_limits {
+                crate::sandbox::apply_windows_job_ui_restrictions(handle)?;
+            }
+            if AssignProcessToJobObject(handle, child.as_raw_handle() as _) == 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
             Ok(job)
@@ -146,14 +151,19 @@ impl Drop for ProcessJob {
 }
 
 
-fn build_sandboxed_command(workspace: &Path, cmd_line: &str, use_powershell: bool) -> Command {
+fn build_sandboxed_command(
+    workspace: &Path,
+    cmd_line: &str,
+    use_powershell: bool,
+    policy: &crate::sandbox::PermissionPolicy,
+) -> Result<Command> {
     if cfg!(windows) {
         if use_powershell {
             let translated = translate_posix_for_powershell51(cmd_line);
             let mut c = Command::new("powershell.exe");
             c.args(["-NoProfile", "-NonInteractive", "-Command", &translated])
                 .current_dir(workspace);
-            return c;
+            return Ok(c);
         }
         #[cfg(windows)]
         {
@@ -163,33 +173,23 @@ fn build_sandboxed_command(workspace: &Path, cmd_line: &str, use_powershell: boo
                 .arg("/C")
                 .raw_arg(format!("\"{cmd_line}\""))
                 .current_dir(workspace);
-            return c;
+            return Ok(c);
         }
         #[cfg(not(windows))]
         {
             let mut c = Command::new("cmd");
             c.arg("/C").arg(cmd_line).current_dir(workspace);
-            return c;
+            return Ok(c);
         }
     }
 
-    let sandbox_mode = std::env::var("MEG_SANDBOX").unwrap_or_default();
-    if cfg!(target_os = "linux") && matches!(sandbox_mode.as_str(), "1" | "true" | "bwrap") {
-        let preview = sandbox_command_preview("linux", workspace, cmd_line);
-        let mut c = Command::new(&preview[0]);
-        c.args(&preview[1..]).current_dir(workspace);
-        return c;
-    }
-    if cfg!(target_os = "macos") && matches!(sandbox_mode.as_str(), "1" | "true" | "seatbelt") {
-        let preview = sandbox_command_preview("macos", workspace, cmd_line);
-        let mut c = Command::new(&preview[0]);
-        c.args(&preview[1..]).current_dir(workspace);
-        return c;
+    if let Some(wrapped) = crate::sandbox::maybe_wrap_unix_command(workspace, cmd_line, policy)? {
+        return Ok(wrapped);
     }
 
     let mut c = Command::new("sh");
     c.arg("-c").arg(cmd_line).current_dir(workspace);
-    c
+    Ok(c)
 }
 pub fn run(workspace: &Path, args: &Value) -> Result<String> {
     run_cancellable(workspace, args, &std::sync::atomic::AtomicBool::new(false))
@@ -210,6 +210,8 @@ pub fn run_cancellable(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("missing 'command'"))?;
     crate::security_guards::validate_compound_bash(cmd_line)?;
+    let policy = crate::sandbox::PermissionPolicy::load(workspace);
+    policy.enforce_command(cmd_line)?;
     let allowed_repo = std::env::var("MEG_ALLOWED_GH_REPO").ok();
     if let Err(msg) =
         crate::deliverable_guard::check_gh_privacy_and_publish(cmd_line, allowed_repo.as_deref())
@@ -223,13 +225,14 @@ pub fn run_cancellable(
         .clamp(1, 600);
     let use_ps = args.get("shell").and_then(Value::as_str) == Some("powershell")
         || (cfg!(windows) && cmd_line.trim_start().starts_with("export "));
-    let mut cmd = build_sandboxed_command(workspace, cmd_line, use_ps);
+    let mut cmd = build_sandboxed_command(workspace, cmd_line, use_ps, &policy)?;
     cmd.env("PYTHONDONTWRITEBYTECODE", "1");
     headless_env(&mut cmd);
+    crate::sandbox::scrub_command_env(&mut cmd, &policy);
     let mut child = spawn_detached(&mut cmd)?;
     let pid = child.id();
     #[cfg(windows)]
-    let job = match ProcessJob::attach(&child) {
+    let job = match ProcessJob::attach(&child, policy.sandbox != crate::sandbox::SandboxMode::Off) {
         Ok(job) => Some(job),
         Err(error) => {
             if child.try_wait()?.is_none() {
@@ -467,5 +470,47 @@ mod p1_08_tests {
 
         let detached = detach_daemon_command("python server.py", "/tmp/daemon.log");
         assert!(detached.contains("</dev/null >/tmp/daemon.log 2>&1 &"));
+    }
+
+    #[test]
+    fn live_bash_strips_secret_env_and_enforces_permissions() {
+        let ws = std::env::temp_dir().join(format!("meg-bash-sandbox-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".meg")).unwrap();
+        std::fs::write(
+            ws.join(".meg").join("permissions.json"),
+            r#"{
+                "deny": ["*forbidden_op*"],
+                "ask": ["*needs_approval*"],
+                "env_allow": ["MEG_TEST_ALLOW_SECRET_KEY"]
+            }"#,
+        )
+        .unwrap();
+
+        std::env::set_var("MEG_TEST_STRIP_SECRET_KEY", "SHOULD_NOT_LEAK_777");
+        std::env::set_var("MEG_TEST_ALLOW_SECRET_KEY", "ALLOWED_VAL_888");
+
+        let probe_cmd = if cfg!(windows) {
+            "if defined MEG_TEST_STRIP_SECRET_KEY (echo STRIP=LEAKED) else (echo STRIP=CLEAN) && if defined MEG_TEST_ALLOW_SECRET_KEY (echo ALLOW=PRESENT) else (echo ALLOW=MISSING)"
+        } else {
+            "[ -n \"$MEG_TEST_STRIP_SECRET_KEY\" ] && echo STRIP=LEAKED || echo STRIP=CLEAN; [ -n \"$MEG_TEST_ALLOW_SECRET_KEY\" ] && echo ALLOW=PRESENT || echo ALLOW=MISSING"
+        };
+
+        let out = run(&ws, &serde_json::json!({ "command": probe_cmd })).unwrap();
+        std::env::remove_var("MEG_TEST_STRIP_SECRET_KEY");
+        std::env::remove_var("MEG_TEST_ALLOW_SECRET_KEY");
+
+        assert!(out.contains("STRIP=CLEAN"), "secret env var leaked into child shell: {out}");
+        assert!(out.contains("ALLOW=PRESENT"), "env_allow var was unexpectedly stripped: {out}");
+
+        let denied = run(&ws, &serde_json::json!({ "command": "echo forbidden_op" }))
+            .expect_err("deny rule must block command");
+        assert!(denied.to_string().contains("PERMISSION_DENIED"), "{denied}");
+
+        let asked = run(&ws, &serde_json::json!({ "command": "echo needs_approval" }))
+            .expect_err("ask rule must fail closed without MEG_APPROVE_ASK=1");
+        assert!(asked.to_string().contains("PERMISSION_ASK_REQUIRED"), "{asked}");
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }
