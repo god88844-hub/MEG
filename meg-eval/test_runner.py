@@ -185,3 +185,46 @@ def test_live_meg_exe_subprocess_enforces_airlock_edits_file_and_writes_receipt(
         f"v1|{rcpt['task_id']}|{rcpt['tree_hash']}|false".encode("utf-8")
     ).hexdigest()
     assert rcpt["receipt_hash"] == expected_sig
+
+def test_secret_inspect_proxy_catches_wire_leaks() -> None:
+    import http.server, json, socketserver, threading, urllib.request
+    from run_live_bench import _SecretInspectProxy
+
+    class Upstream(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(n)
+            raw = json.dumps({"ok": True}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    up = socketserver.TCPServer(("127.0.0.1", 0), Upstream)
+    threading.Thread(target=up.serve_forever, daemon=True).start()
+    proxy = _SecretInspectProxy(f"http://127.0.0.1:{up.server_address[1]}/v1", "MEGA_SECRET_999")
+    try:
+        r1 = urllib.request.Request(
+            f"{proxy.proxy_base_url}/chat/completions",
+            data=json.dumps({"messages": [{"role": "user", "content": "hello"}]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(r1, timeout=10) as resp:
+            assert resp.status == 200
+        assert not proxy.leaked_in_request
+
+        r2 = urllib.request.Request(
+            f"{proxy.proxy_base_url}/chat/completions",
+            data=json.dumps({"messages": [{"role": "tool", "content": "token=MEGA_SECRET_999"}]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(r2, timeout=10) as resp:
+            assert resp.status == 200
+        assert proxy.leaked_in_request
+    finally:
+        proxy.close()
+        up.shutdown()

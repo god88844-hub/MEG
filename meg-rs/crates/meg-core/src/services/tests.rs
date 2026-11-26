@@ -135,16 +135,17 @@ for line in sys.stdin:
     .unwrap();
 
     std::fs::create_dir_all(ws.join(".meg")).unwrap();
+    let py_bin = if cfg!(windows) { "python" } else { "python3" };
     std::fs::write(
         ws.join(".meg").join("mcp.json"),
         json!({
             "mcpServers": {
                 "echo": {
-                    "command": "python",
+                    "command": py_bin,
                     "args": [py_server.display().to_string()]
                 },
                 "gh": {
-                    "command": "python",
+                    "command": py_bin,
                     "args": [py_server.display().to_string()]
                 }
             }

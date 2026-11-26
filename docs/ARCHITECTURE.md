@@ -1,35 +1,18 @@
 # MEG Architecture
 
-MEG is a three-layer polyglot coding-agent harness designed for local Windows/POSIX workstations and offline evaluation.
+MEG ships as a **standalone pure-Rust single binary (`meg` / `meg.exe`)** with zero runtime dependency on Bun, Node, or Python.
 
-## Layer Overview
+## Crate Architecture (`meg-rs/crates/`)
 
-| Layer | Directory | Language / Runtime | Responsibility |
-| :--- | :--- | :--- | :--- |
-| **Ring-0 Native Kernel** | `meg-rs/` | Rust (GNU toolchain on Windows) | Deterministic tools, workspace confinement, OS Job Objects / sandboxing, FFI hot path, native streaming provider client, agent loop, CLI/TUI binary (`meg.exe`). |
-| **Layer-2 Control Plane** | `meg-plane/` | TypeScript on Bun | JSON-RPC 2.0 over stdio, `bun:ffi` into `meg_ffi.dll`, model routing, persistent session trees, context compilation, memory, `SKILL.md` progressive disclosure, MCP host, verification gauntlet, multi-agent orchestration. |
-| **Offline Eval & Evolution** | `meg-eval/` | Python 3.11+ (`pytest`) | Strictly offline 4-layer evals, domain oracles, reliability metrics, label-free test synthesis, and PR-only gated evolution (introduced in Phases 6-7). |
+| Crate | Responsibility |
+|---|---|
+| `meg-tools` | Workspace-confined filesystem tools (`fs_tools.rs`), CRLF/UTF-16-safe atomic `edit.rs` with full-range hashline verification, `.gitignore`-aware `grep.rs`, cancellable Job-Object `bash.rs`, transactional `journal.rs` + bounded side-git snapshots, `deliverable_guard.rs` (`SealedManifest`, anti-stub & hot-frame linters), `ledger.rs`, `worktree.rs`, and schema-enforcing `registry.rs`. |
+| `meg-core` | Core agent loop (`lib.rs`), modular provider transport (`shim_client/` supporting OpenAI-compatible Chat Completions & Anthropic Messages with prompt caching, SSE terminal checks, snapshotted multimodal attachments, and cancellable retries), `providers.rs` (Credential Manager + HTTPS guard), `indexer.rs`, `truncate.rs`, `finish_hook.rs`, and `services/` (pure-Rust `NativeServices`: embedded builtin skills, DDIPE scanner, plugins, native stdio/HTTP MCP host, `CLI > MCP` policy, and read-only subagent delegator). |
+| `meg-tui` | Modular Ratatui workstation (`runtime/` split into events, input, media & paste; `/ui classic` and `/ui pro`; structured `/compact`; persistent sessions; model-aware context gauge). |
+| `meg-cli` | Modular CLI entrypoint (`main.rs` ~86 LOC + `cli.rs`, `engine.rs`, `runner.rs`, `loop_cmd.rs`, `bridge.rs`, `tui_launch.rs`, `verify.rs`). Defaults to `ServicePlane::native()`. |
+| `meg-ffi` | Optional C-ABI `cdylib` retained only for legacy Bun compatibility tests. |
 
-## Current Crate & Module Layout
+## Optional / Non-Runtime Directories
 
-### `meg-rs/crates/`
-- `meg-tools` -- Workspace-confined filesystem tools (`fs_tools.rs`), CRLF-safe `edit.rs`, regex `grep.rs`, cancellable Job-Object `bash.rs`, multi-step `journal.rs`, `deliverable_guard.rs`, JSON-schema `registry.rs`.
-- `meg-core` -- Agent loop (`lib.rs`), streaming OpenAI/Anthropic/Ollama client (`shim_client.rs`) with native tool calling, Anthropic `cache_control`, and cancellable retries, `providers.rs` (OS Credential Manager + `Zeroize`), `provider_catalog.rs`, `indexer.rs`, `truncate.rs`, `json_repair.rs`, `finish_hook.rs`, `plane_client.rs`, `cancel.rs`.
-- `meg-ffi` -- C-ABI `cdylib` (`meg_ffi.dll`) exposing search, grep, list_dir, read, edit, truncate, parse, and workspace indexing to Bun with explicit `meg_free`.
-- `meg-cli` -- `meg` binary (`tui`, headless `run`, read-only `worker`).
-- `meg-tui` -- Interactive Ratatui workstation (**FROZEN until Phase 8**).
-
-### `meg-plane/src/`
-- `index.ts` -- Multiplexed JSON-RPC 2.0 stdio dispatch server.
-- `ffi-bridge.ts` -- `bun:ffi` bindings to `meg_ffi.dll`.
-- `router.ts` -- Local/cloud model router with honest `providers.json` sync.
-- `session-tree.ts` -- Forkable session tree with atomic persistence under `.meg/sessions/`.
-- `agents.ts` -- Native worker delegation manager with Windows `taskkill /T /F` cleanup and structured events.
-- `extensions.ts` & `mcp-host.ts` -- Declarative skills/plugins loader and official MCP SDK host (stdio, Streamable HTTP, SSE).
-- `security-router.ts` -- Direct security/crypto root-thread router and hand-off cap.
-
-## Trust & Safety Boundaries
-- Credentials stay in OS Credential Manager (`MEG/provider/<id>`, scoped per `MEG_CONFIG_DIR`) or process env vars; never in JSON configs, URLs, or session files.
-- HTTP clients disable redirects to prevent credential leakage across hosts.
-- Delegated workers run in read-only Plan mode without nested delegation.
-- `meg-tui/` stays untouched through Phases 0-7 so all kernel, control-plane, and eval upgrades land against a stable UI contract.
+- `meg-plane/` ? Legacy Bun/TypeScript control plane kept strictly as an opt-in escape hatch (`MEG_LEGACY_BUN_PLANE=1`). Not required or loaded by default.
+- `meg-eval/` ? Python offline evaluation suite, scripted integration benchmarks, and live benchmark runner (`run_live_bench.py`) with isolated oracle verification and request-body secret inspection.

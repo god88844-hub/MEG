@@ -1,51 +1,68 @@
 # MEG
 
-A native terminal agent harness for local models and cloud APIs, built with Rust and a Bun control plane. No MEG account or login service is required.
+A fast, **pure-Rust single-binary** terminal coding-agent harness for local models (Ollama, LM Studio, llama.cpp, vLLM) and cloud BYOK APIs (Anthropic Messages, OpenAI-compatible). No MEG account, no telemetry, and **no Bun or Node runtime required**.
 
-MEG v0.1.0 includes a workspace browser, streaming chat with a minimal thinking animation, multiline editing, persistent sessions, provider/model selection, skills, declarative plugins, MCP tools, and read-only delegated workers.
+## Install
 
-## Windows release
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/god88844-hub/MEG/main/scripts/install.ps1 | iex
+```
 
-Download `MEG-native-release.zip` from [Releases](https://github.com/god88844-hub/MEG/releases). Install [Bun](https://bun.sh), extract the entire archive into one directory, and run `meg.exe`. Keep `meg_ffi.dll` and `meg-plane` beside the executable.
+**Linux (x64) / macOS (ARM64):**
+```sh
+curl -fsSL https://raw.githubusercontent.com/god88844-hub/MEG/main/scripts/install.sh | sh
+```
 
-The supported native target is Windows x86_64. Other operating systems are not certified by this release's CI.
+**Build from source (only Rust required):**
+```sh
+cd meg-rs
+cargo build --locked --release -p meg-cli
+./target/release/meg --version
+```
 
-## First run
+## Core Capabilities
 
-1. Run `meg.exe` and open a folder, or use Ctrl+N to create a workspace.
-2. Open `/provider`. Connect Ollama, LM Studio, llama.cpp, vLLM, or a cloud provider with your own API key. Paste keys into the masked API-key field.
-3. Use `/model` to select a model reported by the connected server. Local model files must be registered with a running model server before they appear.
-4. Describe a task. `/plan` selects read-only work, `/code` selects Act mode, and `/stop` cancels active work.
+- **Single Compiled Binary (~7.5 MB):** Embedded builtin skills (10 packs), DDIPE skill supply-chain scanner, local declarative plugins, native stdio + Streamable HTTP/SSE MCP host (CLI > MCP guard, trust pinning by file SHA-256), and bounded read-only subagent workers (`meg worker`) all run in pure Rust (`meg-core::services`).
+- **Safety & Verification Guarantees:**
+  - Consistent `.env*` secret airlock and SAL secret scrubbing across `read_file`, `grep_files`, `bash`, and `@"path"` text attachments.
+  - Strict Plan (read-only) vs Act/Build execution gating, `SealedManifest` protected-test verification with automatic restore on tamper, atomic file writes, full-range hashline integrity (`range_hash` / `line_hashes`), `.gitignore`-aware `grep_files`, and multi-step file-mutation `/undo`.
+  - Honest verification receipts: `--require-verify` and `--verify-cmd` detect real verification commands and shell mutations without substring decoys, and `meg loop` propagates inner rejections accurately.
+- **TUI, Headless & Custom UI Bridge:**
+  - Dual Ratatui workstation (`/ui classic` and `/ui pro`), nested `AGENTS.md` / `CLAUDE.md` discovery, structured `/compact`, and Windows Credential Manager key vault (HTTPS enforced for remote endpoints).
+  - Headless automation (`meg run --json`, `meg loop --check ...`) and a stateful, non-blocking, cancellable NDJSON bridge (`meg ui-bridge`) for custom frontends.
 
-The default endpoint is local Ollama at `http://127.0.0.1:11434/v1`. Model names and cloud credentials are never invented. Cloud connections use the provider APIs you configure; no browser-account automation or personal gateway is bundled.
+## Quickstart
 
-Type `/` or `/help` for commands. `/settings`, `/sessions`, `/workspace`, `/skills`, `/plugins`, `/mcp`, `/agent`, and `/stats` expose the product features. See [usage](docs/native-harness.md) and [security](SECURITY.md).
+```sh
+# Interactive workstation
+meg
 
-## Build and test
+# Headless task with verification gate
+meg run -C ./my-project --require-verify --verify-cmd "cargo test" "fix the failing parser test"
 
-Requirements: Bun 1.4.4 or later, Rust's `stable-x86_64-pc-windows-gnu` toolchain, and a WinLibs/MinGW GNU linker on PATH. Windows CI sets up that linker with MSYS2.
+# Automated retry loop until check passes
+meg loop -C ./my-project --check "pytest -q" --max-runs 3 "resolve test failures"
+```
+
+Default local endpoint: `http://127.0.0.1:11434/v1` (Ollama). Use `/provider` and `/model` inside the TUI to connect local servers or BYOK cloud APIs.
+
+## Security & Current Limitations (Honest Scope)
+
+- **Act mode is not yet an OS kernel sandbox.** Native file tools confine paths to the workspace and Plan mode / delegated workers are read-only, but shell commands in Act mode run with your user privileges (OS sandboxing ? Windows Restricted Token/AppContainer, Linux Landlock/`bwrap`, macOS Seatbelt ? is scheduled for Phase 5).
+- **LSP write-through diagnostics** are not yet wired into `edit_file` (Phase 5).
+- **Legacy Bun control plane:** `meg-plane/` remains in the repository strictly as an opt-in legacy compatibility escape hatch (`MEG_LEGACY_BUN_PLANE=1`). Normal `meg` operation never invokes Bun or `meg_ffi.dll`.
+- See [SECURITY.md](SECURITY.md), [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and [docs/STATE.md](docs/STATE.md) for verified scope and boundaries.
+
+## Verification
 
 ```powershell
 cd meg-rs
+cargo clippy --locked --no-deps --workspace -- -D warnings
 cargo test --locked --workspace
-cargo build --locked --release --workspace
-cd ../meg-plane
-bun install --frozen-lockfile --ignore-scripts
-bun test --timeout 20000
-bun build src/index.ts --target=bun --outfile=dist/plane.js
-cd ..
-./meg-rs/target/release/meg.exe
+
+python -m pytest meg-eval -q
 ```
-
-The Bun FFI tests use the real release DLL built by the preceding Cargo command. Python is not required to build or run this product.
-
-For headless execution:
-
-```powershell
-meg.exe run -C C:\projects\example "inspect this workspace"
-```
-
-Act mode and MCP tools can execute powerful operations. Read the security boundaries before running untrusted work. Provider compatibility depends on the selected model and endpoint. Remote MCP OAuth and arbitrary JavaScript plugin runtimes are outside v0.1.0 support.
 
 ## License
 

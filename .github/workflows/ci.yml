@@ -10,39 +10,83 @@ permissions:
   contents: read
 
 jobs:
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 30
+  guard:
+    name: Protected-Path & Test Integrity Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Protected-path test deletion guard
-        shell: pwsh
+      - name: Reject test deletions and weakened assertions
+        shell: bash
         run: |
-          $baseRef = if ("${{ github.event_name }}" -eq "pull_request") {
-            "origin/${{ github.base_ref }}"
-          } elseif ("${{ github.event.before }}" -and "${{ github.event.before }}" -ne "0000000000000000000000000000000000000000") {
-            "${{ github.event.before }}"
-          } else {
-            ""
-          }
-          if (-not $baseRef) {
-            Write-Host "No base commit for diff; skipping deletion guard."
+          BASE_REF=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            BASE_REF="${{ github.event.before }}"
+          fi
+          if [ -z "$BASE_REF" ]; then
+            echo "No base commit for diff; skipping guard."
             exit 0
-          }
-          $deleted = @(git diff --diff-filter=D --name-only "$baseRef..HEAD")
-          $blocked = @($deleted | Where-Object { $_ -match '(^|/)tests/' -or $_ -match '^meg-plane/test/' })
-          if ($blocked.Count -gt 0) {
-            Write-Error ("Unauthorized deletion of protected test path(s): " + ($blocked -join ", "))
+          fi
+          DELETED=$(git diff --diff-filter=D --name-only "$BASE_REF..HEAD" | grep -E '(^|/)tests/|^meg-plane/test/|^meg-eval/test_' || true)
+          if [ -n "$DELETED" ]; then
+            echo "::error::Unauthorized deletion of protected test path(s): $DELETED"
             exit 1
-          }
-          Write-Host "Protected-path guard passed (0 test deletions)."
+          fi
+          WEAKENED=$(git diff "$BASE_REF..HEAD" -- 'meg-rs/crates/*/tests/*' 'meg-eval/test_*.py' | grep -E '^\+\s*(#\[ignore\]|@pytest\.mark\.skip|return\s+#\s*skip)' || true)
+          if [ -n "$WEAKENED" ]; then
+            echo "::error::Suspicious test-skip/ignore weakening detected:"
+            echo "$WEAKENED"
+            exit 1
+          fi
+          echo "Protected-path and assertion integrity guard passed."
+
+  rust-unix:
+    name: Pure-Rust Single Binary (${{ matrix.os }})
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolate runtime configuration
+        run: echo "MEG_CONFIG_DIR=${RUNNER_TEMP}/meg-test-config" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Strict zero-warning clippy
+        working-directory: meg-rs
+        run: cargo clippy --locked --no-deps --workspace -- -D warnings
+      - name: Rust workspace tests (--locked)
+        working-directory: meg-rs
+        run: cargo test --locked --workspace
+      - name: Standalone single-binary release build
+        working-directory: meg-rs
+        run: cargo build --locked --release -p meg-cli
+      - name: Verify standalone binary
+        run: ./meg-rs/target/release/meg --version
+
+  windows:
+    name: Windows Full Gate (Rust + Python Evals + Legacy Bun)
+    needs: guard
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
       - name: Isolate runtime configuration
         run: '"MEG_CONFIG_DIR=$env:RUNNER_TEMP\meg-test-config" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.4.4'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -50,22 +94,28 @@ jobs:
       - name: Export GNU linker
         shell: msys2 {0}
         run: cygpath -w /mingw64/bin >> "$GITHUB_PATH"
-      - name: Install native Rust toolchain
-        run: rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
-      - name: Rust tests
+      - name: Install native Rust toolchain + clippy
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component clippy
+          rustup default stable-x86_64-pc-windows-gnu
+      - name: Strict zero-warning clippy
+        working-directory: meg-rs
+        run: cargo clippy --locked --no-deps --workspace -- -D warnings
+      - name: Rust workspace tests (--locked)
         working-directory: meg-rs
         run: cargo test --locked --workspace
       - name: Native release build
         working-directory: meg-rs
         run: cargo build --locked --release --workspace
-      - name: Install control-plane dependencies
-        working-directory: meg-plane
-        run: bun install --frozen-lockfile --ignore-scripts
-      - name: Bun tests and real native bridge
-        working-directory: meg-plane
-        run: bun test --timeout 20000
-      - name: Bundle control plane
-        working-directory: meg-plane
-        run: bun build src/index.ts --target=bun --outfile=dist/plane.js
-      - name: Check native command
+      - name: Verify standalone pure-Rust binary (zero Bun)
         run: ./meg-rs/target/release/meg.exe --version
+      - name: Python offline evaluation suite
+        run: |
+          python -m pip install --upgrade pytest
+          python -m pytest meg-eval -q
+      - name: Legacy Bun control-plane compatibility suite
+        working-directory: meg-plane
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun test --timeout 20000
+          bun build src/index.ts --target=bun --outfile=dist/plane.js

@@ -1,0 +1,81 @@
+name: Release Pure-Rust Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.artifact }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+            bin: meg.exe
+            artifact: meg-x86_64-pc-windows-gnu.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: meg
+            artifact: meg-x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: meg
+            artifact: meg-aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        if: matrix.os == 'windows-latest'
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+      - name: Export GNU linker (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: cygpath -w /mingw64/bin >> "$GITHUB_PATH"
+      - name: Install Rust target
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+      - name: Build single-binary meg
+        working-directory: meg-rs
+        shell: bash
+        run: cargo build --locked --release -p meg-cli --target ${{ matrix.target }}
+      - name: Stage release artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "meg-rs/target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  publish:
+    name: Publish GitHub Release & SHA256SUMS
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA256SUMS.txt
+        working-directory: dist
+        run: sha256sum meg-* > SHA256SUMS.txt
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "MEG ${GITHUB_REF_NAME} (Pure-Rust Single Binary)" \
+            --generate-notes
