@@ -143,7 +143,32 @@ impl LoopEngine for ShimEngine {
             anyhow::ensure!(!cancel.is_cancelled(), "Run cancelled");
             if connected{
                 let plane=plane.context("The MEG control plane is unavailable; run /doctor")?;
-                let (method,params)=if name=="delegate"{let role_name=args["role"].as_str().unwrap_or("researcher");let mut eff_worker=worker.clone();if let Some(rm)=worker.get("role_models").and_then(|m|m.get(role_name)).and_then(|v|v.as_str()){eff_worker["model"]=serde_json::Value::String(rm.to_string());}("agents.run",serde_json::json!({"workspace":workspace,"role":role_name,"task":args["task"],"worker":eff_worker}))}else if name=="read_skill"{("skills.read",serde_json::json!({"workspace":workspace,"name":args["name"]}))}else{("runtime.tool",serde_json::json!({"workspace":workspace,"tool":name,"args":args,"readOnly":read_only}))};
+                let (method, params) = if name == "delegate" {
+                    let role_name = args["role"].as_str().unwrap_or("researcher");
+                    let mut eff_worker = worker.clone();
+                    if let Some(rm) = worker
+                        .get("role_models")
+                        .and_then(|m| m.get(role_name))
+                        .and_then(|v| v.as_str())
+                    {
+                        let def_prof: Option<meg_core::providers::ProviderProfile> =
+                            serde_json::from_value(worker["provider"].clone()).ok();
+                        let resolved = meg_core::providers::resolve_role_target_global(
+                            rm,
+                            def_prof.as_ref(),
+                        )?;
+                        eff_worker["model"] = serde_json::Value::String(resolved.model);
+                        if let Some(prof) = resolved.provider {
+                            eff_worker["base_url"] =
+                                serde_json::Value::String(prof.base_url.clone());
+                            eff_worker["provider"] = serde_json::to_value(&prof)?;
+                        }
+                    }
+                    (
+                        "agents.run",
+                        serde_json::json!({"workspace": workspace, "role": role_name, "task": args["task"], "worker": eff_worker}),
+                    )
+                }else if name=="read_skill"{("skills.read",serde_json::json!({"workspace":workspace,"name":args["name"]}))}else{("runtime.tool",serde_json::json!({"workspace":workspace,"tool":name,"args":args,"readOnly":read_only}))};
                 let value=plane.call_with_events(method,params,&cancel,|event|forward_agent_event(&events,event))?;
                 if name=="delegate"{if let Some(tx)=&events{let _=tx.send(RunnerMsg::DelegatedUsage(value["usage"].clone()));}}
                 return Ok(meg_tools::ToolResult{ok:true,output:if let Some(answer)=value["answer"].as_str(){answer.to_string()}else{serde_json::to_string(&value)?}});

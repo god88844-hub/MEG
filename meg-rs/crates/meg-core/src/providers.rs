@@ -711,6 +711,91 @@ mod tests {
 }
 
 // ===========================================================================
+// Phase 5C-2: Cross-Provider Role Routing (`provider_id:model_id`)
+// ===========================================================================
+
+#[derive(Debug, Clone)]
+pub struct ResolvedRoleTarget {
+    pub provider: Option<ProviderProfile>,
+    pub model: String,
+}
+
+/// Read comma/semicolon-separated disabled provider IDs from `MEG_DISABLED_PROVIDERS`.
+pub fn disabled_providers_from_env() -> Vec<String> {
+    std::env::var("MEG_DISABLED_PROVIDERS")
+        .unwrap_or_default()
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+/// Resolve a role model string (`provider_id:model_id` or bare `model_id`) against
+/// configured provider profiles while enforcing `disabled_providers` governance.
+///
+/// Only splits on the first `:` when the prefix matches `default_provider.id` or a
+/// configured `ProviderProfile::id`, preserving bare Ollama tags (`llama3:8b`) and
+/// OpenRouter slugs (`anthropic/claude-sonnet-4`).
+pub fn resolve_role_target(
+    spec: &str,
+    default_provider: Option<&ProviderProfile>,
+    settings: &ProviderSettings,
+    disabled_providers: &[String],
+) -> Result<ResolvedRoleTarget> {
+    let trimmed = spec.trim();
+    let (resolved_provider, resolved_model) = if let Some((prefix, rest)) = trimmed.split_once(':')
+    {
+        let p_trim = prefix.trim();
+        let m_trim = rest.trim();
+        if !p_trim.is_empty() && !m_trim.is_empty() {
+            if let Some(def) = default_provider.filter(|p| p.id.eq_ignore_ascii_case(p_trim)) {
+                (Some(def.clone()), m_trim.to_string())
+            } else if let Some(found) = settings
+                .profiles
+                .iter()
+                .find(|p| p.id.eq_ignore_ascii_case(p_trim))
+            {
+                (Some(found.clone()), m_trim.to_string())
+            } else {
+                (default_provider.cloned(), trimmed.to_string())
+            }
+        } else {
+            (default_provider.cloned(), trimmed.to_string())
+        }
+    } else {
+        (default_provider.cloned(), trimmed.to_string())
+    };
+
+    if let Some(prof) = &resolved_provider {
+        if disabled_providers
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(&prof.id))
+        {
+            anyhow::bail!(
+                "PROVIDER_DISABLED: role route '{trimmed}' targets disabled provider '{}'",
+                prof.id
+            );
+        }
+    }
+
+    Ok(ResolvedRoleTarget {
+        provider: resolved_provider,
+        model: resolved_model,
+    })
+}
+
+/// Resolve a role model spec using the global `ProviderStore` and `MEG_DISABLED_PROVIDERS`.
+pub fn resolve_role_target_global(
+    spec: &str,
+    default_provider: Option<&ProviderProfile>,
+) -> Result<ResolvedRoleTarget> {
+    let settings = ProviderStore::global().load().unwrap_or_default();
+    let disabled = disabled_providers_from_env();
+    resolve_role_target(spec, default_provider, &settings, &disabled)
+}
+
+// ===========================================================================
 // P2-04: Governance Locks (disabledProviders post-pin check & --pinned-model)
 // ===========================================================================
 
@@ -799,5 +884,49 @@ mod p2_04_governance_tests {
         let mut local = ProviderProfile::environment();
         local.base_url = "http://127.0.0.1:11434/v1".into();
         assert!(local.validate().is_ok());
+    }
+
+    #[test]
+    fn cross_provider_role_routing_resolves_profiles_preserves_ollama_tags_and_enforces_disabled() {
+        let settings = ProviderSettings::default();
+        let openrouter = settings
+            .profiles
+            .iter()
+            .find(|p| p.id == "openrouter")
+            .unwrap()
+            .clone();
+
+        // Cross-provider Anthropic route
+        let anth = resolve_role_target("anthropic:claude-sonnet-4", Some(&openrouter), &settings, &[])
+            .unwrap();
+        assert_eq!(anth.provider.as_ref().unwrap().id, "anthropic");
+        assert_eq!(anth.model, "claude-sonnet-4");
+
+        // Cross-provider Ollama route preserving model tag colon
+        let oll = resolve_role_target("ollama:qwen2.5-coder:32b", Some(&openrouter), &settings, &[])
+            .unwrap();
+        assert_eq!(oll.provider.as_ref().unwrap().id, "ollama");
+        assert_eq!(oll.model, "qwen2.5-coder:32b");
+
+        // Bare Ollama tag does NOT falsely split on ':'
+        let bare_tag = resolve_role_target("llama3:8b", Some(&openrouter), &settings, &[]).unwrap();
+        assert_eq!(bare_tag.provider.as_ref().unwrap().id, "openrouter");
+        assert_eq!(bare_tag.model, "llama3:8b");
+
+        // OpenRouter slash slug stays on default provider
+        let slug = resolve_role_target("anthropic/claude-sonnet-4", Some(&openrouter), &settings, &[])
+            .unwrap();
+        assert_eq!(slug.provider.as_ref().unwrap().id, "openrouter");
+        assert_eq!(slug.model, "anthropic/claude-sonnet-4");
+
+        // Disabled provider blocks cross-provider route
+        let blocked = resolve_role_target(
+            "openai:gpt-5-codex",
+            Some(&openrouter),
+            &settings,
+            &["openai".to_string()],
+        )
+        .expect_err("disabled provider must block role route");
+        assert!(blocked.to_string().contains("PROVIDER_DISABLED"), "{blocked}");
     }
 }

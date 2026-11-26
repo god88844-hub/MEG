@@ -69,13 +69,23 @@ pub(crate) async fn run_request_with_options(
 }
 
 
-pub(crate) async fn run_cold_l3_reviewer(req: ColdReviewRequest<'_>) -> Result<String> {
-    let mut rev_shim = if let Some(profile) = req.provider {
+fn build_role_shim(
+    model_spec: &str,
+    default_provider: Option<&meg_core::providers::ProviderProfile>,
+    fallback_base_url: &str,
+) -> Result<(ShimClient, Option<meg_core::providers::ProviderProfile>)> {
+    let target = meg_core::providers::resolve_role_target_global(model_spec, default_provider)?;
+    let mut client = if let Some(profile) = &target.provider {
         ShimClient::with_profile(profile)?
     } else {
-        ShimClient::with(req.base_url.to_string(), req.reviewer_model.to_string())
+        ShimClient::with(fallback_base_url.to_string(), target.model.clone())
     };
-    rev_shim.model = req.reviewer_model.to_string();
+    client.model = target.model;
+    Ok((client, target.provider))
+}
+
+pub(crate) async fn run_cold_l3_reviewer(req: ColdReviewRequest<'_>) -> Result<String> {
+    let (mut rev_shim, _) = build_role_shim(req.reviewer_model, req.provider.as_ref(), req.base_url)?;
     rev_shim.tools = Vec::new(); // Strictly read-only, tool-less fresh context.
 
     let mut diff_context = String::new();
@@ -188,13 +198,12 @@ pub(crate) async fn run_request_detailed(
         "handoff_id": uuid::Uuid::new_v4().to_string(),
         "role_models": role_models,
     });
-    let mut shim = if let Some(profile) = &request.provider {
-        ShimClient::with_profile(profile)?
-    } else {
-        ShimClient::with(request.base_url.clone(), request.model.clone())
-    };
-    shim.model = request.model.clone();
-    shim.reasoning_effort = if request.provider.as_ref().is_none_or(|p| p.send_effort) {
+    let (mut shim, effective_provider) = build_role_shim(
+        &request.model,
+        request.provider.as_ref(),
+        &request.base_url,
+    )?;
+    shim.reasoning_effort = if effective_provider.as_ref().is_none_or(|p| p.send_effort) {
         Some(if request.effort == "max" {
             "xhigh".into()
         } else {
@@ -237,7 +246,7 @@ pub(crate) async fn run_request_detailed(
     }
     // Catalog discovery belongs to the UI service. Configured endpoints can run
     // without a /models route and without downloading the catalog every turn.
-    if request.provider.is_none() {
+    if effective_provider.is_none() {
         let models = tokio::select! {result=shim.models()=>result,_=request.cancel.cancelled()=>anyhow::bail!("Run cancelled")};
         if let Some(tx) = &tx {
             let _ = tx.send(RunnerMsg::Online(models.is_ok()));
@@ -254,13 +263,16 @@ pub(crate) async fn run_request_detailed(
     });
     shim.tools = build_tool_specs(&registry, request.mode, &catalog, plane.is_some());
     let executor_shim = if let Some(exec_model) = &extras.executor_model {
-        let mut es = if let Some(profile) = &request.provider {
-            ShimClient::with_profile(profile)?
+        let (mut es, exec_profile) = build_role_shim(
+            exec_model,
+            request.provider.as_ref(),
+            &request.base_url,
+        )?;
+        es.reasoning_effort = if exec_profile.as_ref().is_none_or(|p| p.send_effort) {
+            shim.reasoning_effort.clone()
         } else {
-            ShimClient::with(request.base_url.clone(), exec_model.clone())
+            None
         };
-        es.model = exec_model.clone();
-        es.reasoning_effort = shim.reasoning_effort.clone();
         es.tools = shim.tools.clone();
         Some(es)
     } else {
