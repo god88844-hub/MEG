@@ -344,6 +344,10 @@ def run_meg_loop_task(
     max_steps: int = 8,
     timeout_s: float = 90.0,
     no_plane: bool = True,
+    core_six: bool = False,
+    pair_mode: Optional[str] = None,
+    executor_model: Optional[str] = None,
+    reviewer_model: Optional[str] = None,
     meg_bin: Optional[_Path] = None,
 ) -> Dict[str, object]:
     """Execute the real compiled `meg loop` (Loop-2) outer work loop."""
@@ -364,9 +368,16 @@ def run_meg_loop_task(
         "--max-steps",
         str(max_steps),
         "--json",
-        "--",
-        goal,
     ]
+    if core_six:
+        cmd.append("--core-six")
+    if pair_mode:
+        cmd.extend(["--pair-mode", pair_mode])
+    if executor_model:
+        cmd.extend(["--executor-model", executor_model])
+    if reviewer_model:
+        cmd.extend(["--reviewer-model", reviewer_model])
+    cmd.extend(["--", goal])
     env = dict(_os.environ)
     env["MEG_TUI_BASE_URL"] = base_url
     env["MEG_TUI_MODEL"] = pinned_model

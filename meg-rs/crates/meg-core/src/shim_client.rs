@@ -281,13 +281,37 @@ impl ShimClient {
             if self.prompt_caching {
                 mark_anthropic_history_cache_breakpoint(&mut wire_messages);
             }
+            let base_max_tokens: u64 = std::env::var("MEG_ANTHROPIC_MAX_TOKENS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&v| v >= 256)
+                .unwrap_or(4096);
+            let thinking_budget: Option<u64> = self
+                .reasoning_effort
+                .as_deref()
+                .and_then(|eff| match eff.to_ascii_lowercase().as_str() {
+                    "low" => Some(2048),
+                    "medium" => Some(6144),
+                    "high" | "xhigh" | "max" => Some(12288),
+                    _ => None,
+                });
+            let max_tokens = match thinking_budget {
+                Some(b) => base_max_tokens.max(b + 4096),
+                None => base_max_tokens,
+            };
             let mut body = json!({
                 "model": self.model,
                 "messages": wire_messages,
                 "system": system_value,
-                "max_tokens": 4096,
+                "max_tokens": max_tokens,
                 "stream": true
             });
+            if let Some(budget) = thinking_budget {
+                body["thinking"] = json!({
+                    "type": "enabled",
+                    "budget_tokens": budget
+                });
+            }
             if use_native_tools && !self.tools.is_empty() {
                 let mut tools_json: Vec<Value> = self
                     .tools
@@ -422,12 +446,20 @@ impl ShimClient {
                     .and_then(|b| String::from_utf8(b).ok())
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                if snippet.contains("tool")
-                    || snippet.contains("function")
+                let is_schema_or_name_error = snippet.contains("does not match")
+                    || snippet.contains("must match")
+                    || snippet.contains("invalid tool name")
+                    || snippet.contains("invalid function name")
+                    || snippet.contains("input_schema");
+                let endpoint_lacks_tools = snippet.contains("not support")
+                    || snippet.contains("doesn't support")
                     || snippet.contains("unsupported")
-                    || snippet.contains("not support")
                     || snippet.contains("unknown field")
-                {
+                    || snippet.contains("unrecognized")
+                    || ((snippet.contains("tool") || snippet.contains("function"))
+                        && !is_schema_or_name_error
+                        && !snippet.contains("invalid"));
+                if endpoint_lacks_tools && !is_schema_or_name_error {
                     self.tools_rejected.store(true, Ordering::Relaxed);
                     fallback_attempted = true;
                     continue;
@@ -1238,6 +1270,56 @@ mod protocol_regressions {
         assert!(!error.contains("do-not-echo"));
     }
 
+    #[tokio::test]
+    async fn adversarial_schema_error_does_not_disable_native_tools_and_anthropic_maps_effort() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"error":"Invalid function name: string does not match pattern"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut client = ShimClient::with(format!("{}/v1", server.uri()), "strict-model".into());
+        client.tools = vec![ToolSpec {
+            name: "read_file".into(),
+            description: "Read".into(),
+            parameters: json!({"type": "object"}),
+        }];
+        let err = client
+            .chat(&[crate::ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+            }])
+            .await
+            .expect_err("Schema validation error must not silently disable native tools");
+        assert!(err.to_string().contains("400"), "{err}");
+        assert!(
+            !client.tools_rejected.load(std::sync::atomic::Ordering::Relaxed),
+            "tools_rejected must stay false on a single bad schema/name error"
+        );
+
+        let mut anth = ShimClient::with("https://api.anthropic.com/v1".into(), "claude-sonnet".into());
+        anth.kind = crate::providers::ProviderKind::Anthropic;
+        anth.reasoning_effort = Some("high".into());
+        let body = anth.build_request_body(
+            &[crate::ChatMessage {
+                role: "user".into(),
+                content: "plan".into(),
+            }],
+            false,
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 12288);
+        assert!(body["max_tokens"].as_u64().unwrap() >= 16384);
+    }
     #[tokio::test]
     async fn adversarial_truncated_sse_stream_without_terminal_event_errors() {
         use wiremock::matchers::{method, path};

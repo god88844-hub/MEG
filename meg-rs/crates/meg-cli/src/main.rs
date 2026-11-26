@@ -122,7 +122,7 @@ impl LoopEngine for ShimEngine {
             anyhow::ensure!(!cancel.is_cancelled(), "Run cancelled");
             if connected{
                 let plane=plane.context("The MEG control plane is unavailable; run /doctor")?;
-                let (method,params)=if name=="delegate"{("agents.run",serde_json::json!({"workspace":workspace,"role":args["role"].as_str().unwrap_or("researcher"),"task":args["task"],"worker":worker}))}else if name=="read_skill"{("skills.read",serde_json::json!({"workspace":workspace,"name":args["name"]}))}else{("runtime.tool",serde_json::json!({"workspace":workspace,"tool":name,"args":args,"readOnly":read_only}))};
+                let (method,params)=if name=="delegate"{let role_name=args["role"].as_str().unwrap_or("researcher");let mut eff_worker=worker.clone();if let Some(rm)=worker.get("role_models").and_then(|m|m.get(role_name)).and_then(|v|v.as_str()){eff_worker["model"]=serde_json::Value::String(rm.to_string());}("agents.run",serde_json::json!({"workspace":workspace,"role":role_name,"task":args["task"],"worker":eff_worker}))}else if name=="read_skill"{("skills.read",serde_json::json!({"workspace":workspace,"name":args["name"]}))}else{("runtime.tool",serde_json::json!({"workspace":workspace,"tool":name,"args":args,"readOnly":read_only}))};
                 let value=plane.call_with_events(method,params,&cancel,|event|forward_agent_event(&events,event))?;
                 if name=="delegate"{if let Some(tx)=&events{let _=tx.send(RunnerMsg::DelegatedUsage(value["usage"].clone()));}}
                 return Ok(meg_tools::ToolResult{ok:true,output:if let Some(answer)=value["answer"].as_str(){answer.to_string()}else{serde_json::to_string(&value)?}});
@@ -1170,7 +1170,30 @@ async fn run_request_detailed(
         !request.model.trim().is_empty(),
         "No model selected. Connect a provider and choose /model first."
     );
-    let worker = serde_json::json!({"provider":request.provider,"model":request.model,"base_url":request.base_url,"effort":request.effort,"handoff_id":uuid::Uuid::new_v4().to_string()});
+    let (role_ui_cfg, _) = meg_tui::UserUiConfig::load(Some(&request.workspace));
+    let mut role_models = serde_json::Map::new();
+    if let Some(m) = role_ui_cfg.roles.researcher.as_ref().filter(|s| !s.trim().is_empty()) {
+        role_models.insert("researcher".into(), serde_json::Value::String(m.clone()));
+    }
+    if let Some(m) = role_ui_cfg.roles.planner.as_ref().filter(|s| !s.trim().is_empty()) {
+        role_models.insert("planner".into(), serde_json::Value::String(m.clone()));
+    }
+    if let Some(m) = request
+        .reviewer_model
+        .as_ref()
+        .or(role_ui_cfg.roles.reviewer.as_ref())
+        .filter(|s| !s.trim().is_empty())
+    {
+        role_models.insert("reviewer".into(), serde_json::Value::String(m.clone()));
+    }
+    let worker = serde_json::json!({
+        "provider": request.provider,
+        "model": request.model,
+        "base_url": request.base_url,
+        "effort": request.effort,
+        "handoff_id": uuid::Uuid::new_v4().to_string(),
+        "role_models": role_models,
+    });
     let mut shim = if let Some(profile) = &request.provider {
         ShimClient::with_profile(profile)?
     } else {
@@ -1191,15 +1214,32 @@ async fn run_request_detailed(
         let p = plane.clone();
         let workspace = request.workspace.clone();
         let cancel = request.cancel.clone();
-        let value = tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             p.call(
                 "runtime.catalog",
                 serde_json::json!({"workspace":workspace}),
                 &cancel,
             )
         })
-        .await??;
-        catalog = value["catalog"].clone();
+        .await?
+        {
+            Ok(value) => {
+                catalog = value["catalog"].clone();
+            }
+            Err(err) => {
+                if request.cancel.is_cancelled() {
+                    anyhow::bail!("Run cancelled");
+                }
+                let msg = format!(
+                    "Control-plane catalog unavailable ({err}); continuing with native tools."
+                );
+                if let Some(tx) = &tx {
+                    let _ = tx.send(RunnerMsg::Line(msg));
+                } else {
+                    eprintln!("[meg] warning: {msg}");
+                }
+            }
+        }
     }
     // Catalog discovery belongs to the UI service. Configured endpoints can run
     // without a /models route and without downloading the catalog every turn.

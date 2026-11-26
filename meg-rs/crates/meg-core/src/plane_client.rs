@@ -82,7 +82,28 @@ impl PlaneClient {
                     _ => {}
                 }
                 if line.len() > 4 * 1024 * 1024 {
-                    break;
+                    // Drain the rest of this oversized frame without killing the shared reader.
+                    if !line.ends_with(b"\n") {
+                        let mut sink = [0u8; 8192];
+                        loop {
+                            match std::io::Read::read(&mut input, &mut sink) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if sink[..n].contains(&b'\n') {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(id) = extract_jsonrpc_id_prefix(&line) {
+                        if let Some(tx) = responses.lock().unwrap().remove(&id) {
+                            let _ = tx.send(Incoming::Result(Err(
+                                "Control-plane response exceeded 4 MiB safety limit".into(),
+                            )));
+                        }
+                    }
+                    continue;
                 }
                 let Ok(value) = serde_json::from_slice::<Value>(&line) else {
                     continue;
@@ -235,4 +256,17 @@ fn own_process_tree(child: &Child) -> Result<std::os::windows::io::OwnedHandle> 
         );
         Ok(owned)
     }
+}
+
+fn extract_jsonrpc_id_prefix(prefix: &[u8]) -> Option<u64> {
+    let head = std::str::from_utf8(&prefix[..prefix.len().min(256)]).ok()?;
+    let idx = head.find("\"id\"")?;
+    let rest = &head[idx + 4..];
+    let colon = rest.find(':')?;
+    let digits: String = rest[colon + 1..]
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse::<u64>().ok()
 }
