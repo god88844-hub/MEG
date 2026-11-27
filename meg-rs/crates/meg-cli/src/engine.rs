@@ -744,7 +744,9 @@ pub(crate) fn is_verification_command(cmd: &str) -> bool {
     [
         "pytest",
         "python -m pytest",
+        "python3 -m pytest",
         "python -m unittest",
+        "python3 -m unittest",
         "cargo test",
         "cargo check",
         "cargo clippy",

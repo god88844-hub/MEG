@@ -345,20 +345,23 @@ pub fn unix_sandbox_argv(
     let ws = workspace.display().to_string();
     match platform {
         "linux" => {
+            // Mount /tmp BEFORE binding workspace so workspaces under /tmp are not shadowed.
             let mut argv = vec![
                 "bwrap".into(),
                 "--ro-bind".into(),
                 "/".into(),
                 "/".into(),
-                "--bind".into(),
-                ws.clone(),
-                ws,
                 "--dev".into(),
                 "/dev".into(),
                 "--proc".into(),
                 "/proc".into(),
                 "--tmpfs".into(),
                 "/tmp".into(),
+                "--bind".into(),
+                ws.clone(),
+                ws.clone(),
+                "--chdir".into(),
+                ws,
                 "--unshare-pid".into(),
                 "--new-session".into(),
                 "--die-with-parent".into(),
@@ -371,13 +374,22 @@ pub fn unix_sandbox_argv(
         }
         "macos" => {
             let escaped_ws = ws.replace('\\', "\\\\").replace('"', "\\\"");
+            let canon_extra = std::fs::canonicalize(workspace)
+                .ok()
+                .map(|p| p.display().to_string())
+                .filter(|c| c != &ws)
+                .map(|c| {
+                    let esc = c.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!(" (subpath \"{esc}\")")
+                })
+                .unwrap_or_default();
             let net_rule = if allow_network {
                 "(allow network*)"
             } else {
                 "(deny network*)"
             };
             let profile = format!(
-                "(version 1)(deny default)(allow process*)(allow sysctl-read)(allow file-read*){net_rule}(allow file-write* (subpath \"{escaped_ws}\") (subpath \"/tmp\") (subpath \"/private/tmp\") (subpath \"/dev/null\"))"
+                "(version 1)(deny default)(allow process*)(allow sysctl-read)(allow file-read*){net_rule}(allow file-write* (subpath \"{escaped_ws}\"){canon_extra} (subpath \"/tmp\") (subpath \"/private/tmp\") (subpath \"/dev/null\"))"
             );
             vec![
                 "/usr/bin/sandbox-exec".into(),
@@ -403,15 +415,27 @@ pub fn maybe_wrap_unix_command(
         return Ok(None);
     }
     if cfg!(target_os = "linux") {
-        let has_bwrap = command_on_path("bwrap");
-        if has_bwrap {
+        static BWRAP_USABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let bwrap_ok = *BWRAP_USABLE.get_or_init(|| {
+            if !command_on_path("bwrap") {
+                return false;
+            }
+            Command::new("bwrap")
+                .args(["--ro-bind", "/", "/", "--unshare-pid", "--", "true"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+        if bwrap_ok {
             let argv = unix_sandbox_argv("linux", workspace, cmd_line, policy.allow_network);
             let mut c = Command::new(&argv[0]);
             c.args(&argv[1..]).current_dir(workspace);
             return Ok(Some(c));
         }
         if policy.sandbox == SandboxMode::Strict {
-            bail!("SANDBOX_UNAVAILABLE: MEG_SANDBOX=strict requires 'bwrap' (bubblewrap) on Linux");
+            bail!("SANDBOX_UNAVAILABLE: MEG_SANDBOX=strict requires usable 'bwrap' (bubblewrap) on Linux");
         }
     } else if cfg!(target_os = "macos") {
         let has_seatbelt = Path::new("/usr/bin/sandbox-exec").is_file();

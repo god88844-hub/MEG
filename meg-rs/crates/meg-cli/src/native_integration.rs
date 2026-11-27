@@ -34,8 +34,10 @@ async fn fixture() -> MockServer {
     server
 }
 fn request(server: &MockServer) -> meg_tui::RunRequest {
+    let ws = std::env::temp_dir().join(format!("meg-ni-req-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&ws);
     let state = WorkstationState {
-        cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        cwd: ws.to_string_lossy().into_owned(),
         model: "fixture".into(),
         ..Default::default()
     };
@@ -417,7 +419,7 @@ async fn live_antigravity_orchestrator_routes_planner_executor_reintervention_an
         None,
         RunExtras {
             max_steps: Some(8),
-            verify_cmd: Some("python -c \"import calc; assert calc.mul(3, 4) == 12\"".into()),
+            verify_cmd: Some(format!("{} -c \"import calc; assert calc.mul(3, 4) == 12\"", if cfg!(windows) { "python" } else { "python3" })),
             require_verify: true,
             pair_mode: Some("antigravity_orchestrator".into()),
             executor_model: Some("hydrogen-exec".into()),
@@ -566,7 +568,7 @@ async fn anti_stub_gate_withholds_finish_and_recovers_once_stub_removed() {
         None,
         RunExtras {
             max_steps: Some(8),
-            verify_cmd: Some("python -c \"import app; assert app.run() == 42\"".into()),
+            verify_cmd: Some(format!("{} -c \"import app; assert app.run() == 42\"", if cfg!(windows) { "python" } else { "python3" })),
             require_verify: true,
             ..RunExtras::default()
         },
@@ -689,14 +691,19 @@ async fn deliverable_guard_locks_verified_file_and_allows_explicit_unlock() {
         )
         .await
         .unwrap();
-    // Genuine passing test command locks verified deliverable.
+    // Genuine passing test command locks verified deliverable (pure-Rust/Unix portable).
     std::fs::write(
-        target.parent().unwrap().join("verify.test.ts"),
-        "import { test, expect } from 'bun:test'; test('ok', () => expect(1).toBe(1));\n",
+        target.parent().unwrap().join("test_verify.py"),
+        "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): self.assertEqual(1, 1)\n",
     )
     .unwrap();
+    let py_cmd = if cfg!(windows) {
+        "python -m unittest test_verify.py"
+    } else {
+        "python3 -m unittest test_verify.py"
+    };
     engine
-        .execute_tool("bash", &json!({"command": "bun test verify.test.ts"}))
+        .execute_tool("bash", &json!({"command": py_cmd}))
         .await
         .unwrap();
     // Subsequent overwrite without unlock_deliverable is blocked.
