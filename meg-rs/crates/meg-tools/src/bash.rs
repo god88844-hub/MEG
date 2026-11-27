@@ -114,8 +114,7 @@ fn bounded_output<R: Read>(mut reader: R) -> String {
 struct ProcessJob(windows_sys::Win32::Foundation::HANDLE);
 #[cfg(windows)]
 impl ProcessJob {
-    fn attach(child: &std::process::Child, mode: crate::sandbox::SandboxMode) -> Result<Self> {
-        use std::os::windows::io::AsRawHandle;
+    fn create(mode: crate::sandbox::SandboxMode) -> Result<Self> {
         use windows_sys::Win32::System::JobObjects::*;
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
@@ -147,11 +146,20 @@ impl ProcessJob {
                     crate::sandbox::apply_windows_job_ui_restrictions(handle)?;
                 }
             }
-            if AssignProcessToJobObject(handle, child.as_raw_handle() as _) == 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
             Ok(job)
         }
+    }
+
+    fn attach(child: &std::process::Child, mode: crate::sandbox::SandboxMode) -> Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        let job = Self::create(mode)?;
+        unsafe {
+            if AssignProcessToJobObject(job.0, child.as_raw_handle() as _) == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        Ok(job)
     }
 }
 #[cfg(windows)]
@@ -240,7 +248,49 @@ pub fn run_cancellable(
         || (cfg!(windows) && cmd_line.trim_start().starts_with("export "));
     #[cfg(windows)]
     if policy.sandbox == crate::sandbox::SandboxMode::Strict {
-        crate::sandbox::probe_windows_restricted_token()?;
+        let job = ProcessJob::create(policy.sandbox)?;
+        let effective_cmd = if use_ps {
+            translate_posix_for_powershell51(cmd_line)
+        } else {
+            cmd_line.to_string()
+        };
+        let res = crate::sandbox::run_windows_restricted_process(
+            workspace,
+            &effective_cmd,
+            use_ps,
+            &policy,
+            timeout_secs,
+            cancel,
+            job.0,
+        )?;
+        drop(job);
+        let mut body = if res.stderr.is_empty() {
+            res.stdout
+        } else {
+            format!("{}\n[stderr]\n{}", res.stdout, res.stderr)
+        };
+        if body.len() > MAX_OUTPUT {
+            let start = body.floor_char_boundary(HEAD);
+            let end = body.ceil_char_boundary(body.len().saturating_sub(TAIL));
+            body = format!(
+                "{}\n...[truncated {} bytes]...\n{}",
+                &body[..start],
+                end.saturating_sub(start),
+                &body[end..]
+            );
+        }
+        body = crate::security_guards::scrub_sal_observation(&body);
+        if let Some(reason) = res.interrupted {
+            if body.trim().is_empty() {
+                bail!("{reason}");
+            }
+            bail!("{reason}\n{body}");
+        }
+        let formatted = format!("[exit {}]\n{body}", res.exit_code);
+        if res.exit_code != 0 {
+            bail!("{formatted}");
+        }
+        return Ok(formatted);
     }
     let mut cmd = build_sandboxed_command(workspace, cmd_line, use_ps, &policy)?;
     cmd.env("PYTHONDONTWRITEBYTECODE", "1");

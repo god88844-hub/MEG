@@ -266,7 +266,7 @@ impl LoopEngine for ShimEngine {
                         }
                     }
                 }
-            } else if name == "bash" && !unlock {
+            } else if matches!(name.as_str(), "bash" | "shell_session") && !unlock {
                 if let Some(cmd) = args.get("command").or_else(|| args.get("cmd")).and_then(|v| v.as_str()) {
                     let g = guard.lock().unwrap();
                     if let Some(blocked) = g.check_bash(cmd) {
@@ -290,7 +290,7 @@ impl LoopEngine for ShimEngine {
             } else {
                 None
             };
-            let pre_bash_snap = if name == "bash" {
+            let pre_bash_snap = if matches!(name.as_str(), "bash" | "shell_session") {
                 snapshot_workspace_files(&workspace)
             } else {
                 None
@@ -323,7 +323,7 @@ impl LoopEngine for ShimEngine {
                         }
                     }
                 }
-                if name == "bash" {
+                if matches!(name.as_str(), "bash" | "shell_session") {
                     let cmd = args
                         .get("command")
                         .or_else(|| args.get("cmd"))

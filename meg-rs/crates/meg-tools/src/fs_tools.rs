@@ -89,7 +89,45 @@ fn resolve_inner(workspace: &Path, candidate: &str) -> Result<PathBuf> {
     if !canon.starts_with(&ws) {
         bail!("path escapes workspace: {candidate}");
     }
-    Ok(full)
+    Ok(canon)
+}
+
+/// Open a workspace file read-only with symlink TOCTOU verification:
+/// checks `symlink_metadata` before open, opens the handle, and verifies the opened
+/// handle's identity (`dev`/`ino` on Unix) and post-open canonical workspace confinement.
+pub(crate) fn open_confined_readonly(workspace: &Path, full: &Path) -> Result<std::fs::File> {
+    let pre_meta = std::fs::symlink_metadata(full)?;
+    if pre_meta.file_type().is_symlink() {
+        let target = std::fs::canonicalize(full)?;
+        let ws = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+        if !target.starts_with(&ws) {
+            bail!("SYMLINK_TOCTOU_BLOCKED: symlink escapes workspace: {}", full.display());
+        }
+    }
+    let file = std::fs::File::open(full)?;
+    let opened_meta = file.metadata()?;
+    if !opened_meta.is_file() {
+        bail!("not a regular file: {}", full.display());
+    }
+    #[cfg(unix)]
+    if !pre_meta.file_type().is_symlink() {
+        use std::os::unix::fs::MetadataExt;
+        if pre_meta.dev() != opened_meta.dev() || pre_meta.ino() != opened_meta.ino() {
+            bail!(
+                "SYMLINK_TOCTOU_BLOCKED: file identity changed between resolve and open: {}",
+                full.display()
+            );
+        }
+    }
+    // Re-confirm canonical confinement after opening handle
+    if let (Ok(post_canon), Ok(ws_canon)) = (std::fs::canonicalize(full), std::fs::canonicalize(workspace)) {
+        if !post_canon.starts_with(&ws_canon) {
+            bail!("SYMLINK_TOCTOU_BLOCKED: path escaped workspace after open: {}", full.display());
+        }
+    }
+    Ok(file)
 }
 
 /// Read a workspace file. Supports `offset`, `limit` (default 100 lines when paginated),
@@ -134,7 +172,13 @@ pub fn read_file_cached(
         return read_oversized_file(&full, path, file_len, offset, limit, hashlines, numbered);
     }
 
-    let raw_bytes = std::fs::read(&full)?;
+    let raw_bytes = {
+        use std::io::Read;
+        let mut f = open_confined_readonly(workspace, &full)?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        buf
+    };
     let (text, _) = crate::edit::decode_with_bom(&raw_bytes)?;
 
     let content_hash = fnv1a_64(text.as_bytes());
@@ -300,6 +344,11 @@ pub fn write_file(workspace: &Path, args: &Value) -> Result<String> {
     let hot_violations = crate::deliverable_guard::lint_hot_frame_file(&full, content);
     if !hot_violations.is_empty() {
         bail!("HOT_FRAME_LINTER_BLOCKED:\n{}", hot_violations.join("\n"));
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&full) {
+        if meta.file_type().is_symlink() {
+            bail!("SYMLINK_WRITE_BLOCKED: refusing to overwrite symlink '{path}'");
+        }
     }
     if let Some(parent) = full.parent() {
         std::fs::create_dir_all(parent)?;
@@ -672,5 +721,31 @@ mod tests {
         assert!(!page.contains("line-13:"), "{page}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlink_escape_and_write_blocked() {
+        let ws = std::env::temp_dir().join(format!("meg-toctou-ws-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("meg-toctou-out-{}.txt", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(&outside, "outside secret").unwrap();
+        let link = ws.join("escape_link.txt");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&outside, &link).is_ok();
+        if linked {
+            assert!(
+                read_file(&ws, &json!({"path": "escape_link.txt"})).is_err(),
+                "symlink escaping workspace must be rejected on read"
+            );
+            assert!(
+                write_file(&ws, &json!({"path": "escape_link.txt", "content": "x"})).is_err(),
+                "symlink escaping workspace must be rejected on write"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_file(&outside);
     }
 }

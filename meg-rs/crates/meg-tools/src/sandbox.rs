@@ -516,6 +516,261 @@ pub fn probe_windows_restricted_token() -> Result<()> {
     Ok(())
 }
 
+
+/// Result of running a Windows command under a real `CreateRestrictedToken` primary token
+/// attached to a resource + UI-restricted Job Object before the main thread resumes.
+#[cfg(windows)]
+pub(crate) struct RestrictedWindowsOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub interrupted: Option<String>,
+}
+
+#[cfg(windows)]
+fn to_wide_null(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn build_wide_env_block(policy: &PermissionPolicy) -> Vec<u16> {
+    use std::collections::BTreeMap;
+    let mut env_map: BTreeMap<String, String> = BTreeMap::new();
+    for (k, v) in std::env::vars() {
+        if is_secret_env_name(&k) && !policy.env_allow.contains(&k) {
+            continue;
+        }
+        env_map.insert(k, v);
+    }
+    env_map.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
+    env_map.insert("DEBIAN_FRONTEND".into(), "noninteractive".into());
+    env_map.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+    env_map.insert("GIT_EDITOR".into(), "true".into());
+    env_map.insert("PAGER".into(), "cat".into());
+    env_map.insert("PYTHONUNBUFFERED".into(), "1".into());
+    env_map.insert("TERM".into(), "dumb".into());
+    if !policy.allow_network {
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            env_map.insert(key.into(), "http://127.0.0.1:9".into());
+        }
+        env_map.insert("NO_PROXY".into(), "".into());
+        env_map.insert("no_proxy".into(), "".into());
+        env_map.insert("MEG_NETWORK_DISABLED".into(), "1".into());
+    }
+    let mut block: Vec<u16> = Vec::new();
+    for (k, v) in env_map {
+        let entry = format!("{k}={v}");
+        block.extend(entry.encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+/// Spawn and run a Windows command under `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)`
+/// via `CreateProcessAsUserW` (`CREATE_SUSPENDED`), attaching it to a Job Object
+/// with memory/process/UI limits BEFORE resuming the thread.
+#[cfg(windows)]
+pub(crate) fn run_windows_restricted_process(
+    workspace: &Path,
+    cmd_line: &str,
+    use_powershell: bool,
+    policy: &PermissionPolicy,
+    timeout_secs: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+    job_handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<RestrictedWindowsOutput> {
+    use std::io::Read;
+    use std::os::windows::io::FromRawHandle;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::{
+        CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SECURITY_ATTRIBUTES, TOKEN_ASSIGN_PRIMARY,
+        TOKEN_DUPLICATE, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcessToken,
+        ResumeThread, TerminateProcess, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP,
+        CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOW,
+    };
+
+    let full_cmdline = if use_powershell {
+        let escaped = cmd_line.replace('"', "\\\"");
+        format!("powershell.exe -NoProfile -NonInteractive -Command \"{escaped}\"")
+    } else {
+        format!("cmd.exe /S /C \"{cmd_line}\"")
+    };
+    let mut cmd_w = to_wide_null(&full_cmdline);
+    let cwd_w = to_wide_null(&workspace.display().to_string());
+    let mut env_block = build_wide_env_block(policy);
+
+    unsafe {
+        let mut proc_token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+            &mut proc_token,
+        ) == 0
+        {
+            bail!(
+                "OpenProcessToken failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut restricted: HANDLE = std::ptr::null_mut();
+        let ok = CreateRestrictedToken(
+            proc_token,
+            DISABLE_MAX_PRIVILEGE,
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &mut restricted,
+        );
+        CloseHandle(proc_token);
+        if ok == 0 || restricted.is_null() {
+            bail!(
+                "CreateRestrictedToken(DISABLE_MAX_PRIVILEGE) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let sa = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        let mut out_rd: HANDLE = std::ptr::null_mut();
+        let mut out_wr: HANDLE = std::ptr::null_mut();
+        let mut err_rd: HANDLE = std::ptr::null_mut();
+        let mut err_wr: HANDLE = std::ptr::null_mut();
+        if CreatePipe(&mut out_rd, &mut out_wr, &sa, 0) == 0 {
+            CloseHandle(restricted);
+            bail!("CreatePipe(stdout) failed: {}", std::io::Error::last_os_error());
+        }
+        if CreatePipe(&mut err_rd, &mut err_wr, &sa, 0) == 0 {
+            CloseHandle(out_rd);
+            CloseHandle(out_wr);
+            CloseHandle(restricted);
+            bail!("CreatePipe(stderr) failed: {}", std::io::Error::last_os_error());
+        }
+        let _ = SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0);
+        let _ = SetHandleInformation(err_rd, HANDLE_FLAG_INHERIT, 0);
+
+        let mut si: STARTUPINFOW = std::mem::zeroed();
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = INVALID_HANDLE_VALUE;
+        si.hStdOutput = out_wr;
+        si.hStdError = err_wr;
+
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        let flags = CREATE_SUSPENDED
+            | CREATE_NEW_PROCESS_GROUP
+            | CREATE_NO_WINDOW
+            | CREATE_UNICODE_ENVIRONMENT;
+        let created = CreateProcessAsUserW(
+            restricted,
+            std::ptr::null(),
+            cmd_w.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1, // inherit pipe write handles
+            flags,
+            env_block.as_mut_ptr() as *mut std::ffi::c_void,
+            cwd_w.as_ptr(),
+            &si,
+            &mut pi,
+        );
+        CloseHandle(restricted);
+        CloseHandle(out_wr);
+        CloseHandle(err_wr);
+
+        if created == 0 {
+            let err = std::io::Error::last_os_error();
+            CloseHandle(out_rd);
+            CloseHandle(err_rd);
+            bail!("CreateProcessAsUserW(restricted token) failed: {err}");
+        }
+
+        if AssignProcessToJobObject(job_handle, pi.hProcess) == 0 {
+            let err = std::io::Error::last_os_error();
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            CloseHandle(out_rd);
+            CloseHandle(err_rd);
+            bail!("AssignProcessToJobObject(restricted) failed: {err}");
+        }
+
+        ResumeThread(pi.hThread);
+        CloseHandle(pi.hThread);
+
+        let mut out_file = std::fs::File::from_raw_handle(out_rd as _);
+        let mut err_file = std::fs::File::from_raw_handle(err_rd as _);
+        let out_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out_file.by_ref().take(64 * 1024).read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+        let err_thread = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err_file.by_ref().take(64 * 1024).read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let mut interrupted = None;
+        loop {
+            let wait = WaitForSingleObject(pi.hProcess, 25);
+            if wait == 0 {
+                break;
+            }
+            if cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                interrupted = Some(if cancel.load(Ordering::SeqCst) {
+                    "Run cancelled".to_string()
+                } else {
+                    format!("command timed out after {timeout_secs}s")
+                });
+                TerminateProcess(pi.hProcess, 1);
+                let _ = WaitForSingleObject(pi.hProcess, 2_000);
+                break;
+            }
+        }
+        let mut exit_code: u32 = 1;
+        let _ = GetExitCodeProcess(pi.hProcess, &mut exit_code);
+        CloseHandle(pi.hProcess);
+
+        let stdout = out_thread.join().unwrap_or_default();
+        let stderr = err_thread.join().unwrap_or_default();
+        Ok(RestrictedWindowsOutput {
+            exit_code: exit_code as i32,
+            stdout,
+            stderr,
+            interrupted,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

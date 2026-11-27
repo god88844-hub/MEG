@@ -8,6 +8,7 @@ pub mod grep;
 pub mod journal;
 pub mod ledger;
 pub mod lsp;
+pub mod pty_shell;
 pub mod registry;
 pub mod sandbox;
 pub mod security_guards;

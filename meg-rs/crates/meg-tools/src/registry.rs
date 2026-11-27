@@ -264,6 +264,18 @@ fn finish_schema() -> Value {
     })
 }
 
+fn shell_session_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": ["exec", "status", "reset", "close"], "description": "Session action (default 'exec')." },
+            "session_id": { "type": "string", "description": "Optional session name (default 'default')." },
+            "command": { "type": "string", "description": "Shell command to run in the persistent session when action='exec'." },
+            "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 600 }
+        }
+    })
+}
+
 fn list_dir_schema() -> Value {
     json!({
         "type": "object",
@@ -403,6 +415,14 @@ impl ToolRegistry {
                 move |args| fs_tools::list_dir(&ws, args)
             },
         );
+        let shell_mgr = crate::pty_shell::ShellSessionManager::new(workspace);
+        let no_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        reg.register_with_schema(
+            "shell_session",
+            "Persistent stateful shell session preserving cwd & env across calls: {action?: 'exec'|'status'|'reset'|'close', session_id?, command?, timeout_seconds?}.",
+            shell_session_schema(),
+            move |args| shell_mgr.execute(args, &no_cancel),
+        );
         reg
     }
 
@@ -458,6 +478,14 @@ impl ToolRegistry {
             "Unified glob/regex search with cancellation.",
             glob_grep_schema(),
             move |args| run_glob_grep(&gg_ws, args, Some(&gg_cancel)),
+        );
+        let shell_mgr = crate::pty_shell::ShellSessionManager::new(workspace);
+        let shell_cancel = cancel.clone();
+        registry.register_with_schema(
+            "shell_session",
+            "Persistent stateful shell session preserving cwd & env with cancellation.",
+            shell_session_schema(),
+            move |args| shell_mgr.execute(args, &shell_cancel),
         );
         let ws = workspace.to_path_buf();
         registry.register_with_schema(
