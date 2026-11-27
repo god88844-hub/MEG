@@ -44,9 +44,12 @@ fn spawn_detached(cmd: &mut Command) -> Result<std::process::Child> {
 #[cfg(unix)]
 fn spawn_detached(cmd: &mut Command) -> Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
+    extern "C" {
+        fn setsid() -> i32;
+    }
     unsafe {
         cmd.pre_exec(|| {
-            libc::setsid();
+            setsid();
             Ok(())
         });
     }

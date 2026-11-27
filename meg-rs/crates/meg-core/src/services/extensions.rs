@@ -393,7 +393,15 @@ impl WorkspaceExtensions {
         sha256_hex(&raw)
     }
 
+    fn trust_store_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     fn set_trust(&self, name: &str, config: &McpConfig, enabled: bool) -> Result<()> {
+        let _guard = Self::trust_store_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let file = config_root().join("mcp-trust.json");
         let mut value = read_json_bounded(&file, json!({}))?;
         let key = self.trust_key(name);
@@ -408,9 +416,15 @@ impl WorkspaceExtensions {
     }
 
     pub fn reconnect_trusted(&self) {
-        let file = config_root().join("mcp-trust.json");
-        let Ok(trusted) = read_json_bounded(&file, json!({})) else {
-            return;
+        let trusted = {
+            let _guard = Self::trust_store_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let file = config_root().join("mcp-trust.json");
+            match read_json_bounded(&file, json!({})) {
+                Ok(v) => v,
+                Err(_) => return,
+            }
         };
         let Ok(configs) = self.configs() else {
             return;
