@@ -54,24 +54,44 @@ fn save_entries_atomic(journal: &Path, entries: &[Value]) -> Result<()> {
     Ok(())
 }
 
+const MAX_CHECKPOINT_BYTES: u64 = 2 * 1024 * 1024;
+
 pub struct FileCheckpoint {
     path: PathBuf,
     before: Option<Vec<u8>>,
+    skipped_oversized: bool,
 }
 
 impl FileCheckpoint {
     pub fn capture(workspace: &Path, args: &Value) -> Result<Self> {
         let path =
             crate::fs_tools::resolve(workspace, args["path"].as_str().context("Missing path")?)?;
+        if path.exists() && std::fs::metadata(&path)?.len() > MAX_CHECKPOINT_BYTES {
+            return Ok(Self {
+                path,
+                before: None,
+                skipped_oversized: true,
+            });
+        }
         let before = if path.exists() {
             Some(std::fs::read(&path)?)
         } else {
             None
         };
-        Ok(Self { path, before })
+        Ok(Self {
+            path,
+            before,
+            skipped_oversized: false,
+        })
     }
 
     pub fn commit(self, workspace: &Path) -> Result<()> {
+        if self.skipped_oversized {
+            return Ok(());
+        }
+        if std::fs::metadata(&self.path)?.len() > MAX_CHECKPOINT_BYTES {
+            return Ok(());
+        }
         let after = std::fs::read(&self.path)?;
         let journal = journal_path(workspace);
         let mut entries = load_entries(&journal).unwrap_or_default();
@@ -90,6 +110,9 @@ impl FileCheckpoint {
     /// Commit the undo entry; if saving the journal fails, restore the file to its
     /// pre-edit state so a mutation never lands without a matching undo record.
     pub fn commit_or_rollback(self, workspace: &Path) -> Result<()> {
+        if self.skipped_oversized {
+            return Ok(());
+        }
         let path = self.path.clone();
         let before = self.before.clone();
         if let Err(err) = self.commit(workspace) {
@@ -527,5 +550,21 @@ mod tests {
             "Failed journal commit must roll back the file mutation"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_file_checkpoint_skips_json_bloat_without_oom() {
+        let ws = std::env::temp_dir().join(format!("meg-ckpt-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let big = ws.join("blob.bin");
+        std::fs::write(&big, vec![b'x'; (MAX_CHECKPOINT_BYTES as usize) + 1024]).unwrap();
+
+        let ckpt = FileCheckpoint::capture(&ws, &json!({"path": "blob.bin"})).unwrap();
+        assert!(ckpt.skipped_oversized);
+        ckpt.commit_or_rollback(&ws).unwrap();
+        assert_eq!(depth(&ws), 0, "oversized file must not bloat undo_journal.json");
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

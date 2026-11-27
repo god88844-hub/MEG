@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const MAX_READ_BYTES: usize = 50_000;
+const MAX_LOAD_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_STREAM_SCAN_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LIST_SCAN_ENTRIES: usize = 10_000;
 pub const DEFAULT_VIEW_LINES: usize = 100;
 pub const MAX_SEARCH_HITS: usize = 50;
 
@@ -111,9 +114,6 @@ pub fn read_file_cached(
             "SECRET_AIRLOCK: direct read of '{path}' is blocked (.env* files cannot enter model context; use .env.example)"
         );
     }
-    let raw_bytes = std::fs::read(&full)?;
-    let (text, _) = crate::edit::decode_with_bom(&raw_bytes)?;
-
     let offset = args.get("offset").and_then(Value::as_u64).map(|n| n as usize);
     let limit = args.get("limit").and_then(Value::as_u64).map(|n| n as usize);
     let hashlines = args
@@ -128,6 +128,14 @@ pub fn read_file_cached(
             .unwrap_or(false)
         || offset.is_some()
         || limit.is_some();
+
+    let file_len = std::fs::metadata(&full)?.len();
+    if file_len > MAX_LOAD_FILE_BYTES {
+        return read_oversized_file(&full, path, file_len, offset, limit, hashlines, numbered);
+    }
+
+    let raw_bytes = std::fs::read(&full)?;
+    let (text, _) = crate::edit::decode_with_bom(&raw_bytes)?;
 
     let content_hash = fnv1a_64(text.as_bytes());
     let total_lines = text.lines().count();
@@ -186,6 +194,85 @@ pub fn read_file_cached(
     Ok(cap_utf8(crate::security_guards::scrub_sal_observation(&text), MAX_READ_BYTES))
 }
 
+fn read_oversized_file(
+    full: &Path,
+    path: &str,
+    file_len: u64,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    hashlines: bool,
+    numbered: bool,
+) -> Result<String> {
+    use std::io::{BufRead, BufReader, Read};
+    let mut file = std::fs::File::open(full)?;
+    if numbered {
+        let start = offset.unwrap_or(1).max(1);
+        let count = limit.unwrap_or(DEFAULT_VIEW_LINES).clamp(1, 2_000);
+        let target_end = start.saturating_add(count).saturating_sub(1);
+        let mut reader = BufReader::new(file);
+        let mut collected: Vec<String> = Vec::new();
+        let mut line_no = 0usize;
+        let mut scanned_bytes = 0usize;
+        let mut raw_line = Vec::new();
+        let mut hit_scan_cap = false;
+        while line_no < target_end {
+            raw_line.clear();
+            let n = reader.read_until(b'\n', &mut raw_line)?;
+            if n == 0 {
+                break;
+            }
+            scanned_bytes = scanned_bytes.saturating_add(n);
+            line_no += 1;
+            if line_no >= start {
+                let s = String::from_utf8_lossy(&raw_line)
+                    .trim_end_matches(&['\r', '\n'][..])
+                    .to_string();
+                collected.push(s);
+            }
+            if scanned_bytes >= MAX_STREAM_SCAN_BYTES {
+                hit_scan_cap = true;
+                break;
+            }
+        }
+        if collected.is_empty() {
+            if hit_scan_cap {
+                return Ok(format!(
+                    "[{path}: file is {file_len} bytes; stream scan reached {} MiB limit at line {line_no} before offset {start}; use grep_files to narrow down]",
+                    MAX_STREAM_SCAN_BYTES / (1024 * 1024)
+                ));
+            }
+            return Ok(format!(
+                "[{path}: offset {start} is past end of file ({line_no} lines)]"
+            ));
+        }
+        let end_no = start + collected.len() - 1;
+        let mut out = format!("[{path}: lines {start}-{end_no} (streamed from {file_len}B file)]\n");
+        let refs: Vec<&str> = collected.iter().map(String::as_str).collect();
+        if hashlines {
+            out.push_str(&crate::edit::format_hashlines(&refs, start));
+        } else {
+            for (idx, line) in refs.iter().enumerate() {
+                out.push_str(&format!("{:>4} | {line}\n", start + idx));
+            }
+        }
+        let out = out.trim_end_matches('\n').to_string();
+        return Ok(cap_utf8(
+            crate::security_guards::scrub_sal_observation(&out),
+            MAX_READ_BYTES,
+        ));
+    }
+
+    let mut buf = Vec::with_capacity(MAX_READ_BYTES.min(file_len as usize));
+    file.by_ref().take(MAX_READ_BYTES as u64).read_to_end(&mut buf)?;
+    let prefix = String::from_utf8_lossy(&buf).into_owned();
+    let scrubbed = crate::security_guards::scrub_sal_observation(&prefix);
+    let clipped = cap_utf8(scrubbed, MAX_READ_BYTES.saturating_sub(256));
+    Ok(format!(
+        "{clipped}\n...[file is {file_len} bytes (> {} MiB full-load cap); showing bounded prefix ? use offset/limit or grep_files]",
+        MAX_LOAD_FILE_BYTES / (1024 * 1024)
+    ))
+}
+
 fn cap_utf8(text: String, max_bytes: usize) -> String {
     if text.len() > max_bytes {
         let end = text.floor_char_boundary(max_bytes);
@@ -242,7 +329,12 @@ pub fn list_dir(workspace: &Path, args: &Value) -> Result<String> {
     ensure!(full.is_dir(), "not a directory: {rel_path}");
 
     let mut items: Vec<(bool, String, u64)> = Vec::new();
+    let mut scan_capped = false;
     for entry in std::fs::read_dir(&full)?.filter_map(|e| e.ok()) {
+        if items.len() >= MAX_LIST_SCAN_ENTRIES {
+            scan_capped = true;
+            break;
+        }
         let name = entry.file_name().to_string_lossy().to_string();
         if !include_ignored && is_ignored_name(&name) {
             continue;
@@ -259,6 +351,11 @@ pub fn list_dir(workspace: &Path, args: &Value) -> Result<String> {
     }
     let total = items.len();
     let mut lines = Vec::new();
+    if scan_capped {
+        lines.push(format!(
+            "[directory scan capped at {MAX_LIST_SCAN_ENTRIES} entries; narrow path or use search_files]"
+        ));
+    }
     for (is_file, name, size) in items.into_iter().take(max_entries) {
         if is_file {
             lines.push(format!("file {name} ({size}B)"));
@@ -541,6 +638,39 @@ mod tests {
         let out = read_file(&dir, &serde_json::json!({ "path": "note.txt" }))
             .expect("read_file must support UTF-16LE BOM files");
         assert!(out.contains("hello utf16"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_file_uses_bounded_prefix_and_streamed_pagination() {
+        let dir = std::env::temp_dir().join(format!("meg-oversized-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let big = dir.join("huge.log");
+        let line = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let repeats = (MAX_LOAD_FILE_BYTES as usize / line.len()) + 50;
+        let mut f = std::fs::File::create(&big).unwrap();
+        use std::io::Write;
+        for i in 1..=repeats {
+            writeln!(f, "line-{i}: {line}").unwrap();
+        }
+        drop(f);
+
+        let raw = read_file(&dir, &serde_json::json!({"path": "huge.log"})).unwrap();
+        assert!(raw.contains("full-load cap"), "{raw}");
+        assert!(raw.len() <= MAX_READ_BYTES + 256);
+
+        let page = read_file(
+            &dir,
+            &serde_json::json!({"path": "huge.log", "offset": 10, "limit": 3, "hashlines": true}),
+        )
+        .unwrap();
+        assert!(page.contains("streamed from"), "{page}");
+        assert!(page.contains("line-10:"), "{page}");
+        assert!(page.contains("line-12:"), "{page}");
+        assert!(!page.contains("line-13:"), "{page}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

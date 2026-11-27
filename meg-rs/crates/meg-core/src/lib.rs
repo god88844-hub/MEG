@@ -911,7 +911,7 @@ pub fn compact_transcript(
     }
 
     if total_len(messages) <= max_chars {
-        return 0;
+        return dropped_prior;
     }
 
     // Pass 2: group middle messages into atomic units and drop oldest units.
@@ -954,12 +954,21 @@ pub fn compact_transcript(
     }
 
     if dropped_groups > 0 {
+        let digest_cap = (max_chars / 6).min(600);
+        let carry_forward =
+            extract_compaction_carry_forward(&groups[..first_kept_group], digest_cap);
         let mut rebuilt = head;
         if let Some(goal_msg) = rebuilt.get_mut(goal_msg_idx) {
             if !goal_msg.content.contains("[Context compacted:") {
-                goal_msg.content.push_str(&format!(
-                    "\n\n[Context compacted: {dropped_groups} earlier turn(s) omitted to stay within context budget.]"
-                ));
+                if carry_forward.is_empty() {
+                    goal_msg.content.push_str(&format!(
+                        "\n\n[Context compacted: {dropped_groups} earlier turn(s) omitted to stay within context budget.]"
+                    ));
+                } else {
+                    goal_msg.content.push_str(&format!(
+                        "\n\n[Context compacted: {dropped_groups} earlier turn(s) omitted to stay within context budget.\n{carry_forward}]"
+                    ));
+                }
             }
         }
         for group in groups.into_iter().skip(first_kept_group) {
@@ -969,6 +978,68 @@ pub fn compact_transcript(
         *messages = rebuilt;
     }
     dropped_prior + dropped_groups
+}
+
+fn extract_compaction_carry_forward(dropped: &[Vec<ChatMessage>], max_bytes: usize) -> String {
+    if max_bytes < 80 {
+        return String::new();
+    }
+    let mut files = std::collections::BTreeSet::new();
+    let mut errors: Vec<String> = Vec::new();
+    for group in dropped {
+        for msg in group {
+            for token in msg.content.split_whitespace() {
+                let clean = token.trim_matches(|c: char| {
+                    matches!(c, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':')
+                });
+                if files.len() < 8
+                    && clean.len() >= 4
+                    && clean.len() <= 96
+                    && (clean.contains('/') || clean.contains('\\'))
+                    && clean.contains('.')
+                    && !clean.starts_with("http")
+                {
+                    files.insert(clean.to_string());
+                }
+            }
+            for line in msg.content.lines() {
+                if errors.len() >= 4 {
+                    break;
+                }
+                let trimmed = line.trim();
+                let low = trimmed.to_ascii_lowercase();
+                if (low.contains("error[")
+                    || low.contains("failed:")
+                    || low.contains("panic")
+                    || low.contains("traceback")
+                    || low.contains("assertion"))
+                    && !trimmed.is_empty()
+                {
+                    let snippet: String = trimmed.chars().take(110).collect();
+                    if !errors.contains(&snippet) {
+                        errors.push(snippet);
+                    }
+                }
+            }
+        }
+    }
+    let mut parts = Vec::new();
+    if !files.is_empty() {
+        parts.push(format!(
+            "Touched/referenced files: {}",
+            files.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !errors.is_empty() {
+        parts.push(format!("Prior failures/errors: {}", errors.join(" | ")));
+    }
+    let joined = parts.join("\n");
+    if joined.len() > max_bytes {
+        let cut = joined.floor_char_boundary(max_bytes);
+        format!("{}...", &joined[..cut])
+    } else {
+        joined
+    }
 }
 
 fn strip_image_markers(text: &str) -> String {
@@ -1388,5 +1459,36 @@ mod production_loop_regressions {
             "Plain code answer was mistaken for a broken JSON action"
         );
         assert_eq!(outcomes.len(), 1);
+    }
+
+    #[test]
+    fn compact_transcript_carries_forward_dropped_files_and_errors() {
+        use crate::{compact_transcript, ChatMessage};
+        let mut msgs = vec![
+            ChatMessage { role: "system".into(), content: "sys".into() },
+            ChatMessage { role: "user".into(), content: "GOAL: fix auth bug".into() },
+        ];
+        msgs.push(ChatMessage {
+            role: "assistant".into(),
+            content: format!("Inspecting src/auth/login.rs {}", "a".repeat(800)),
+        });
+        msgs.push(ChatMessage {
+            role: "user".into(),
+            content: format!("error[E0308]: mismatched types in src/auth/login.rs\n{}", "b".repeat(800)),
+        });
+        for i in 0..4 {
+            msgs.push(ChatMessage {
+                role: "assistant".into(),
+                content: format!("step {i} {}", "c".repeat(400)),
+            });
+            msgs.push(ChatMessage {
+                role: "user".into(),
+                content: format!("obs {i} {}", "d".repeat(400)),
+            });
+        }
+        let dropped = compact_transcript(&mut msgs, 1, 2_200);
+        assert!(dropped > 0);
+        assert!(msgs[1].content.contains("src/auth/login.rs"), "{}", msgs[1].content);
+        assert!(msgs[1].content.contains("error[E0308]"), "{}", msgs[1].content);
     }
 }

@@ -765,7 +765,7 @@ fn build_structured_compaction_summary(
     }
 
     let mut out = format!(
-        "[Structured Context Compaction ? {} older messages archived at {}]\n",
+        "[Structured Context Compaction - {} older messages archived at {}]\n",
         older.len(),
         archive_path.display()
     );
@@ -790,5 +790,6 @@ fn build_structured_compaction_summary(
             out.push_str(&format!("- {d}\n"));
         }
     }
+    out.push_str("Restorable Archive: use read_file on the archived JSON path only if an omitted detail is needed.\n");
     out
 }
