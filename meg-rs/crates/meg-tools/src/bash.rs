@@ -111,7 +111,7 @@ fn bounded_output<R: Read>(mut reader: R) -> String {
 struct ProcessJob(windows_sys::Win32::Foundation::HANDLE);
 #[cfg(windows)]
 impl ProcessJob {
-    fn attach(child: &std::process::Child, apply_ui_limits: bool) -> Result<Self> {
+    fn attach(child: &std::process::Child, mode: crate::sandbox::SandboxMode) -> Result<Self> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::*;
         unsafe {
@@ -121,7 +121,15 @@ impl ProcessJob {
             }
             let job = Self(handle);
             let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let mut flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            let job_cfg = crate::sandbox::windows_job_limits(mode);
+            if let Some(cfg) = job_cfg {
+                flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_JOB_MEMORY;
+                limits.BasicLimitInformation.ActiveProcessLimit = cfg.max_active_processes;
+                limits.JobMemoryLimit = cfg.max_job_memory_bytes;
+            }
+            limits.BasicLimitInformation.LimitFlags = flags;
             if SetInformationJobObject(
                 handle,
                 JobObjectExtendedLimitInformation,
@@ -131,8 +139,10 @@ impl ProcessJob {
             {
                 return Err(std::io::Error::last_os_error().into());
             }
-            if apply_ui_limits {
-                crate::sandbox::apply_windows_job_ui_restrictions(handle)?;
+            if let Some(cfg) = job_cfg {
+                if cfg.apply_ui_limits {
+                    crate::sandbox::apply_windows_job_ui_restrictions(handle)?;
+                }
             }
             if AssignProcessToJobObject(handle, child.as_raw_handle() as _) == 0 {
                 return Err(std::io::Error::last_os_error().into());
@@ -225,14 +235,19 @@ pub fn run_cancellable(
         .clamp(1, 600);
     let use_ps = args.get("shell").and_then(Value::as_str) == Some("powershell")
         || (cfg!(windows) && cmd_line.trim_start().starts_with("export "));
+    #[cfg(windows)]
+    if policy.sandbox == crate::sandbox::SandboxMode::Strict {
+        crate::sandbox::probe_windows_restricted_token()?;
+    }
     let mut cmd = build_sandboxed_command(workspace, cmd_line, use_ps, &policy)?;
     cmd.env("PYTHONDONTWRITEBYTECODE", "1");
     headless_env(&mut cmd);
     crate::sandbox::scrub_command_env(&mut cmd, &policy);
+    crate::sandbox::apply_network_policy_env(&mut cmd, &policy);
     let mut child = spawn_detached(&mut cmd)?;
     let pid = child.id();
     #[cfg(windows)]
-    let job = match ProcessJob::attach(&child, policy.sandbox != crate::sandbox::SandboxMode::Off) {
+    let job = match ProcessJob::attach(&child, policy.sandbox) {
         Ok(job) => Some(job),
         Err(error) => {
             if child.try_wait()?.is_none() {
@@ -510,6 +525,31 @@ mod p1_08_tests {
         let asked = run(&ws, &serde_json::json!({ "command": "echo needs_approval" }))
             .expect_err("ask rule must fail closed without MEG_APPROVE_ASK=1");
         assert!(asked.to_string().contains("PERMISSION_ASK_REQUIRED"), "{asked}");
+
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn live_bash_strict_sandbox_enforces_job_limits_and_network_sinkhole() {
+        let ws = std::env::temp_dir().join(format!("meg-bash-strict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join(".meg")).unwrap();
+        std::fs::write(
+            ws.join(".meg").join("permissions.json"),
+            r#"{"sandbox": "strict", "network": false}"#,
+        )
+        .unwrap();
+
+        let cmd = if cfg!(windows) {
+            "echo PROXY=%HTTP_PROXY%"
+        } else {
+            "echo PROXY=$HTTP_PROXY"
+        };
+        let out = run(&ws, &serde_json::json!({"command": cmd})).unwrap();
+        assert!(
+            out.contains("PROXY=http://127.0.0.1:9"),
+            "expected network-off sinkhole proxy under strict sandbox, got: {out}"
+        );
 
         let _ = std::fs::remove_dir_all(&ws);
     }

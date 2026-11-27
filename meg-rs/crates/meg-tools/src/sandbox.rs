@@ -223,6 +223,8 @@ pub fn is_secret_env_name(name: &str) -> bool {
             | "MISTRAL_API_KEY"
             | "XAI_API_KEY"
             | "MEG_API_KEY"
+            | "MEG_TUI_API_KEY"
+            | "MEG_RECEIPT_KEY"
             | "GH_TOKEN"
             | "GITHUB_TOKEN"
             | "GITLAB_TOKEN"
@@ -268,6 +270,55 @@ pub fn scrub_command_env(cmd: &mut Command, policy: &PermissionPolicy) -> usize 
     removed
 }
 
+/// Defense-in-depth proxy sinkhole when `.meg/permissions.json` or `MEG_SANDBOX_NET=0`
+/// disables outbound network access. Complements OS-level `--unshare-net` / Seatbelt denial
+/// and protects Windows where non-admin firewall rules are unavailable.
+pub fn apply_network_policy_env(cmd: &mut Command, policy: &PermissionPolicy) {
+    if !policy.allow_network {
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            cmd.env(key, "http://127.0.0.1:9");
+        }
+        cmd.env("NO_PROXY", "");
+        cmd.env("no_proxy", "");
+    }
+}
+
+/// Resource & fork-bomb bounds enforced by Windows Job Objects per sandbox mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsJobLimits {
+    pub max_active_processes: u32,
+    pub max_job_memory_bytes: usize,
+    pub apply_ui_limits: bool,
+}
+
+/// Resolve Windows Job Object resource limits for the active `SandboxMode`.
+pub fn windows_job_limits(mode: SandboxMode) -> Option<WindowsJobLimits> {
+    let env_mb = std::env::var("MEG_SANDBOX_MAX_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&mb| mb >= 256);
+    match mode {
+        SandboxMode::Off => None,
+        SandboxMode::Auto => Some(WindowsJobLimits {
+            max_active_processes: 128,
+            max_job_memory_bytes: env_mb.unwrap_or(4096).saturating_mul(1024 * 1024),
+            apply_ui_limits: true,
+        }),
+        SandboxMode::Strict => Some(WindowsJobLimits {
+            max_active_processes: 64,
+            max_job_memory_bytes: env_mb.unwrap_or(2048).saturating_mul(1024 * 1024),
+            apply_ui_limits: true,
+        }),
+    }
+}
+
 fn command_on_path(bin: &str) -> bool {
     let p = Path::new(bin);
     if p.components().count() > 1 {
@@ -308,6 +359,8 @@ pub fn unix_sandbox_argv(
                 "/proc".into(),
                 "--tmpfs".into(),
                 "/tmp".into(),
+                "--unshare-pid".into(),
+                "--new-session".into(),
                 "--die-with-parent".into(),
             ];
             if !allow_network {
@@ -528,5 +581,24 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(job);
             res.expect("JobObjectBasicUIRestrictions should succeed on Windows");
         }
+    }
+
+    #[test]
+    fn phase6c_sandbox_hardening_invariants() {
+        assert!(is_secret_env_name("MEG_RECEIPT_KEY"));
+        assert!(is_secret_env_name("MEG_TUI_API_KEY"));
+
+        let linux = unix_sandbox_argv("linux", Path::new("/work/repo"), "pytest", false);
+        assert!(linux.contains(&"--unshare-pid".to_string()));
+        assert!(linux.contains(&"--new-session".to_string()));
+        assert!(linux.contains(&"--die-with-parent".to_string()));
+        assert!(linux.contains(&"--unshare-net".to_string()));
+
+        assert!(windows_job_limits(SandboxMode::Off).is_none());
+        let auto = windows_job_limits(SandboxMode::Auto).unwrap();
+        let strict = windows_job_limits(SandboxMode::Strict).unwrap();
+        assert!(strict.max_active_processes < auto.max_active_processes);
+        assert!(strict.max_job_memory_bytes <= auto.max_job_memory_bytes);
+        assert!(strict.apply_ui_limits);
     }
 }
