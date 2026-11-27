@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "meg-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "meg-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "meg-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "meg-core",
  "meg-tools",
@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "meg-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "regex",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "meg-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
