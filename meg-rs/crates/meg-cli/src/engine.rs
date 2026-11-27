@@ -170,6 +170,7 @@ impl LoopEngine for ShimEngine {
         let sealed = self.sealed.clone();
         let aepn = self.aepn.clone();
         let edited_files = self.edited_files.clone();
+        let verify_passed = self.verify_passed.clone();
         let result = tokio::task::spawn_blocking(move || -> Result<meg_tools::ToolResult> {
             anyhow::ensure!(!cancel.is_cancelled(), "Run cancelled");
             if connected{
@@ -200,9 +201,38 @@ impl LoopEngine for ShimEngine {
                         serde_json::json!({"workspace": workspace, "role": role_name, "task": args["task"], "worker": eff_worker}),
                     )
                 }else if name=="read_skill"{("skills.read",serde_json::json!({"workspace":workspace,"name":args["name"]}))}else{("runtime.tool",serde_json::json!({"workspace":workspace,"tool":name,"args":args,"readOnly":read_only}))};
-                let value=plane.call_with_events(method,params,&cancel,|event|forward_agent_event(&events,event))?;
-                if name=="delegate"{if let Some(tx)=&events{let _=tx.send(RunnerMsg::DelegatedUsage(value["usage"].clone()));}}
-                return Ok(meg_tools::ToolResult{ok:true,output:if let Some(answer)=value["answer"].as_str(){answer.to_string()}else{serde_json::to_string(&value)?}});
+                let pre_mcp_snap = if name.starts_with("mcp__") || name.starts_with("mcp:") {
+                    snapshot_workspace_files(&workspace)
+                } else {
+                    None
+                };
+                let value = plane.call_with_events(method, params, &cancel, |event| {
+                    forward_agent_event(&events, event)
+                })?;
+                if let Some(before) = pre_mcp_snap {
+                    if let Some(after) = snapshot_workspace_files(&workspace) {
+                        record_workspace_mutations(
+                            &before,
+                            &after,
+                            &aepn,
+                            &edited_files,
+                            &verify_passed,
+                        );
+                    }
+                }
+                if name == "delegate" {
+                    if let Some(tx) = &events {
+                        let _ = tx.send(RunnerMsg::DelegatedUsage(value["usage"].clone()));
+                    }
+                }
+                return Ok(meg_tools::ToolResult {
+                    ok: true,
+                    output: if let Some(answer) = value["answer"].as_str() {
+                        answer.to_string()
+                    } else {
+                        serde_json::to_string(&value)?
+                    },
+                });
             }
             if let Err(locked_msg) = read_only_lock.guard_mutation(&name) {
                 return Ok(meg_tools::ToolResult { ok: false, output: locked_msg });
@@ -268,21 +298,13 @@ impl LoopEngine for ShimEngine {
             let result = registry.execute(&name, &args);
             if let Some(before) = pre_bash_snap {
                 if let Some(after) = snapshot_workspace_files(&workspace) {
-                    let mut shell_changed = Vec::new();
-                    for (path, sig) in &after {
-                        if before.get(path) != Some(sig) {
-                            shell_changed.push(path.clone());
-                        }
-                    }
-                    if !shell_changed.is_empty() {
-                        let _ = aepn.lock().unwrap().on_code_edit();
-                        let mut ef = edited_files.lock().unwrap();
-                        for p in shell_changed {
-                            if !ef.contains(&p) {
-                                ef.push(p);
-                            }
-                        }
-                    }
+                    record_workspace_mutations(
+                        &before,
+                        &after,
+                        &aepn,
+                        &edited_files,
+                        &verify_passed,
+                    );
                 }
             }
             if result.ok {
@@ -291,6 +313,7 @@ impl LoopEngine for ShimEngine {
                         anyhow::anyhow!("Undo journal could not be saved; file edit was rolled back: {e}")
                     })?;
                     let _ = aepn.lock().unwrap().on_code_edit();
+                    verify_passed.store(false, std::sync::atomic::Ordering::SeqCst);
                     if let Some(raw_path) = args["path"].as_str() {
                         if let Ok(resolved) = meg_tools::fs_tools::resolve(&workspace, raw_path) {
                             let mut ef = edited_files.lock().unwrap();
@@ -621,6 +644,38 @@ pub(crate) fn visible_preview(raw: &str) -> String {
     String::new()
 }
 
+
+
+pub(crate) fn record_workspace_mutations(
+    before: &std::collections::BTreeMap<std::path::PathBuf, (u64, String)>,
+    after: &std::collections::BTreeMap<std::path::PathBuf, (u64, String)>,
+    aepn: &std::sync::Mutex<meg_core::finish_hook::AepnSupervisor>,
+    edited_files: &std::sync::Mutex<Vec<std::path::PathBuf>>,
+    verify_passed: &std::sync::atomic::AtomicBool,
+) -> usize {
+    let mut changed = Vec::new();
+    for (path, sig) in after {
+        if before.get(path) != Some(sig) {
+            changed.push(path.clone());
+        }
+    }
+    let deleted_count = before
+        .keys()
+        .filter(|path| !after.contains_key(*path))
+        .count();
+    let total_mutations = changed.len() + deleted_count;
+    if total_mutations > 0 {
+        let _ = aepn.lock().unwrap().on_code_edit();
+        verify_passed.store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut ef = edited_files.lock().unwrap();
+        for p in changed {
+            if !ef.contains(&p) {
+                ef.push(p);
+            }
+        }
+    }
+    total_mutations
+}
 
 pub(crate) fn snapshot_workspace_files(
     workspace: &Path,

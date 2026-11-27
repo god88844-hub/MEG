@@ -152,26 +152,147 @@ pub fn compute_workspace_tree_hash(workspace: &Path) -> Result<String> {
     Ok(sha256_hex(material.as_bytes()))
 }
 
-/// Write a tree-hash bound execution receipt to `<workspace>/.meg/receipt.json`.
-pub fn write_receipt(workspace: &Path, task_id: &str, checks_passed: bool) -> Result<Value> {
+/// Provenance metadata recorded alongside workspace tree hashes in `.meg/receipt.json`.
+#[derive(Debug, Clone, Default)]
+pub struct ReceiptMeta {
+    pub verify_cmd: Option<String>,
+    pub reviewer_verdict: Option<String>,
+    pub edited_count: usize,
+}
+
+fn hex_to_bytes_32(hex: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let bytes = hex.as_bytes();
+    for i in 0..32 {
+        let hi = (bytes[i * 2] as char).to_digit(16).unwrap_or(0) as u8;
+        let lo = (bytes[i * 2 + 1] as char).to_digit(16).unwrap_or(0) as u8;
+        out[i] = (hi << 4) | lo;
+    }
+    out
+}
+
+/// Compute RFC 2104 HMAC-SHA256 hex digest using the workspace SHA-256 primitive.
+pub fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    let mut k_block = [0u8; 64];
+    if key.len() > 64 {
+        let hashed = hex_to_bytes_32(&sha256_hex(key));
+        k_block[..32].copy_from_slice(&hashed);
+    } else {
+        k_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = Vec::with_capacity(64 + msg.len());
+    let mut opad = Vec::with_capacity(64 + 32);
+    for b in k_block {
+        ipad.push(b ^ 0x36);
+        opad.push(b ^ 0x5c);
+    }
+    ipad.extend_from_slice(msg);
+    let inner = hex_to_bytes_32(&sha256_hex(&ipad));
+    opad.extend_from_slice(&inner);
+    sha256_hex(&opad)
+}
+
+fn ct_eq_str(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in ab.iter().zip(bb.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Read an optional receipt HMAC signing key from `MEG_RECEIPT_KEY`.
+pub fn receipt_key_from_env() -> Option<Vec<u8>> {
+    std::env::var("MEG_RECEIPT_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.into_bytes())
+}
+
+fn provenance_digest(
+    task_id: &str,
+    tree_hash: &str,
+    checks_passed: bool,
+    verify_cmd: &str,
+    reviewer_verdict: &str,
+    edited_count: usize,
+) -> String {
+    let material = format!(
+        "v2|{task_id}|{tree_hash}|{checks_passed}|{verify_cmd}|{reviewer_verdict}|{edited_count}"
+    );
+    sha256_hex(material.as_bytes())
+}
+
+/// Write a tree-hash bound execution receipt with provenance metadata and optional HMAC-SHA256 attestation.
+pub fn write_receipt_with_options(
+    workspace: &Path,
+    task_id: &str,
+    checks_passed: bool,
+    meta: &ReceiptMeta,
+    hmac_key: Option<&[u8]>,
+) -> Result<Value> {
     let tree_hash = compute_workspace_tree_hash(workspace)?;
     let sig_input = format!("v1|{task_id}|{tree_hash}|{checks_passed}");
     let receipt_hash = sha256_hex(sig_input.as_bytes());
-    let receipt = json!({
+    let verify_cmd_str = meta.verify_cmd.as_deref().unwrap_or("");
+    let reviewer_str = meta.reviewer_verdict.as_deref().unwrap_or("");
+    let prov_hash = provenance_digest(
+        task_id,
+        &tree_hash,
+        checks_passed,
+        verify_cmd_str,
+        reviewer_str,
+        meta.edited_count,
+    );
+    let (integrity_mode, hmac_val) = match hmac_key.filter(|k| !k.is_empty()) {
+        Some(key) => {
+            let mac_input = format!("hmac-v1|{receipt_hash}|{prov_hash}");
+            ("hmac-sha256", Some(hmac_sha256_hex(key, mac_input.as_bytes())))
+        }
+        None => ("unkeyed-sha256", None),
+    };
+    let mut receipt = json!({
         "version": 1,
         "task_id": task_id,
         "tree_hash": tree_hash,
         "checks_passed": checks_passed,
         "receipt_hash": receipt_hash,
+        "provenance_hash": prov_hash,
+        "provenance": {
+            "verify_cmd": meta.verify_cmd,
+            "reviewer_verdict": meta.reviewer_verdict,
+            "edited_count": meta.edited_count,
+            "integrity_mode": integrity_mode,
+        },
     });
+    if let Some(mac) = hmac_val {
+        receipt["hmac_sha256"] = Value::String(mac);
+    }
     let dir = workspace.join(".meg");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("receipt.json"), serde_json::to_vec_pretty(&receipt)?)?;
     Ok(receipt)
 }
 
-/// Verify `<workspace>/.meg/receipt.json` against the live workspace tree hash and signature.
-pub fn verify_receipt(workspace: &Path) -> Result<String> {
+/// Write a tree-hash bound execution receipt to `<workspace>/.meg/receipt.json`.
+pub fn write_receipt(workspace: &Path, task_id: &str, checks_passed: bool) -> Result<Value> {
+    let key = receipt_key_from_env();
+    write_receipt_with_options(
+        workspace,
+        task_id,
+        checks_passed,
+        &ReceiptMeta::default(),
+        key.as_deref(),
+    )
+}
+
+/// Verify `<workspace>/.meg/receipt.json` against the live workspace tree hash, provenance, and optional HMAC key.
+pub fn verify_receipt_with_key(workspace: &Path, hmac_key: Option<&[u8]>) -> Result<String> {
     let file = workspace.join(".meg").join("receipt.json");
     if !file.exists() {
         bail!("receipt missing: .meg/receipt.json");
@@ -183,8 +304,43 @@ pub fn verify_receipt(workspace: &Path) -> Result<String> {
     let recorded_sig = v["receipt_hash"].as_str().unwrap_or("");
 
     let expected_sig = sha256_hex(format!("v1|{task_id}|{recorded_tree}|{checks_passed}").as_bytes());
-    if recorded_sig != expected_sig {
+    if !ct_eq_str(recorded_sig, &expected_sig) {
         bail!("receipt signature mismatch (tampered receipt.json)");
+    }
+    let recorded_prov_hash = v["provenance_hash"].as_str();
+    if let Some(prov_sig) = recorded_prov_hash {
+        let verify_cmd_str = v["provenance"]["verify_cmd"].as_str().unwrap_or("");
+        let reviewer_str = v["provenance"]["reviewer_verdict"].as_str().unwrap_or("");
+        let edited_count = v["provenance"]["edited_count"].as_u64().unwrap_or(0) as usize;
+        let expected_prov = provenance_digest(
+            task_id,
+            recorded_tree,
+            checks_passed,
+            verify_cmd_str,
+            reviewer_str,
+            edited_count,
+        );
+        if !ct_eq_str(prov_sig, &expected_prov) {
+            bail!("receipt provenance hash mismatch (tampered provenance metadata)");
+        }
+    }
+    let recorded_mac = v["hmac_sha256"].as_str();
+    match (hmac_key.filter(|k| !k.is_empty()), recorded_mac) {
+        (Some(key), Some(mac)) => {
+            let prov_part = recorded_prov_hash.unwrap_or("");
+            let mac_input = format!("hmac-v1|{recorded_sig}|{prov_part}");
+            let expected_mac = hmac_sha256_hex(key, mac_input.as_bytes());
+            if !ct_eq_str(mac, &expected_mac) {
+                bail!("receipt HMAC-SHA256 mismatch (invalid key or tampered receipt)");
+            }
+        }
+        (Some(_), None) => {
+            bail!("receipt is unkeyed but MEG_RECEIPT_KEY requires HMAC-SHA256 attestation");
+        }
+        (None, Some(_)) => {
+            bail!("receipt carries HMAC-SHA256 attestation; supply MEG_RECEIPT_KEY to verify");
+        }
+        (None, None) => {}
     }
     if !checks_passed {
         bail!("receipt records checks_passed = false");
@@ -194,6 +350,12 @@ pub fn verify_receipt(workspace: &Path) -> Result<String> {
         bail!("workspace tree hash drifted since receipt was signed");
     }
     Ok(format!("verified:{task_id}:{live_tree}"))
+}
+
+/// Verify `<workspace>/.meg/receipt.json` against the live workspace tree hash and signature.
+pub fn verify_receipt(workspace: &Path) -> Result<String> {
+    let key = receipt_key_from_env();
+    verify_receipt_with_key(workspace, key.as_deref())
 }
 
 #[cfg(test)]
@@ -263,5 +425,50 @@ mod tests {
         std::fs::write(dir.join(".loop").join("state.json"), r#"{"status":"green"}"#).unwrap();
         verify_receipt(&dir).expect("Receipt must remain valid after .loop/state.json update");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231_and_keyed_receipt_blocks_tampering_and_downgrade() {
+        // RFC 4231 Test Case 1 & Test Case 2
+        assert_eq!(
+            hmac_sha256_hex(&[0x0bu8; 20], b"Hi There"),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        assert_eq!(
+            hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+
+        let ws = tmpdir();
+        std::fs::write(ws.join("app.rs"), "pub fn ok() -> bool { true }\n").unwrap();
+        let key = b"super-secret-ci-attestation-key";
+        let meta = ReceiptMeta {
+            verify_cmd: Some("cargo test --locked".into()),
+            reviewer_verdict: Some("PASS".into()),
+            edited_count: 1,
+        };
+        let r = write_receipt_with_options(&ws, "phase6a", true, &meta, Some(key)).unwrap();
+        assert_eq!(r["provenance"]["integrity_mode"], "hmac-sha256");
+        assert!(verify_receipt_with_key(&ws, Some(key)).is_ok());
+
+        // Wrong key must fail
+        assert!(verify_receipt_with_key(&ws, Some(b"wrong-key")).is_err());
+        // Missing key (downgrade attempt) must fail closed
+        assert!(verify_receipt_with_key(&ws, None).is_err());
+
+        // Tampering provenance metadata without recomputing HMAC must fail
+        let receipt_file = ws.join(".meg").join("receipt.json");
+        let mut tampered: Value =
+            serde_json::from_slice(&std::fs::read(&receipt_file).unwrap()).unwrap();
+        tampered["provenance"]["verify_cmd"] = Value::String("echo fake".into());
+        std::fs::write(&receipt_file, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+        assert!(verify_receipt_with_key(&ws, Some(key)).is_err());
+
+        // Unkeyed receipt must be rejected when verification requires a key
+        write_receipt_with_options(&ws, "phase6a-unkeyed", true, &meta, None).unwrap();
+        assert!(verify_receipt_with_key(&ws, None).is_ok());
+        assert!(verify_receipt_with_key(&ws, Some(key)).is_err());
+
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

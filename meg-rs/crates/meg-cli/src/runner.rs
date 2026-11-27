@@ -45,6 +45,7 @@ pub(crate) struct ColdReviewRequest<'a> {
     pub(crate) goal: &'a str,
     pub(crate) edited_files: &'a [std::path::PathBuf],
     pub(crate) final_answer: &'a str,
+    pub(crate) verify_summary: Option<&'a str>,
     pub(crate) cancel: &'a meg_core::CancellationToken,
 }
 
@@ -84,35 +85,136 @@ fn build_role_shim(
     Ok((client, target.provider))
 }
 
+fn run_git_capture(workspace: &std::path::Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        text.to_string()
+    } else {
+        let head: String = text.chars().take(max_chars).collect();
+        format!("{head}\n...[truncated {count} -> {max_chars} chars]")
+    }
+}
+
+/// Build diff-aware review context (git status + unified git diff + untracked/non-git snapshots + verification evidence).
+pub(crate) fn build_l3_review_context(
+    workspace: &std::path::Path,
+    edited_files: &[std::path::PathBuf],
+    verify_summary: Option<&str>,
+) -> String {
+    const MAX_DIFF_CHARS: usize = 24_000;
+    const MAX_STATUS_CHARS: usize = 4_000;
+    const MAX_FALLBACK_FILES: usize = 24;
+    const MAX_FILE_PREVIEW_CHARS: usize = 4_000;
+
+    let mut sections = Vec::new();
+    let mut covered_by_git_diff = std::collections::HashSet::new();
+
+    if let Some(status) = run_git_capture(workspace, &["status", "--short"]) {
+        sections.push(format!(
+            "=== GIT STATUS ===\n{}",
+            truncate_chars(&status, MAX_STATUS_CHARS)
+        ));
+    }
+
+    let git_diff = run_git_capture(workspace, &["diff", "--no-color", "--unified=3", "HEAD"])
+        .or_else(|| run_git_capture(workspace, &["diff", "--no-color", "--unified=3"]));
+    if let Some(diff) = git_diff {
+        for line in diff.lines() {
+            if let Some(rest) = line.strip_prefix("+++ b/") {
+                covered_by_git_diff.insert(rest.trim().to_string());
+            }
+        }
+        sections.push(format!(
+            "=== GIT DIFF ===\n{}",
+            truncate_chars(&diff, MAX_DIFF_CHARS)
+        ));
+    }
+
+    let mut fallback_files = String::new();
+    let mut included = 0usize;
+    let mut omitted = 0usize;
+    for path in edited_files {
+        let rel = path
+            .strip_prefix(workspace)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if covered_by_git_diff.contains(&rel) {
+            continue;
+        }
+        if included >= MAX_FALLBACK_FILES {
+            omitted += 1;
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let preview = truncate_chars(&text, MAX_FILE_PREVIEW_CHARS);
+            let label = if covered_by_git_diff.is_empty() {
+                "FILE"
+            } else {
+                "NEW/UNTRACKED FILE"
+            };
+            fallback_files.push_str(&format!("--- {label}: {rel} ---\n{preview}\n\n"));
+            included += 1;
+        }
+    }
+    if omitted > 0 {
+        fallback_files.push_str(&format!(
+            "[Note: {omitted} additional modified files omitted due to review budget]\n"
+        ));
+    }
+    if !fallback_files.is_empty() {
+        sections.push(format!("=== WORKSPACE FILE SNAPSHOTS ===\n{fallback_files}"));
+    }
+
+    if let Some(vs) = verify_summary.map(str::trim).filter(|s| !s.is_empty()) {
+        sections.push(format!(
+            "=== VERIFICATION EVIDENCE ===\n{}",
+            truncate_chars(vs, 4_000)
+        ));
+    } else {
+        sections.push("=== VERIFICATION EVIDENCE ===\n(no verification command recorded)".into());
+    }
+
+    if sections.is_empty() {
+        "(no source files modified)\n".into()
+    } else {
+        sections.join("\n\n")
+    }
+}
+
 pub(crate) async fn run_cold_l3_reviewer(req: ColdReviewRequest<'_>) -> Result<String> {
     let (mut rev_shim, _) = build_role_shim(req.reviewer_model, req.provider.as_ref(), req.base_url)?;
     rev_shim.tools = Vec::new(); // Strictly read-only, tool-less fresh context.
 
-    let mut diff_context = String::new();
-    for path in req.edited_files.iter().take(12) {
-        let rel = path
-            .strip_prefix(req.workspace)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if let Ok(text) = std::fs::read_to_string(path) {
-            let preview: String = text.chars().take(4_000).collect();
-            diff_context.push_str(&format!("--- FILE: {rel} ---\n{preview}\n\n"));
-        }
-    }
-    if diff_context.is_empty() {
-        diff_context.push_str("(no source files modified)\n");
-    }
+    let diff_context = build_l3_review_context(req.workspace, req.edited_files, req.verify_summary);
 
     let messages = vec![
         meg_core::ChatMessage {
             role: "system".into(),
-            content: "You are a cold, independent L3 code reviewer. You have ZERO builder history. Your default answer is REJECT unless the code clearly satisfies the goal without bugs, stubs, or regressions. Respond ONLY with JSON: {\"verdict\":\"PASS\"|\"REJECT\",\"reason\":\"...\"}.".into(),
+            content: "You are a cold, independent L3 code reviewer. You have ZERO builder history. Your default answer is REJECT unless the diff and verification evidence clearly satisfy the goal without bugs, stubs, regressions, or missing coverage. If critical diff context was truncated or verification evidence is missing for risky changes, REJECT and state what is missing. Respond ONLY with JSON: {\"verdict\":\"PASS\"|\"REJECT\",\"reason\":\"...\"}.".into(),
         },
         meg_core::ChatMessage {
             role: "user".into(),
             content: format!(
-                "GOAL: {}\n\nCLAIMED COMPLETION: {}\n\nMODIFIED WORKSPACE ARTIFACTS:\n{}",
+                "GOAL: {}\n\nCLAIMED COMPLETION: {}\n\n{}",
                 req.goal, req.final_answer, diff_context
             ),
         },
@@ -417,9 +519,16 @@ pub(crate) async fn run_request_detailed(
             _ => false,
         });
         if mutated {
+            let edited_now = edited_files.lock().unwrap().clone();
+            let aepn_tests_green = aepn.lock().unwrap().p_tests_green;
+            let real_checks_passed = extras.verify_cmd.is_some() || aepn_tests_green > 0;
+            let verify_summary = match (&extras.verify_cmd, aepn_tests_green) {
+                (Some(cmd), _) => format!("external verify_cmd passed: {cmd}"),
+                (None, n) if n > 0 => format!("in-loop verification commands passed: {n}"),
+                _ => "no verification command ran".to_string(),
+            };
             // Cold cross-model L3 reviewer runs before signing .meg/receipt.json
             if let Some(rev_model) = &extras.reviewer_model {
-                let edited_now = edited_files.lock().unwrap().clone();
                 let verdict = run_cold_l3_reviewer(ColdReviewRequest {
                     provider: &reviewer_provider,
                     base_url: &reviewer_base_url,
@@ -428,15 +537,26 @@ pub(crate) async fn run_request_detailed(
                     goal: &request.goal,
                     edited_files: &edited_now,
                     final_answer: result.1.as_deref().unwrap_or(""),
+                    verify_summary: Some(&verify_summary),
                     cancel: &reviewer_cancel,
                 })
                 .await?;
                 let _ = aepn.lock().unwrap().record_critic_approved();
                 reviewer_verdict_out = Some(verdict);
             }
-            let real_checks_passed =
-                extras.verify_cmd.is_some() || aepn.lock().unwrap().p_tests_green > 0;
-            meg_tools::ledger::write_receipt(&receipt_workspace, "meg-run", real_checks_passed)?;
+            let receipt_meta = meg_tools::ledger::ReceiptMeta {
+                verify_cmd: extras.verify_cmd.clone(),
+                reviewer_verdict: reviewer_verdict_out.clone(),
+                edited_count: edited_now.len(),
+            };
+            let receipt_key = meg_tools::ledger::receipt_key_from_env();
+            meg_tools::ledger::write_receipt_with_options(
+                &receipt_workspace,
+                "meg-run",
+                real_checks_passed,
+                &receipt_meta,
+                receipt_key.as_deref(),
+            )?;
         }
     }
     let telemetry = RunTelemetry {

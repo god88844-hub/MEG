@@ -356,3 +356,83 @@ fn deferred_mcp_loading_withholds_large_catalogs_and_activates_on_demand() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn phase6a_mutation_tracker_and_diff_aware_l3_review_context() {
+    let dir = std::env::temp_dir().join(format!("meg-phase6a-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1. Mutation tracker catches edits and deletions, resetting AEPN & verify_passed
+    let f1 = dir.join("lib.rs");
+    let f2 = dir.join("temp.rs");
+    std::fs::write(&f1, "pub fn answer() -> i32 { 41 }\n").unwrap();
+    std::fs::write(&f2, "pub fn drop_me() {}\n").unwrap();
+    let before = crate::engine::snapshot_workspace_files(&dir).unwrap();
+
+    let aepn = std::sync::Mutex::new(meg_core::finish_hook::AepnSupervisor::new(10));
+    let _ = aepn.lock().unwrap().record_tests_green();
+    let verify_passed = std::sync::atomic::AtomicBool::new(true);
+    let edited_files = std::sync::Mutex::new(Vec::new());
+
+    // Delete f2 only: must still invalidate tests_green and verify_passed
+    std::fs::remove_file(&f2).unwrap();
+    let after_del = crate::engine::snapshot_workspace_files(&dir).unwrap();
+    let del_count = crate::engine::record_workspace_mutations(
+        &before,
+        &after_del,
+        &aepn,
+        &edited_files,
+        &verify_passed,
+    );
+    assert_eq!(del_count, 1);
+    assert_eq!(aepn.lock().unwrap().p_tests_green, 0);
+    assert!(!verify_passed.load(std::sync::atomic::Ordering::SeqCst));
+
+    // 2. Git diff + untracked snapshot + verification evidence in L3 review context
+    let git_init = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["init", "-q"])
+        .status();
+    if git_init.is_ok_and(|s| s.success()) {
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["config", "user.email", "test@example.com"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["config", "user.name", "Test"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["add", "lib.rs"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["commit", "-q", "-m", "init"])
+            .status();
+
+        // Modify tracked file and add a new untracked file
+        std::fs::write(&f1, "pub fn answer() -> i32 { 42 }\n").unwrap();
+        let f3 = dir.join("extra.rs");
+        std::fs::write(&f3, "pub fn helper() -> i32 { 7 }\n").unwrap();
+
+        let ctx = crate::runner::build_l3_review_context(
+            &dir,
+            &[f1.clone(), f3.clone()],
+            Some("external verify_cmd passed: cargo test --locked"),
+        );
+        assert!(ctx.contains("=== GIT DIFF ==="), "{ctx}");
+        assert!(ctx.contains("-pub fn answer() -> i32 { 41 }"), "{ctx}");
+        assert!(ctx.contains("+pub fn answer() -> i32 { 42 }"), "{ctx}");
+        assert!(ctx.contains("NEW/UNTRACKED FILE: extra.rs"), "{ctx}");
+        assert!(ctx.contains("cargo test --locked"), "{ctx}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
