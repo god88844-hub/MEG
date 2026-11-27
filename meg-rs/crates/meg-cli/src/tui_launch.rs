@@ -47,6 +47,12 @@ pub(crate) fn launch_tui(workspace: &Path) -> Result<()> {
             && options.resume.is_none()
             && std::env::var("MEG_NO_PICKER").ok().as_deref() != Some("1"),
     );
+    if options.delegent {
+        std::env::set_var("MEG_DELEGENT", "1");
+    }
+    if let Some(spec) = &options.subagent_model {
+        std::env::set_var("MEG_SUBAGENT_MODEL", spec);
+    }
     let plane_result = start_plane();
     let plane_error = plane_result.as_ref().err().map(ToString::to_string);
     let plane = plane_result.ok();

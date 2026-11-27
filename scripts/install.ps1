@@ -15,8 +15,13 @@ $tmpBin = Join-Path $env:TEMP "meg-$tag.exe"
 Write-Host "Downloading MEG $tag ($asset)..." -ForegroundColor Cyan
 Invoke-WebRequest -Uri $binUrl -OutFile $tmpBin
 
+$sums = $null
 try {
     $sums = (Invoke-WebRequest -Uri $sumUrl -UseBasicParsing).Content
+} catch {
+    Write-Warning "Could not fetch SHA256SUMS.txt: $_"
+}
+if ($sums) {
     $line = ($sums -split '\r?\n' | Where-Object { $_ -match [regex]::Escape($asset) } | Select-Object -First 1)
     $expected = if ($line) { ($line -split '\s+')[0] } else { $null }
     if ($expected) {
@@ -27,8 +32,6 @@ try {
         }
         Write-Host "Verified SHA-256: $actual" -ForegroundColor Green
     }
-} catch {
-    Write-Warning "Could not verify SHA256SUMS.txt: $_"
 }
 
 $dest = Join-Path $installDir "meg.exe"

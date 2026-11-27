@@ -313,17 +313,27 @@ pub(crate) fn parse_loop_options(args: &[String]) -> Result<LoopOptions> {
 
 
 pub(crate) fn print_usage() {
-    println!("MEG â€” native agent harness & workstation\n");
+    println!("MEG \u{2014} native agent harness & workstation\n");
     println!("Usage:");
     println!("  meg [COMMAND] [OPTIONS]\n");
     println!("Commands:");
     println!("  tui             Launch the interactive Workstation TUI (default)");
-    println!("  run [OPTIONS] [--] <goal>  Execute headlessly (-C, -m, --pinned-model, --verify-cmd, --pair-mode, --executor-model, --reviewer-model, --json)");
-    println!("  loop --check <cmd> [OPTIONS] [--] <goal>  Run verified Loop-2 outer work loop (.loop/state.json, check_cannot_fail, stall exit)");
+    println!("  run [OPTIONS] [--] <goal>  Execute headlessly (-C, -m, --pinned-model, --verify-cmd, --pair-mode, --executor-model, --reviewer-model, --delegent, --subagent-model, --json)");
+    println!("  loop --check <cmd> [OPTIONS] [--] <goal>  Run verified Loop-2 outer work loop (.meg/state.json, check_cannot_fail, stall exit)");
     println!("  ui-bridge [-C <dir>]  Open NDJSON stdin/stdout protocol so any custom TUI/GUI can drive MEG");
     println!("\nOptions:");
     println!("  -h, --help      Print this help message");
-    println!("  -C, --cd PATH   Open a workspace\n  -m, --model ID  Select the session model\n  --effort LEVEL  low, medium, high or max\n  --resume ID     Resume a saved session (or latest)\n  --continue      Resume the latest saved session\n  --workspace-picker  Choose a workspace before opening\n  --no-picker     Open the current workspace directly");
+    println!("  -V, --version   Print version information");
+    println!("  -C, --cd PATH   Open a workspace");
+    println!("  -m, --model ID  Select the session model");
+    println!("  --effort LEVEL  low, medium, high or max");
+    println!("  --delegent      Route read-only subagents to local SLM (Ollama/LM Studio)");
+    println!("  --subagent-model SPEC  Explicit subagent route (e.g. ollama:qwen2.5-coder:7b)");
+    println!("  --resume ID     Resume a saved session (or latest)");
+    println!("  --continue      Resume the latest saved session");
+    println!("  --workspace-picker  Choose a workspace before opening");
+    println!("  --no-picker     Open the current workspace directly");
+    println!("\nExit codes (headless run/loop, mirrored in .meg/state.json):");
+    println!("  0 = GREEN, 2 = BUDGET, 3 = STALL, 4 = CHECK_CANNOT_FAIL");
     println!("\nBare meg opens the workspace selector. Use /provider for local or cloud connections,\n/model for model selection and /help for skills, plugins, MCP and worker commands.\nNo MEG account is required; cloud providers use your own API key.\nMEG_TUI_BASE_URL / MEG_TUI_MODEL / MEG_TUI_API_KEY remain supported overrides.");
 }
-
