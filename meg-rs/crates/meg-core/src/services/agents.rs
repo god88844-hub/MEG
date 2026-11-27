@@ -203,6 +203,28 @@ impl AgentManager {
             )),
         );
         req_obj.insert("mode".into(), Value::String("plan".into()));
+        let default_prof: Option<crate::providers::ProviderProfile> = req_obj
+            .get("provider")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok());
+        let settings = crate::providers::ProviderStore::global()
+            .load()
+            .unwrap_or_default();
+        let disabled = crate::providers::disabled_providers_from_env();
+        let routed = resolve_subagent_route(
+            role,
+            params,
+            default_prof.as_ref(),
+            &settings,
+            &disabled,
+        )?;
+        if let Some(ref target) = routed {
+            req_obj.insert("model".into(), Value::String(target.model.clone()));
+            if let Some(ref prof) = target.provider {
+                req_obj.insert("provider".into(), serde_json::to_value(prof)?);
+                req_obj.insert("base_url".into(), Value::String(prof.base_url.clone()));
+            }
+        }
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(serde_json::to_string(&Value::Object(req_obj))?.as_bytes());
             let _ = stdin.flush();
@@ -294,7 +316,111 @@ impl AgentManager {
             .unwrap_or_default();
         merged.insert("id".into(), Value::String(id));
         merged.insert("role".into(), Value::String(role.to_string()));
+        if let Some(ref target) = routed {
+            merged.insert("routed_model".into(), Value::String(target.model.clone()));
+            if let Some(ref prof) = target.provider {
+                merged.insert("routed_provider".into(), Value::String(prof.id.clone()));
+            }
+        }
         merged.insert("message".into(), Value::String(format!("{role}: {answer}")));
         Ok(Value::Object(merged))
     }
+}
+
+/// Resolve an optional Delegent / local-SLM route for read-only subagents.
+///
+/// Priority:
+/// 1. Role-specific env override (`MEG_SUBAGENT_MODEL_RESEARCHER` / `_PLANNER` / `_REVIEWER`)
+/// 2. Explicit `params["subagentModel"]` or `MEG_SUBAGENT_MODEL` (`provider_id:model_id` or `model_id`)
+/// 3. Delegent local-SLM preset (`MEG_DELEGENT=1` or `params["delegent"] == true`), selecting
+///    an enabled local `ollama` or `lmstudio` profile using `MEG_LOCAL_SLM_MODEL` or its `default_model`.
+pub(crate) fn resolve_subagent_route(
+    role: &str,
+    params: &Value,
+    default_provider: Option<&crate::providers::ProviderProfile>,
+    settings: &crate::providers::ProviderSettings,
+    disabled_providers: &[String],
+) -> Result<Option<crate::providers::ResolvedRoleTarget>> {
+    let role_env_key = format!("MEG_SUBAGENT_MODEL_{}", role.to_ascii_uppercase());
+    let explicit_spec = std::env::var(&role_env_key)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            params
+                .get("subagentModel")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            std::env::var("MEG_SUBAGENT_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
+
+    if let Some(spec) = explicit_spec {
+        let target = crate::providers::resolve_role_target(
+            &spec,
+            default_provider,
+            settings,
+            disabled_providers,
+        )?;
+        return Ok(Some(target));
+    }
+
+    let delegent_enabled = params
+        .get("delegent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || matches!(
+            std::env::var("MEG_DELEGENT").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        );
+    if !delegent_enabled {
+        return Ok(None);
+    }
+
+    let local_model_override = std::env::var("MEG_LOCAL_SLM_MODEL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let is_disabled = |id: &str| {
+        disabled_providers
+            .iter()
+            .any(|d| d.eq_ignore_ascii_case(id))
+    };
+
+    for preferred_id in ["ollama", "lmstudio"] {
+        if is_disabled(preferred_id) {
+            continue;
+        }
+        if let Some(prof) = settings
+            .profiles
+            .iter()
+            .find(|p| p.id.eq_ignore_ascii_case(preferred_id))
+        {
+            let model = local_model_override.clone().or_else(|| {
+                let m = prof.default_model.trim();
+                if m.is_empty() {
+                    None
+                } else {
+                    Some(m.to_string())
+                }
+            });
+            if let Some(m) = model {
+                let spec = format!("{}:{m}", prof.id);
+                let target = crate::providers::resolve_role_target(
+                    &spec,
+                    default_provider,
+                    settings,
+                    disabled_providers,
+                )?;
+                return Ok(Some(target));
+            }
+        }
+    }
+
+    Ok(None)
 }

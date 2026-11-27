@@ -11,7 +11,7 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliCommand {
         None | Some("tui") => CliCommand::Tui,
         Some(
             "-C" | "--cd" | "-m" | "--model" | "--effort" | "--resume" | "--continue"
-            | "--no-picker" | "--workspace-picker",
+            | "--no-picker" | "--workspace-picker" | "--delegent" | "--subagent-model",
         ) => CliCommand::Tui,
         Some("-h") | Some("--help") => CliCommand::Help,
         Some("-V") | Some("--version") => CliCommand::Version,
@@ -79,6 +79,8 @@ pub(crate) struct TuiOptions {
     pub(crate) verify_cmd: Option<String>,
     pub(crate) require_verify: bool,
     pub(crate) reviewer_model: Option<String>,
+    pub(crate) subagent_model: Option<String>,
+    pub(crate) delegent: bool,
     pub(crate) ui_mode: Option<String>,
 }
 
@@ -96,7 +98,9 @@ pub(crate) fn parse_tui_options(args: &[String]) -> Result<TuiOptions> {
             "--continue" => options.resume = Some("latest".into()),
             "--no-picker" => options.picker = Some(false),
             "--workspace-picker" => options.picker = Some(true),
-            "-C" | "--cd" | "-m" | "--model" | "--effort" | "--resume" | "--ui" | "--pair-mode" | "--executor-model" | "--reviewer-model" => {
+            "--delegent" => options.delegent = true,
+            "-C" | "--cd" | "-m" | "--model" | "--effort" | "--resume" | "--ui" | "--pair-mode"
+            | "--executor-model" | "--reviewer-model" | "--subagent-model" => {
                 i += 1;
                 let value = args
                     .get(i)
@@ -105,6 +109,11 @@ pub(crate) fn parse_tui_options(args: &[String]) -> Result<TuiOptions> {
                 match flag {
                     "-C" | "--cd" => options.cwd = Some(value.into()),
                     "-m" | "--model" => options.model = Some(value),
+                    "--ui" => options.ui_mode = Some(value),
+                    "--pair-mode" => options.pair_mode = Some(value),
+                    "--executor-model" => options.executor_model = Some(value),
+                    "--reviewer-model" => options.reviewer_model = Some(value),
+                    "--subagent-model" => options.subagent_model = Some(value),
                     "--effort" => {
                         anyhow::ensure!(
                             matches!(value.as_str(), "low" | "medium" | "high" | "max"),
@@ -146,7 +155,11 @@ pub(crate) fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)>
                 options.require_verify = true;
                 i += 1;
             }
-            "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps" | "--pair-mode" | "--executor-model" | "--verify-cmd" | "--reviewer-model" => {
+            "--delegent" => {
+                options.delegent = true;
+                i += 1;
+            }
+            "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps" | "--pair-mode" | "--executor-model" | "--verify-cmd" | "--reviewer-model" | "--subagent-model" => {
                 let flag = &args[i];
                 let value = args
                     .get(i + 1)
@@ -169,6 +182,7 @@ pub(crate) fn parse_run_options(args: &[String]) -> Result<(String, TuiOptions)>
                     "--executor-model" => options.executor_model = Some(value.clone()),
                     "--verify-cmd" => options.verify_cmd = Some(value.clone()),
                     "--reviewer-model" => options.reviewer_model = Some(value.clone()),
+                    "--subagent-model" => options.subagent_model = Some(value.clone()),
                     "--max-steps" => {
                         let parsed: usize = value
                             .parse()
@@ -227,9 +241,13 @@ pub(crate) fn parse_loop_options(args: &[String]) -> Result<LoopOptions> {
                 base.core_six = true;
                 i += 1;
             }
+            "--delegent" => {
+                base.delegent = true;
+                i += 1;
+            }
             "-C" | "--cd" | "-m" | "--model" | "--pinned-model" | "--effort" | "--max-steps"
-            | "--pair-mode" | "--executor-model" | "--reviewer-model" | "--check"
-            | "--max-runs" | "--max-same" => {
+            | "--pair-mode" | "--executor-model" | "--reviewer-model" | "--subagent-model"
+            | "--check" | "--max-runs" | "--max-same" => {
                 let flag = &args[i];
                 let value = args
                     .get(i + 1)
@@ -251,6 +269,7 @@ pub(crate) fn parse_loop_options(args: &[String]) -> Result<LoopOptions> {
                     }
                     "--executor-model" => base.executor_model = Some(value.clone()),
                     "--reviewer-model" => base.reviewer_model = Some(value.clone()),
+                    "--subagent-model" => base.subagent_model = Some(value.clone()),
                     "--check" => check_cmd = Some(value.clone()),
                     "--max-steps" => {
                         let n: usize = value.parse().context("--max-steps requires integer 1..=200")?;

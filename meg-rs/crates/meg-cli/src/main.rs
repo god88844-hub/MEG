@@ -44,7 +44,9 @@ async fn main() -> Result<()> {
                 .unwrap_or(&workspace)
                 .canonicalize()?;
             anyhow::ensure!(workspace.is_dir(), "Workspace must be a directory");
-            run_goal_headless(&workspace, &goal, &options).await?;
+            if let Err(err) = run_goal_headless(&workspace, &goal, &options).await {
+                return exit_with_terminal_code(err);
+            }
             Ok(())
         }
         CliCommand::Loop => {
@@ -56,7 +58,9 @@ async fn main() -> Result<()> {
                 .unwrap_or(&workspace)
                 .canonicalize()?;
             anyhow::ensure!(workspace.is_dir(), "Workspace must be a directory");
-            run_loop_headless(&workspace, &options).await?;
+            if let Err(err) = run_loop_headless(&workspace, &options).await {
+                return exit_with_terminal_code(err);
+            }
             Ok(())
         }
         CliCommand::UiBridge => {
@@ -84,3 +88,20 @@ async fn main() -> Result<()> {
     }
 }
 
+fn exit_with_terminal_code(err: anyhow::Error) -> Result<()> {
+    let msg = format!("{err:#}");
+    let code = if msg.starts_with("RUN_BUDGET_EXHAUSTED:") || msg.starts_with("LOOP_BUDGET_EXHAUSTED:") {
+        Some(crate::runner::EXIT_CODE_BUDGET)
+    } else if msg.starts_with("RUN_STALLED:") || msg.starts_with("LOOP_STALLED:") {
+        Some(crate::runner::EXIT_CODE_STALL)
+    } else if msg.starts_with("CHECK_CANNOT_FAIL:") {
+        Some(crate::runner::EXIT_CODE_CHECK_CANNOT_FAIL)
+    } else {
+        None
+    };
+    if let Some(exit_code) = code {
+        eprintln!("Error: {msg}");
+        std::process::exit(exit_code);
+    }
+    Err(err)
+}

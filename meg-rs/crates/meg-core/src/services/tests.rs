@@ -328,3 +328,80 @@ for line in sys.stdin:
 
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+#[test]
+fn delegent_subagent_routing_prefers_local_slm_and_respects_disabled_providers() {
+    let mut settings = crate::providers::ProviderSettings::default();
+    if let Some(oll) = settings.profiles.iter_mut().find(|p| p.id == "ollama") {
+        oll.default_model = "qwen2.5-coder:7b".into();
+    }
+    if let Some(lms) = settings.profiles.iter_mut().find(|p| p.id == "lmstudio") {
+        lms.default_model = "qwen2.5-coder-14b".into();
+    }
+    let openrouter = settings
+        .profiles
+        .iter()
+        .find(|p| p.id == "openrouter")
+        .unwrap()
+        .clone();
+
+    // 1. Default off -> returns None (preserves parent model)
+    let none = super::agents::resolve_subagent_route(
+        "researcher",
+        &json!({}),
+        Some(&openrouter),
+        &settings,
+        &[],
+    )
+    .unwrap();
+    assert!(none.is_none());
+
+    // 2. Explicit cross-provider subagentModel preserves Ollama tag
+    let explicit = super::agents::resolve_subagent_route(
+        "researcher",
+        &json!({"subagentModel": "ollama:qwen2.5-coder:7b"}),
+        Some(&openrouter),
+        &settings,
+        &[],
+    )
+    .unwrap()
+    .expect("explicit subagent route should resolve");
+    assert_eq!(explicit.provider.as_ref().unwrap().id, "ollama");
+    assert_eq!(explicit.model, "qwen2.5-coder:7b");
+
+    // 3. Delegent preset picks ollama first, then falls back to lmstudio when ollama is disabled
+    let del_oll = super::agents::resolve_subagent_route(
+        "planner",
+        &json!({"delegent": true}),
+        Some(&openrouter),
+        &settings,
+        &[],
+    )
+    .unwrap()
+    .expect("delegent should pick ollama");
+    assert_eq!(del_oll.provider.as_ref().unwrap().id, "ollama");
+    assert_eq!(del_oll.model, "qwen2.5-coder:7b");
+
+    let del_lms = super::agents::resolve_subagent_route(
+        "reviewer",
+        &json!({"delegent": true}),
+        Some(&openrouter),
+        &settings,
+        &["ollama".to_string()],
+    )
+    .unwrap()
+    .expect("delegent should fall back to lmstudio when ollama is disabled");
+    assert_eq!(del_lms.provider.as_ref().unwrap().id, "lmstudio");
+    assert_eq!(del_lms.model, "qwen2.5-coder-14b");
+
+    // 4. Explicit disabled provider fails closed
+    let err = super::agents::resolve_subagent_route(
+        "researcher",
+        &json!({"subagentModel": "ollama:qwen2.5-coder:7b"}),
+        Some(&openrouter),
+        &settings,
+        &["ollama".to_string()],
+    )
+    .expect_err("explicit route targeting disabled provider must fail closed");
+    assert!(err.to_string().contains("PROVIDER_DISABLED"), "{err}");
+}

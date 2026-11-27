@@ -756,6 +756,12 @@ pub(crate) async fn run_goal_headless(workspace: &Path, goal: &str, options: &Tu
     if options.core_six {
         std::env::set_var("MEG_CORE_SIX", "1");
     }
+    if options.delegent {
+        std::env::set_var("MEG_DELEGENT", "1");
+    }
+    if let Some(spec) = &options.subagent_model {
+        std::env::set_var("MEG_SUBAGENT_MODEL", spec);
+    }
     let plane = if std::env::var("MEG_NO_PLANE").as_deref() == Ok("1")
         || std::env::var("MEG_PLANE_DISABLED").as_deref() == Ok("1")
     {
@@ -778,8 +784,29 @@ pub(crate) async fn run_goal_headless(workspace: &Path, goal: &str, options: &Tu
         },
     )
     .await?;
+    let (terminal_status, exit_code) =
+        classify_run_terminal_state(&outcomes, final_answer.as_deref());
+    let receipt_path = workspace.join(".meg").join("receipt.json");
+    let state_path = write_meg_state(
+        workspace,
+        terminal_status,
+        exit_code,
+        serde_json::json!({
+            "mode": "run",
+            "goal": goal,
+            "model": state.model,
+            "pinned_model": options.pinned_model,
+            "delegent": options.delegent,
+            "subagent_model": options.subagent_model,
+            "turns": outcomes.len(),
+            "planner_turns": telemetry.planner_turns,
+            "executor_turns": telemetry.executor_turns,
+            "reviewer_verdict": telemetry.reviewer_verdict,
+            "receipt_path": if receipt_path.is_file() { Some(receipt_path.display().to_string()) } else { None },
+        }),
+    )?;
+
     if options.json_output {
-        let receipt_path = workspace.join(".meg").join("receipt.json");
         let receipt_json: Option<serde_json::Value> = if receipt_path.is_file() {
             std::fs::read_to_string(&receipt_path)
                 .ok()
@@ -789,12 +816,17 @@ pub(crate) async fn run_goal_headless(workspace: &Path, goal: &str, options: &Tu
         };
         let payload = serde_json::json!({
             "ok": final_answer.is_some(),
+            "status": terminal_status,
+            "exit_code": exit_code,
+            "state_path": state_path.display().to_string(),
             "goal": goal,
             "model": state.model,
             "pinned_model": options.pinned_model,
             "pair_mode": options.pair_mode,
             "executor_model": options.executor_model,
             "reviewer_model": options.reviewer_model,
+            "delegent": options.delegent,
+            "subagent_model": options.subagent_model,
             "planner_turns": telemetry.planner_turns,
             "executor_turns": telemetry.executor_turns,
             "reviewer_verdict": telemetry.reviewer_verdict,
@@ -805,7 +837,10 @@ pub(crate) async fn run_goal_headless(workspace: &Path, goal: &str, options: &Tu
         });
         println!("{}", serde_json::to_string(&payload)?);
         if final_answer.is_none() {
-            anyhow::bail!("Budget exhausted without a final answer");
+            if terminal_status == "STALL" {
+                anyhow::bail!("RUN_STALLED: repeated identical turns without a final answer");
+            }
+            anyhow::bail!("RUN_BUDGET_EXHAUSTED: Budget exhausted without a final answer");
         }
         return Ok(());
     }
@@ -828,8 +863,162 @@ pub(crate) async fn run_goal_headless(workspace: &Path, goal: &str, options: &Tu
     }
     match final_answer {
         Some(answer) => println!("\nFINAL: {answer}"),
-        None => anyhow::bail!("Budget exhausted without a final answer"),
+        None if terminal_status == "STALL" => {
+            anyhow::bail!("RUN_STALLED: repeated identical turns without a final answer")
+        }
+        None => anyhow::bail!("RUN_BUDGET_EXHAUSTED: Budget exhausted without a final answer"),
     }
     Ok(())
+}
+
+pub(crate) const EXIT_CODE_GREEN: i32 = 0;
+pub(crate) const EXIT_CODE_BUDGET: i32 = 2;
+pub(crate) const EXIT_CODE_STALL: i32 = 3;
+pub(crate) const EXIT_CODE_CHECK_CANNOT_FAIL: i32 = 4;
+
+pub(crate) fn classify_terminal_signatures(sigs: &[String], has_final: bool) -> (&'static str, i32) {
+    if has_final {
+        return ("GREEN", EXIT_CODE_GREEN);
+    }
+    if sigs.len() >= 3 {
+        let tail = &sigs[sigs.len() - 3..];
+        if tail[0] == tail[1] && tail[1] == tail[2] {
+            return ("STALL", EXIT_CODE_STALL);
+        }
+    }
+    ("BUDGET", EXIT_CODE_BUDGET)
+}
+
+pub(crate) fn classify_run_terminal_state(
+    outcomes: &[meg_core::TurnOutcome],
+    final_answer: Option<&str>,
+) -> (&'static str, i32) {
+    let sigs: Vec<String> = outcomes
+        .iter()
+        .map(|o| match &o.action {
+            meg_core::Action::Tool { tool, .. } => format!(
+                "tool:{tool}:{}",
+                crate::loop_cmd::mask_failure_fingerprint(o.observation.as_deref().unwrap_or(""))
+            ),
+            meg_core::Action::Batch { calls, .. } => format!(
+                "batch:{}:{}",
+                calls.len(),
+                crate::loop_cmd::mask_failure_fingerprint(o.observation.as_deref().unwrap_or(""))
+            ),
+            meg_core::Action::Final { .. } => "final".to_string(),
+            meg_core::Action::Unknown(_) => "unknown".to_string(),
+        })
+        .collect();
+    classify_terminal_signatures(&sigs, final_answer.is_some())
+}
+
+pub(crate) fn write_meg_state(
+    workspace: &std::path::Path,
+    status: &str,
+    exit_code: i32,
+    details: serde_json::Value,
+) -> Result<std::path::PathBuf> {
+    let meg_dir = workspace.join(".meg");
+    std::fs::create_dir_all(&meg_dir)?;
+    let state_path = meg_dir.join("state.json");
+    let updated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut doc = serde_json::Map::new();
+    doc.insert("schema_version".into(), serde_json::json!(1));
+    doc.insert("status".into(), serde_json::json!(status));
+    doc.insert("exit_code".into(), serde_json::json!(exit_code));
+    doc.insert("updated_at_ms".into(), serde_json::json!(updated_at_ms));
+    if let Some(obj) = details.as_object() {
+        for (k, v) in obj {
+            doc.insert(k.clone(), v.clone());
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(doc))?;
+    let tmp = meg_dir.join(format!("state.json.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, &bytes)?;
+    if std::fs::rename(&tmp, &state_path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&state_path, &bytes)?;
+    }
+    Ok(state_path)
+}
+
+#[cfg(test)]
+mod phase7a_tests {
+    use super::*;
+
+    #[test]
+    fn phase7a_terminal_state_classifier_and_meg_state_json() {
+        assert_eq!(classify_terminal_signatures(&[], true), ("GREEN", EXIT_CODE_GREEN));
+        assert_eq!(
+            classify_terminal_signatures(&["a".into(), "b".into(), "c".into()], false),
+            ("BUDGET", EXIT_CODE_BUDGET)
+        );
+        assert_eq!(
+            classify_terminal_signatures(&["a".into(), "x".into(), "x".into(), "x".into()], false),
+            ("STALL", EXIT_CODE_STALL)
+        );
+
+        let ws = std::env::temp_dir().join(format!("meg-state-json-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let path = write_meg_state(
+            &ws,
+            "STALL",
+            EXIT_CODE_STALL,
+            serde_json::json!({"mode": "run", "turns": 5}),
+        )
+        .unwrap();
+        assert_eq!(path, ws.join(".meg").join("state.json"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["status"], "STALL");
+        assert_eq!(parsed["exit_code"], 3);
+        assert_eq!(parsed["turns"], 5);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn phase7a_cli_parses_delegent_and_subagent_model_flags() {
+        let run_args: Vec<String> = [
+            "meg",
+            "run",
+            "--delegent",
+            "--subagent-model",
+            "ollama:qwen2.5-coder:7b",
+            "audit",
+            "repo",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (goal, run_opts) = crate::cli::parse_run_options(&run_args).unwrap();
+        assert_eq!(goal, "audit repo");
+        assert!(run_opts.delegent);
+        assert_eq!(run_opts.subagent_model.as_deref(), Some("ollama:qwen2.5-coder:7b"));
+
+        let tui_args: Vec<String> = [
+            "meg",
+            "tui",
+            "--delegent",
+            "--ui",
+            "pro",
+            "--pair-mode",
+            "devin_fusion",
+            "--subagent-model",
+            "lmstudio:qwen-7b",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let tui_opts = crate::cli::parse_tui_options(&tui_args).unwrap();
+        assert!(tui_opts.delegent);
+        assert_eq!(tui_opts.ui_mode.as_deref(), Some("pro"));
+        assert_eq!(tui_opts.pair_mode.as_deref(), Some("devin_fusion"));
+        assert_eq!(tui_opts.subagent_model.as_deref(), Some("lmstudio:qwen-7b"));
+        assert!(tui_opts.resume.is_none());
+    }
 }
 

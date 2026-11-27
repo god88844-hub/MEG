@@ -75,6 +75,25 @@ pub(crate) async fn run_loop_headless(workspace: &std::path::Path, options: &Loo
             "runs": runs,
         });
         std::fs::write(&state_path, serde_json::to_vec_pretty(&doc)?)?;
+        let (canonical, exit_code) = match status {
+            "green" => ("GREEN", crate::runner::EXIT_CODE_GREEN),
+            "stalled" => ("STALL", crate::runner::EXIT_CODE_STALL),
+            "budget" => ("BUDGET", crate::runner::EXIT_CODE_BUDGET),
+            "check_cannot_fail" => ("CHECK_CANNOT_FAIL", crate::runner::EXIT_CODE_CHECK_CANNOT_FAIL),
+            _ => ("RUNNING", crate::runner::EXIT_CODE_GREEN),
+        };
+        let _ = crate::runner::write_meg_state(
+            workspace,
+            canonical,
+            exit_code,
+            serde_json::json!({
+                "mode": "loop",
+                "goal": options.goal,
+                "check_cmd": options.check_cmd,
+                "runs": runs.len(),
+                "loop_state_path": state_path.display().to_string(),
+            }),
+        );
         Ok(())
     };
 
@@ -116,6 +135,12 @@ pub(crate) async fn run_loop_headless(workspace: &std::path::Path, options: &Loo
         .unwrap_or_default();
     if options.base.core_six {
         std::env::set_var("MEG_CORE_SIX", "1");
+    }
+    if options.base.delegent {
+        std::env::set_var("MEG_DELEGENT", "1");
+    }
+    if let Some(spec) = &options.base.subagent_model {
+        std::env::set_var("MEG_SUBAGENT_MODEL", spec);
     }
     let plane = if std::env::var("MEG_NO_PLANE").as_deref() == Ok("1")
         || std::env::var("MEG_PLANE_DISABLED").as_deref() == Ok("1")
