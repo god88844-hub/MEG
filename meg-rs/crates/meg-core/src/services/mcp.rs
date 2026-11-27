@@ -79,6 +79,7 @@ impl StdioTransport {
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
+        scrub_mcp_inherited_secrets(&mut cmd, env_map);
         for (k, v) in env_map {
             cmd.env(k, v);
         }
@@ -746,5 +747,121 @@ where
             .enable_all()
             .build()?;
         rt.block_on(fut)
+    }
+}
+
+pub(crate) fn is_mcp_secret_env_name(name: &str) -> bool {
+    let up = name.to_ascii_uppercase();
+    if matches!(
+        up.as_str(),
+        "PATH"
+            | "PATHEXT"
+            | "HOME"
+            | "USERPROFILE"
+            | "HOMEDRIVE"
+            | "HOMEPATH"
+            | "TEMP"
+            | "TMP"
+            | "TMPDIR"
+            | "SYSTEMROOT"
+            | "WINDIR"
+            | "COMSPEC"
+            | "APPDATA"
+            | "LOCALAPPDATA"
+            | "PROGRAMFILES"
+            | "PROGRAMFILES(X86)"
+            | "CARGO_HOME"
+            | "RUSTUP_HOME"
+            | "GOPATH"
+            | "GOROOT"
+            | "VIRTUAL_ENV"
+            | "CONDA_PREFIX"
+            | "TERM"
+            | "LANG"
+            | "LC_ALL"
+            | "COLORTERM"
+            | "NO_COLOR"
+            | "CI"
+    ) {
+        return false;
+    }
+    if matches!(
+        up.as_str(),
+        "OPENAI_API_KEY"
+            | "ANTHROPIC_API_KEY"
+            | "GEMINI_API_KEY"
+            | "GOOGLE_API_KEY"
+            | "DEEPSEEK_API_KEY"
+            | "OPENROUTER_API_KEY"
+            | "NVIDIA_API_KEY"
+            | "GROQ_API_KEY"
+            | "MISTRAL_API_KEY"
+            | "XAI_API_KEY"
+            | "MEG_API_KEY"
+            | "MEG_TUI_API_KEY"
+            | "MEG_RECEIPT_KEY"
+            | "GH_TOKEN"
+            | "GITHUB_TOKEN"
+            | "GITLAB_TOKEN"
+            | "NPM_TOKEN"
+            | "PYPI_TOKEN"
+            | "CARGO_REGISTRY_TOKEN"
+            | "HF_TOKEN"
+            | "HUGGING_FACE_HUB_TOKEN"
+            | "AWS_ACCESS_KEY_ID"
+            | "AWS_SECRET_ACCESS_KEY"
+            | "AWS_SESSION_TOKEN"
+            | "AZURE_CLIENT_SECRET"
+            | "DOCKER_PASSWORD"
+    ) {
+        return true;
+    }
+    up.ends_with("_API_KEY")
+        || up.ends_with("_SECRET")
+        || up.ends_with("_SECRET_KEY")
+        || up.ends_with("_ACCESS_KEY")
+        || up.ends_with("_PRIVATE_KEY")
+        || up.ends_with("_AUTH_TOKEN")
+        || up.ends_with("_ACCESS_TOKEN")
+        || up.ends_with("_PASSWORD")
+        || up.ends_with("_PASSWD")
+        || up.contains("_SECRET_")
+}
+
+pub(crate) fn mcp_secret_keys_to_scrub<'a>(
+    ambient_keys: impl IntoIterator<Item = &'a str>,
+    explicit_env: &HashMap<String, String>,
+) -> Vec<String> {
+    let explicit_upper: std::collections::HashSet<String> = explicit_env
+        .keys()
+        .map(|k| k.to_ascii_uppercase())
+        .collect();
+    ambient_keys
+        .into_iter()
+        .filter(|k| is_mcp_secret_env_name(k) && !explicit_upper.contains(&k.to_ascii_uppercase()))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn scrub_mcp_inherited_secrets(cmd: &mut Command, explicit_env: &HashMap<String, String>) {
+    if std::env::var("MEG_PASSTHROUGH_SECRETS").as_deref() == Ok("1") {
+        return;
+    }
+    let ambient: Vec<(std::ffi::OsString, String)> = std::env::vars_os()
+        .map(|(k, _)| {
+            let name = k.to_string_lossy().into_owned();
+            (k, name)
+        })
+        .collect();
+    let to_scrub: std::collections::HashSet<String> = mcp_secret_keys_to_scrub(
+        ambient.iter().map(|(_, name)| name.as_str()),
+        explicit_env,
+    )
+    .into_iter()
+    .collect();
+    for (k, name) in ambient {
+        if to_scrub.contains(&name) {
+            cmd.env_remove(&k);
+        }
     }
 }

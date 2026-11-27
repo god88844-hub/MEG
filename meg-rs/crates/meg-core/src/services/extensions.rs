@@ -297,35 +297,81 @@ impl WorkspaceExtensions {
         Ok(result)
     }
 
-    fn mcp_artifact_hashes(&self, config: &McpConfig) -> Vec<String> {
-        let mut candidates = Vec::new();
-        if let Some(ref cmd) = config.command {
-            candidates.push(cmd.as_str());
+    fn resolve_mcp_artifact_path(&self, raw: &str, search_path: bool) -> Option<PathBuf> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("http://")
+            || trimmed.starts_with("https://")
+        {
+            return None;
         }
-        if let Some(ref args) = config.args {
-            for arg in args.iter().take(4) {
-                if !arg.starts_with('-') {
-                    candidates.push(arg.as_str());
+        let p = Path::new(trimmed);
+        if p.is_absolute() {
+            if p.is_file() {
+                return Some(p.to_path_buf());
+            }
+            if search_path {
+                return resolve_windows_pathext(p);
+            }
+            return None;
+        }
+        let has_sep = trimmed.contains('/') || trimmed.contains('\\');
+        if has_sep || !search_path {
+            let ws_candidate = self.workspace.join(p);
+            if ws_candidate.is_file() {
+                return Some(ws_candidate);
+            }
+            if search_path {
+                if let Some(found) = resolve_windows_pathext(&ws_candidate) {
+                    return Some(found);
                 }
             }
+            if !search_path {
+                return None;
+            }
         }
-        let mut hashes = Vec::new();
-        for raw in candidates {
-            let p = Path::new(raw);
-            let resolved = if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                self.workspace.join(p)
-            };
-            if let Ok(meta) = fs::metadata(&resolved) {
-                if meta.is_file() && meta.len() <= 16 * 1024 * 1024 {
-                    if let Ok(bytes) = fs::read(&resolved) {
-                        hashes.push(format!("{}:{}", resolved.display(), sha256_hex(&bytes)));
+        if search_path {
+            if let Some(path_var) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&path_var) {
+                    let candidate = dir.join(trimmed);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                    if let Some(found) = resolve_windows_pathext(&candidate) {
+                        return Some(found);
                     }
                 }
             }
         }
-        hashes
+        None
+    }
+
+    pub(crate) fn mcp_artifact_hashes(&self, config: &McpConfig) -> Vec<String> {
+        let mut candidates: Vec<(&str, bool)> = Vec::new();
+        if let Some(ref cmd) = config.command {
+            candidates.push((cmd.as_str(), true));
+        }
+        if let Some(ref args) = config.args {
+            for arg in args.iter().take(16) {
+                if !arg.starts_with('-') {
+                    candidates.push((arg.as_str(), false));
+                } else if let Some((_, val)) = arg.split_once('=') {
+                    if !val.is_empty() {
+                        candidates.push((val, false));
+                    }
+                }
+            }
+        }
+        let mut pinned = std::collections::BTreeSet::new();
+        for (raw, search_path) in candidates {
+            if let Some(resolved) = self.resolve_mcp_artifact_path(raw, search_path) {
+                let canon = fs::canonicalize(&resolved).unwrap_or(resolved);
+                if let Some(digest) = hash_mcp_artifact_file(&canon) {
+                    pinned.insert(format!("{}:{}", canon.display(), digest));
+                }
+            }
+        }
+        pinned.into_iter().collect()
     }
 
     fn fingerprint(&self, name: &str, config: &McpConfig) -> String {
@@ -776,4 +822,48 @@ impl WorkspaceExtensions {
         }
         Ok(result)
     }
+}
+
+fn resolve_windows_pathext(base: &Path) -> Option<PathBuf> {
+    if !cfg!(windows) || base.extension().is_some() {
+        return None;
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".into());
+    for ext in pathext.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let mut os = base.as_os_str().to_os_string();
+        os.push(ext);
+        let cand = PathBuf::from(os);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn hash_mcp_artifact_file(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const FULL_HASH_CAP: u64 = 16 * 1024 * 1024;
+    const WINDOW_BYTES: usize = 1024 * 1024;
+
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
+    if len <= FULL_HASH_CAP {
+        let bytes = fs::read(path).ok()?;
+        return Some(sha256_hex(&bytes));
+    }
+    let mut file = fs::File::open(path).ok()?;
+    let mut material = format!("large:{len}:").into_bytes();
+    let mut head = vec![0u8; WINDOW_BYTES];
+    let n_head = file.read(&mut head).ok()?;
+    material.extend_from_slice(&head[..n_head]);
+    if len > WINDOW_BYTES as u64 {
+        file.seek(SeekFrom::Start(len - WINDOW_BYTES as u64)).ok()?;
+        let mut tail = vec![0u8; WINDOW_BYTES];
+        let n_tail = file.read(&mut tail).ok()?;
+        material.extend_from_slice(&tail[..n_tail]);
+    }
+    Some(sha256_hex(&material))
 }

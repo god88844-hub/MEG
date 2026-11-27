@@ -205,3 +205,126 @@ for line in sys.stdin:
     svc.shutdown();
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+#[test]
+fn mcp_hash_pinning_blocks_tampered_script_reconnect_and_scrubs_secrets() {
+    // 1. Secret env classifier strips ambient credentials while allowing explicit server env
+    let mut explicit = std::collections::HashMap::new();
+    explicit.insert("CUSTOM_API_KEY".into(), "explicit-allowed".into());
+    let scrubbed = super::mcp::mcp_secret_keys_to_scrub(
+        ["PATH", "OPENAI_API_KEY", "MEG_RECEIPT_KEY", "CUSTOM_API_KEY", "GH_TOKEN"],
+        &explicit,
+    );
+    assert!(scrubbed.iter().any(|k| k == "OPENAI_API_KEY"));
+    assert!(scrubbed.iter().any(|k| k == "MEG_RECEIPT_KEY"));
+    assert!(scrubbed.iter().any(|k| k == "GH_TOKEN"));
+    assert!(!scrubbed.iter().any(|k| k == "PATH"));
+    assert!(!scrubbed.iter().any(|k| k == "CUSTOM_API_KEY"));
+
+    // 2. Live stdio MCP server: hash-pinning covers PATH binary + script, reconnects when
+    //    untouched, and refuses auto-reconnect after a single-byte script modification.
+    let ws = std::env::temp_dir().join(format!("meg-mcp-pin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(ws.join(".meg")).unwrap();
+    let py_server = ws.join("pin_server.py");
+    let server_code = r#"import json, os, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    m = msg.get("method")
+    if m == "initialize":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "pin", "version": "1"}}}
+    elif m == "tools/list":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+            {"name": "probe", "description": "Read explicit env", "inputSchema": {"type": "object", "properties": {}}, "annotations": {"readOnlyHint": True}}
+        ]}}
+    elif m == "tools/call":
+        resp = {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": os.environ.get("PIN_EXPLICIT_VAL", "missing")}]}}
+    else:
+        continue
+    sys.stdout.write(json.dumps(resp) + "\n")
+    sys.stdout.flush()
+"#;
+    std::fs::write(&py_server, server_code).unwrap();
+
+    let py_bin = if cfg!(windows) { "python" } else { "python3" };
+    std::fs::write(
+        ws.join(".meg").join("mcp.json"),
+        json!({
+            "mcpServers": {
+                "pintest": {
+                    "command": py_bin,
+                    "args": [py_server.display().to_string()],
+                    "env": { "PIN_EXPLICIT_VAL": "ok-explicit" }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let cancel = CancellationToken::default();
+    let ws_str = ws.display().to_string();
+
+    // Verify PATH interpreter + script are both pinned
+    let ext_check = super::extensions::WorkspaceExtensions::new(&ws).unwrap();
+    let cfg: super::mcp::McpConfig = serde_json::from_value(json!({
+        "command": py_bin,
+        "args": [py_server.display().to_string()]
+    }))
+    .unwrap();
+    let pins = ext_check.mcp_artifact_hashes(&cfg);
+    assert!(
+        pins.len() >= 2,
+        "expected both PATH interpreter and script to be hash-pinned, got: {pins:?}"
+    );
+
+    // Start once -> trusts fingerprint & executes explicit env
+    let svc1 = NativeServices::new();
+    let started = svc1
+        .call("mcp.command", json!({"workspace": ws_str, "command": "start pintest"}), &cancel)
+        .unwrap();
+    assert_eq!(started["catalog"]["tools"].as_array().unwrap().len(), 1);
+    let probed = svc1
+        .call(
+            "runtime.tool",
+            json!({"workspace": ws_str, "tool": "mcp__pintest__probe", "args": {}, "readOnly": true}),
+            &cancel,
+        )
+        .unwrap();
+    assert_eq!(probed["content"][0]["text"], "ok-explicit");
+    svc1.shutdown();
+
+    // Fresh service with untouched script -> auto-reconnects via pinned trust
+    let svc2 = NativeServices::new();
+    let cat_ok = svc2
+        .call("runtime.catalog", json!({"workspace": ws_str}), &cancel)
+        .unwrap();
+    assert_eq!(
+        cat_ok["catalog"]["tools"].as_array().unwrap().len(),
+        1,
+        "untouched trusted MCP server should auto-reconnect"
+    );
+    svc2.shutdown();
+
+    // Tamper 1 line in the script on disk -> fingerprint drifts -> auto-reconnect MUST refuse
+    std::fs::write(&py_server, format!("{server_code}# tampered\n")).unwrap();
+    let svc3 = NativeServices::new();
+    let cat_tampered = svc3
+        .call("runtime.catalog", json!({"workspace": ws_str}), &cancel)
+        .unwrap();
+    assert_eq!(
+        cat_tampered["catalog"]["tools"].as_array().unwrap().len(),
+        0,
+        "tampered MCP script must invalidate pinned trust and block auto-reconnect"
+    );
+    // Clean up trust entry for this temp workspace
+    let _ = svc3.call("mcp.command", json!({"workspace": ws_str, "command": "stop pintest"}), &cancel);
+    svc3.shutdown();
+
+    let _ = std::fs::remove_dir_all(&ws);
+}
