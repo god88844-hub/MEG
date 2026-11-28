@@ -290,7 +290,7 @@ mod os_pty {
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, TerminateProcess, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
-        PROCESS_INFORMATION, STARTUPINFOW,
+        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
     };
 
     const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
@@ -486,6 +486,10 @@ mod os_pty {
 
                 let mut siex: StartupInfoExW = std::mem::zeroed();
                 siex.startup_info.cb = std::mem::size_of::<StartupInfoExW>() as u32;
+                siex.startup_info.dwFlags = STARTF_USESTDHANDLES;
+                siex.startup_info.hStdInput = std::ptr::null_mut();
+                siex.startup_info.hStdOutput = std::ptr::null_mut();
+                siex.startup_info.hStdError = std::ptr::null_mut();
                 siex.lp_attribute_list = attr_ptr;
 
                 let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
@@ -637,7 +641,7 @@ mod os_pty {
         fn grantpt(fd: c_int) -> c_int;
         fn unlockpt(fd: c_int) -> c_int;
         fn ptsname(fd: c_int) -> *const c_char;
-        fn open(path: *const c_char, oflag: c_int) -> c_int;
+        fn open(path: *const c_char, oflag: c_int, ...) -> c_int;
         fn close(fd: c_int) -> c_int;
         fn dup2(oldfd: c_int, newfd: c_int) -> c_int;
         fn setsid() -> c_int;
@@ -1221,7 +1225,7 @@ mod tests {
         let tty_cmd = if cfg!(windows) {
             "python -c \"import sys; print('IS_TTY=' + str(sys.stdout.isatty()))\""
         } else {
-            "python3 -c \"import sys; print('IS_TTY=' + str(sys.stdout.isatty()))\""
+            "[ -t 1 ] && echo IS_TTY=True || echo IS_TTY=False"
         };
         let tty_out = mgr
             .execute(
