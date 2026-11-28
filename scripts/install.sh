@@ -30,21 +30,27 @@ trap 'rm -f "${TMP_BIN}"' EXIT
 echo "Downloading MEG ${TAG} (${ASSET})..."
 curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/${ASSET}" -o "${TMP_BIN}"
 
-if SUMS="$(curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt" 2>/dev/null)"; then
-  EXPECTED="$(printf '%s\n' "${SUMS}" | awk -v a="${ASSET}" '$2 == a {print $1; exit}')"
-  if [ -n "${EXPECTED}" ]; then
-    if command -v sha256sum >/dev/null 2>&1; then
-      ACTUAL="$(sha256sum "${TMP_BIN}" | awk '{print $1}')"
-    else
-      ACTUAL="$(shasum -a 256 "${TMP_BIN}" | awk '{print $1}')"
-    fi
-    if [ "${ACTUAL}" != "${EXPECTED}" ]; then
-      echo "SHA-256 mismatch! expected=${EXPECTED} actual=${ACTUAL}" >&2
-      exit 1
-    fi
-    echo "Verified SHA-256: ${ACTUAL}"
-  fi
+SUMS="$(curl -fsSL "https://github.com/${REPO}/releases/download/${TAG}/SHA256SUMS.txt")"
+EXPECTED="$(printf '%s\n' "${SUMS}" | awk -v a="${ASSET}" '$2 == a {print $1; exit}')"
+if [ -z "${EXPECTED}" ]; then
+  echo "Missing SHA-256 entry for ${ASSET} in SHA256SUMS.txt; refusing unverified install" >&2
+  exit 1
 fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL="$(sha256sum "${TMP_BIN}" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL="$(shasum -a 256 "${TMP_BIN}" | awk '{print $1}')"
+else
+  echo "Neither sha256sum nor shasum is installed; refusing unverified install" >&2
+  exit 1
+fi
+
+if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+  echo "SHA-256 mismatch! expected=${EXPECTED} actual=${ACTUAL}" >&2
+  exit 1
+fi
+echo "Verified SHA-256: ${ACTUAL}"
 
 chmod +x "${TMP_BIN}"
 mv "${TMP_BIN}" "${INSTALL_DIR}/meg"

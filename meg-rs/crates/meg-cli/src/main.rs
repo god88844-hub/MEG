@@ -6,6 +6,7 @@
 //! - `meg loop --check "<cmd>" "<goal>"`: runs the outer verification retry loop.
 //! - `meg -h` / `meg --help`: displays CLI usage.
 
+mod attach;
 mod bridge;
 mod cli;
 mod engine;
@@ -24,6 +25,7 @@ use crate::bridge::run_ui_bridge;
 use crate::cli::{CliCommand, parse_cli_args, parse_loop_options, parse_run_options, print_usage};
 use crate::loop_cmd::run_loop_headless;
 use crate::runner::{run_goal_headless, run_worker};
+use crate::attach::{parse_attach_options, run_attach};
 use crate::serve::run_serve;
 use crate::tui_launch::launch_tui;
 
@@ -86,6 +88,11 @@ async fn main() -> Result<()> {
                 0
             };
             run_serve(&ws, port).await?;
+            Ok(())
+        }
+        CliCommand::Attach => {
+            let opts = parse_attach_options(&args)?;
+            run_attach(&opts).await?;
             Ok(())
         }
         CliCommand::Help => {

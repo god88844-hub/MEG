@@ -2,7 +2,7 @@
 
 - **Version:** `0.2.0`
 - **Active Architecture:** Pure-Rust Single Binary (`meg.exe` / `meg`) with `ServicePlane::native()` default (zero Bun/Node/DLL runtime dependency).
-- **Quality Gate:** `cargo clippy --locked --no-deps --workspace -- -D warnings` (0 warnings across all 5 crates), 459 Rust workspace tests, 26 Python `meg-eval` offline tests, and 3-OS CI (Windows, Linux, macOS).
+- **Quality Gate:** `cargo clippy --locked --no-deps --workspace -- -D warnings` (0 warnings across all 5 crates), full Rust workspace test suite across Ubuntu, macOS, and Windows, plus Python `meg-eval` offline tests and protected-path test integrity guard.
 
 ## Completed Phases
 
@@ -11,18 +11,20 @@
 - [x] **Phase 3 (Core Trust & Editing Integrity):** Closed `C02` (full-range hashline interior line verification), `C05` (`.gitignore` support + skipped-file notes in `grep_files`), `C09` (bounded side-git timeouts + pruning), `C10` (registry JSON schema validation), `B02`/`B05` (deduped MCP schemas + nested `AGENTS.md`/`CLAUDE.md`), `B08` (quoted `@"path"` + secret airlock/scrubbing), `B04` (structured `/compact`), `D04` (local MCP binary/script SHA-256 trust pinning), `D09` (blocking remote plaintext HTTP), `F04` (bounded child stderr diagnostics), and `F05` (stateful, non-blocking, cancellable `meg ui-bridge`).
 - [x] **Phase 4 (Cross-Platform CI, Installers & Benchmark Integrity):** Added 3-OS CI matrix (Windows + Linux + macOS + `pytest meg-eval`), tag-triggered release workflow with `SHA256SUMS.txt`, one-line installers (`install.ps1` / `install.sh`), isolated oracle + HTTP wire secret inspection in `run_live_bench.py` (`G02`, `G04`, `G05`), and reconciled docs (`F08`).
 - [x] **Phase 5 (Daily-Driver Primitives):** Shipped native stdio LSP write-through diagnostics (`meg-tools/src/lsp.rs`) wired into `write_file`/`edit_file`, native `web_fetch` with SSRF/private-IP/redirect blocking, `.meg/permissions.json` (`deny` > `allow` > `ask`) + ambient secret env scrubbing (`meg-tools/src/sandbox.rs`), and cross-provider role routing (`provider_id:model_id` preserving Ollama `:tag` + `MEG_DISABLED_PROVIDERS` enforcement).
-- [x] **Phase 6 (Diff-Aware Review, Live MCP & Sandbox Hardening):**
-  - **6A:** Diff-aware cold L3 review & mutation tracking.
-  - **6B:** Live stdio MCP round-trips & deferred loading for large MCP tool catalogs.
-  - **6C-1:** Full `PATH` + script SHA-256 hash-pinning (`extensions.rs`) and ambient host secret scrubbing on MCP stdio spawn (`mcp.rs`).
-  - **6C-2:** Windows Job Object process/RAM/UI limits (`ActiveProcessLimit`, `JobMemoryLimit`, `DIE_ON_UNHANDLED_EXCEPTION`, restricted-token probe in `strict` mode), loopback proxy sinkhole when `network: false`, and Linux `bwrap` `--unshare-pid --new-session` tightening.
-- [x] **Phase 7A (Delegent Local-SLM Routing & Deterministic Terminal State):** Added `--delegent` and `--subagent-model` routing (role env -> explicit spec -> enabled `ollama`/`lmstudio` preset) for read-only subagents, plus atomic `.meg/state.json` persistence and deterministic exit codes (`0=GREEN`, `2=BUDGET`, `3=STALL`, `4=CHECK_CANNOT_FAIL`) across `meg run` and `meg loop`.
-- [x] **Phase 8A (Release Readiness):** Fixed `.github/workflows/{ci,release}.yml` YAML indentation, forwarded `--delegent`/`--subagent-model` in TUI launch, cleaned `meg --help`, made `scripts/install.ps1` SHA-256 verification fail-closed, and synchronized `README.md`, `SECURITY.md`, and `docs/`.
+- [x] **Phase 6 (Diff-Aware Review, Live MCP & Sandbox Hardening):** Diff-aware cold L3 review (`6A`), live stdio MCP round-trips & deferred loading (`6B`), `PATH` + script SHA-256 MCP hash-pinning & spawn secret scrubbing (`6C-1`), and Windows Job Object / Linux `bwrap` / macOS Seatbelt hardening (`6C-2`).
+- [x] **Phase 7A (Delegent Local-SLM Routing & Deterministic Terminal State):** Added `--delegent` and `--subagent-model` routing for read-only subagents, plus atomic `.meg/state.json` persistence and deterministic exit codes (`0=GREEN`, `2=BUDGET`, `3=STALL`, `4=CHECK_CANNOT_FAIL`).
+- [x] **Phase 8A (Release Readiness):** Validated CI/release workflows, synced CLI/TUI flags, and cleaned `meg --help`.
+- [x] **Phase 9 (3-OS Sandboxing, Stateful Daemon & Native Provider Protocols):**
+  - **9A:** Linux `bwrap` `/tmp` mount order + AppArmor probe, macOS canonical Seatbelt subpaths, `mcp-trust.json` concurrency lock, and pure-Rust Unix CI parity.
+  - **9B:** Real Windows `CreateRestrictedToken` + `CreateProcessAsUserW` Job-attached spawn, symlink TOCTOU guards, and persistent stateful `shell_session`.
+  - **9C:** Token-authenticated loopback JSON-RPC 2.0 daemon (`meg serve`, `meg-serve/v1`) with multi-session streaming and mid-flight cancellation.
+  - **9D:** Native OpenAI Responses API (`/v1/responses`) and Google Gemini native (`:streamGenerateContent?alt=sse`, `x-goog-api-key`) wire adapters with multimodal and `wiremock` suites.
+- [x] **Phase 10 (Cross-OS Vault, Windows AppContainer, True PTY & Daemon Client):**
+  - **10A:** Native macOS Keychain (`/usr/bin/security`), Linux Secret Service (`secret-tool`), `0600` atomic fallback vault, and 3-OS namespace isolation tests.
+  - **10B:** Real Windows AppContainer (`CreateAppContainerProfile` + `SECURITY_CAPABILITIES` + workspace-scoped ACL grant + `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` + `BoundedPipeDrain`) with live outside-workspace kernel write-denial test.
+  - **10C:** True OS PTY backing (`shell_session` `pty: true` via Windows ConPTY `CreatePseudoConsole` and Unix POSIX `posix_openpt`/`TIOCSCTTY`) with interactive `open`/`write`/`read`/`resize` and `isatty()` verification across all 3 OSes.
+  - **10D:** Native `meg attach` daemon client (one-shot streaming + interactive REPL + loopback enforcement), fail-closed SHA-256 verification in `scripts/install.ps1` and `scripts/install.sh`, and reconciled `v0.2.0` documentation.
 
-## Next Active Phases
+## Open Milestones
 
-- [ ] **Phase 9 ? Multi-Surface Daemon & Interactive PTY:**
-  - Versioned stateful JSON-RPC daemon (`meg serve`) and persistent interactive PTY shell execution.
-  - Optional Windows AppContainer isolation for untrusted repositories.
-- [ ] **Phase 10 ? Public Same-Model Benchmarks:**
-  - Blind, reproducible same-model benchmark (`meg` vs Pi / OpenCode) with published raw trajectories, `pass@1`, and token/cost breakdown.
+- [ ] **Public Same-Model Benchmarks:** Run blind, reproducible live-model benchmarks (`meg` vs. Pi / OpenCode on identical models & standard API keys across Terminal-Bench 2.0 / SWE-bench Lite) and publish raw trajectories, `pass@1`, wall-clock latency, and token cost.

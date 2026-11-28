@@ -55,6 +55,15 @@ pub(crate) fn parse_cli_args(args: &[String]) -> CliCommand {
             }
             CliCommand::Serve
         }
+        Some("attach") => {
+            if args
+                .get(2)
+                .is_some_and(|arg| matches!(arg.as_str(), "-h" | "--help"))
+            {
+                return CliCommand::Help;
+            }
+            CliCommand::Attach
+        }
         Some(cmd) => CliCommand::Unknown(cmd.to_string()),
     }
 }
@@ -67,6 +76,7 @@ pub(crate) enum CliCommand {
     Loop,
     UiBridge,
     Serve,
+    Attach,
     Help,
     Version,
     Unknown(String),
@@ -332,6 +342,7 @@ pub(crate) fn print_usage() {
     println!("  loop --check <cmd> [OPTIONS] [--] <goal>  Run verified Loop-2 outer work loop (.meg/state.json, check_cannot_fail, stall exit)");
     println!("  ui-bridge [-C <dir>]  Open NDJSON stdin/stdout protocol so any custom TUI/GUI can drive MEG");
     println!("  serve [--port N] [-C <dir>]  Start token-authenticated loopback JSON-RPC 2.0 daemon (meg-serve/v1)");
+    println!("  attach --addr <host:port> --token <tok> [OPTIONS] [goal]  Attach to a running MEG daemon (one-shot or REPL)");
     println!("\nOptions:");
     println!("  -h, --help      Print this help message");
     println!("  -V, --version   Print version information");

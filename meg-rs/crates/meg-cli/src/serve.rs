@@ -107,18 +107,18 @@ struct DaemonSession {
     active_cancel: Arc<Mutex<Option<meg_core::CancellationToken>>>,
 }
 
-struct DaemonState {
+pub(crate) struct DaemonState {
     config: ServeConfig,
     plane: Option<Arc<meg_core::services::ServicePlane>>,
     sessions: Mutex<HashMap<String, DaemonSession>>,
-    shutdown: Notify,
+    pub(crate) shutdown: Notify,
 }
 
 pub(crate) struct DaemonHandle {
     pub(crate) addr: SocketAddr,
     pub(crate) token: String,
-    task: tokio::task::JoinHandle<()>,
-    state: Arc<DaemonState>,
+    pub(crate) task: tokio::task::JoinHandle<()>,
+    pub(crate) state: Arc<DaemonState>,
 }
 
 impl DaemonHandle {
