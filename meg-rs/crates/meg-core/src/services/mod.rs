@@ -134,20 +134,14 @@ impl Drop for NativeServices {
     }
 }
 
-/// Unified service backend: pure-Rust `NativeServices` by default, or an opt-in
-/// external Bun `PlaneClient` when `MEG_LEGACY_BUN_PLANE=1` / `MEG_PLANE_ENTRY` is set.
+/// Pure-Rust in-process service backend (`NativeServices`).
 pub enum ServicePlane {
     Native(Arc<NativeServices>),
-    External(Arc<crate::plane_client::PlaneClient>),
 }
 
 impl ServicePlane {
     pub fn native() -> Arc<Self> {
         Arc::new(Self::Native(Arc::new(NativeServices::new())))
-    }
-
-    pub fn external(client: Arc<crate::plane_client::PlaneClient>) -> Arc<Self> {
-        Arc::new(Self::External(client))
     }
 
     pub fn is_native(&self) -> bool {
@@ -162,7 +156,6 @@ impl ServicePlane {
     ) -> Result<Value> {
         match self {
             Self::Native(svc) => svc.call(method, params, cancel),
-            Self::External(plane) => plane.call(method, params, cancel),
         }
     }
 
@@ -178,7 +171,16 @@ impl ServicePlane {
     {
         match self {
             Self::Native(svc) => svc.call_with_events(method, params, cancel, on_event),
-            Self::External(plane) => plane.call_with_events(method, params, cancel, on_event),
         }
+    }
+}
+
+#[cfg(test)]
+mod plane_tests {
+    use super::*;
+
+    #[test]
+    fn service_plane_is_always_pure_rust_native() {
+        assert!(ServicePlane::native().is_native());
     }
 }

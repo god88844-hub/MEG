@@ -927,15 +927,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "meg-ffi"
-version = "0.2.0"
-dependencies = [
- "meg-core",
- "meg-tools",
- "serde_json",
-]
-
-[[package]]
 name = "meg-tools"
 version = "0.2.0"
 dependencies = [

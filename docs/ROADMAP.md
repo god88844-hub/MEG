@@ -9,6 +9,8 @@ This roadmap is synchronized with [docs/STATE.md](STATE.md) and reflects only ve
 - [x] **Phase 9:** Cross-OS sandbox hardening (Linux `bwrap`, macOS Seatbelt, Windows Restricted Token + Job Objects), symlink TOCTOU guards, loopback token-authenticated JSON-RPC 2.0 daemon (`meg serve`), and native OpenAI Responses API + Google Gemini wire adapters.
 - [x] **Phase 10:** Cross-OS credential vault (Windows Credential Manager, macOS Keychain, Linux Secret Service + `0600` atomic fallback), Windows AppContainer kernel FS/network isolation, true OS PTY (`shell_session` via ConPTY / POSIX PTY), native `meg attach` daemon client, fail-closed installer checksum verification, and `v0.2.0` release reconciliation.
 
+- [x] **Phase 11:** 100% pure-Rust repository consolidation ? removed retired `meg-plane/` (Bun/TS), `meg-ffi`, `plane_client.rs`, and speculative eval scripts; relocated builtin skills into `meg-core/skills/`; upgraded CI/Release workflows to Node 24 actions.
+
 ## Upcoming (`v0.3.0+`)
 
 - [ ] **Public Same-Model Benchmarks:** Blind same-model benchmark against Pi and OpenCode with published raw trajectories, `pass@1`, wall-clock latency, and token cost.

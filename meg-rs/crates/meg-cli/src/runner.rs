@@ -578,46 +578,8 @@ pub(crate) fn default_max_steps() -> usize {
 
 
 pub(crate) fn start_plane() -> Result<Arc<meg_core::services::ServicePlane>> {
-    let use_legacy_bun = std::env::var("MEG_LEGACY_BUN_PLANE").as_deref() == Ok("1")
-        || std::env::var_os("MEG_PLANE_ENTRY").is_some();
-    if !use_legacy_bun {
-        return Ok(meg_core::services::ServicePlane::native());
-    }
-    let exe = std::env::current_exe()?;
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(3)
-        .unwrap();
-    let entry = std::env::var_os("MEG_PLANE_ENTRY")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            [
-                exe.parent().unwrap().join("meg-plane/plane.js"),
-                repo.join("meg-plane/dist/plane.js"),
-                repo.join("meg-plane/src/index.ts"),
-            ]
-            .into_iter()
-            .find(|p| p.is_file())
-        })
-        .context("MEG control-plane bundle is missing")?;
-    let builtin = builtin_skills_path(&entry, repo);
-    let client = meg_core::plane_client::PlaneClient::spawn(&entry, &exe, Some(&builtin))?;
-    Ok(meg_core::services::ServicePlane::external(client))
+    Ok(meg_core::services::ServicePlane::native())
 }
-
-
-pub(crate) fn builtin_skills_path(entry: &Path, repo: &Path) -> std::path::PathBuf {
-    let bundled = entry
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("skills");
-    if bundled.is_dir() {
-        bundled
-    } else {
-        repo.join("meg-plane/skills")
-    }
-}
-
 
 pub(crate) async fn run_worker() -> Result<()> {
     use std::io::Read;

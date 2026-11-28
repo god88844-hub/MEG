@@ -392,7 +392,7 @@ impl ToolRegistry {
 
     pub fn with_core_tools(workspace: &std::path::Path) -> Self {
         let mut reg = Self::with_core_six(workspace);
-        // Legacy aliases preserved for meg-cli, meg-ffi, and frozen meg-tui.
+        // Legacy aliases preserved for meg-cli and meg-tui.
         reg.register_with_schema(
             "search_files",
             "Glob search: {pattern} relative to workspace, returns matching paths.",

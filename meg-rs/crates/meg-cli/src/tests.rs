@@ -18,26 +18,36 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
 #[test]
-fn builtin_skills_follow_installed_sidecar_and_public_source_layout() {
-    let root = std::env::temp_dir().join(format!("meg-cli-skills-{}", uuid::Uuid::new_v4()));
-    let repo = root.join("source");
-    let source_skills = repo.join("meg-plane/skills");
-    std::fs::create_dir_all(&source_skills).unwrap();
-    for entry in [
-        repo.join("meg-plane/src/index.ts"),
-        repo.join("meg-plane/dist/plane.js"),
-    ] {
-        assert_eq!(builtin_skills_path(&entry, &repo), source_skills);
-    }
-    // The path selected by MEG_PLANE_ENTRY follows the same sidecar rule.
-    let installed_entry = root.join("custom-plane/plane.js");
-    let installed_skills = installed_entry.parent().unwrap().join("skills");
-    std::fs::create_dir_all(&installed_skills).unwrap();
-    assert_eq!(
-        builtin_skills_path(&installed_entry, &repo),
-        installed_skills
+fn embedded_builtin_skills_load_without_external_sidecar() {
+    let plane = start_plane().expect("pure-Rust native service plane starts without sidecars");
+    assert!(plane.is_native());
+    let ws = std::env::temp_dir().join(format!("meg-cli-skills-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&ws).unwrap();
+    let ws_str = ws.display().to_string();
+    let cancel = meg_core::CancellationToken::default();
+
+    let catalog = plane
+        .call("runtime.catalog", serde_json::json!({ "workspace": ws_str }), &cancel)
+        .expect("runtime.catalog succeeds");
+    let skills = catalog["catalog"]["skills"].as_array().expect("catalog.skills array");
+    assert!(
+        skills.len() >= 10,
+        "expected >= 10 embedded builtin skills, got {}",
+        skills.len()
     );
-    std::fs::remove_dir_all(root).unwrap();
+
+    let skill_doc = plane
+        .call(
+            "skills.read",
+            serde_json::json!({ "workspace": ws_str, "name": "tdd-discipline" }),
+            &cancel,
+        )
+        .expect("skills.read loads embedded builtin skill");
+    assert!(
+        !skill_doc.to_string().is_empty(),
+        "expected non-empty embedded skill content"
+    );
+    let _ = std::fs::remove_dir_all(&ws);
 }
 #[test]
 fn run_options_preserve_literal_goals_and_apply_session_options() {

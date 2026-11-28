@@ -5,7 +5,6 @@
 
 pub mod build;
 pub mod cancel;
-pub mod plane_client;
 pub mod services;
 pub mod provider_catalog;
 pub mod providers;

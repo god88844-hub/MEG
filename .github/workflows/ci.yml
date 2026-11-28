@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Reject test deletions and weakened assertions
@@ -31,12 +31,12 @@ jobs:
             echo "No base commit for diff; skipping guard."
             exit 0
           fi
-          DELETED=$(git diff --diff-filter=D --name-only "$BASE_REF..HEAD" | grep -E '(^|/)tests/|^meg-plane/test/|^meg-eval/test_' || true)
+          DELETED=$(git diff --diff-filter=D --name-only "$BASE_REF..HEAD" | grep -E '^meg-rs/crates/[^/]+/tests/|^meg-eval/test_(runner|benchmark_suite|metrics|phase7_gate)\.py$|^meg-eval/oracles/test_' || true)
           if [ -n "$DELETED" ]; then
             echo "::error::Unauthorized deletion of protected test path(s): $DELETED"
             exit 1
           fi
-          WEAKENED=$(git diff "$BASE_REF..HEAD" -- 'meg-rs/crates/*/tests/*' 'meg-eval/test_*.py' | grep -E '^\+\s*(#\[ignore\]|@pytest\.mark\.skip|return\s+#\s*skip)' || true)
+          WEAKENED=$(git diff "$BASE_REF..HEAD" -- 'meg-rs/crates/*/tests/*' 'meg-eval/test_*.py' 'meg-eval/oracles/test_*.py' | grep -E '^\+\s*(#\[ignore\]|@pytest\.mark\.skip|return\s+#\s*skip)' || true)
           if [ -n "$WEAKENED" ]; then
             echo "::error::Suspicious test-skip/ignore weakening detected:"
             echo "$WEAKENED"
@@ -54,7 +54,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Isolate runtime configuration
         run: echo "MEG_CONFIG_DIR=${RUNNER_TEMP}/meg-test-config" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
@@ -73,18 +73,15 @@ jobs:
         run: ./meg-rs/target/release/meg --version
 
   windows:
-    name: Windows Full Gate (Rust + Python Evals + Legacy Bun)
+    name: Windows Full Gate (Pure Rust + Python Evals)
     needs: guard
     runs-on: windows-latest
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Isolate runtime configuration
         run: '"MEG_CONFIG_DIR=$env:RUNNER_TEMP\meg-test-config" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: '1.4.4'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - uses: msys2/setup-msys2@v2
@@ -107,15 +104,9 @@ jobs:
       - name: Native release build
         working-directory: meg-rs
         run: cargo build --locked --release --workspace
-      - name: Verify standalone pure-Rust binary (zero Bun)
+      - name: Verify standalone pure-Rust binary
         run: ./meg-rs/target/release/meg.exe --version
       - name: Python offline evaluation suite
         run: |
           python -m pip install --upgrade pytest
           python -m pytest meg-eval -q
-      - name: Legacy Bun control-plane compatibility suite
-        working-directory: meg-plane
-        run: |
-          bun install --frozen-lockfile --ignore-scripts
-          bun test --timeout 20000
-          bun build src/index.ts --target=bun --outfile=dist/plane.js

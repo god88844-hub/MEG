@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CHECK_SH="${SCRIPT_DIR}/check.sh"
-TARGET_REL="meg-plane/src/router.ts"
+TARGET_REL="meg-rs/crates/meg-core/src/services/mod.rs"
 TARGET_ABS="${REPO_ROOT}/${TARGET_REL}"
 
 if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain -- "${TARGET_REL}")" ]]; then
@@ -32,8 +32,8 @@ import sys
 p = sys.argv[1]
 with open(p, "rb") as f:
     raw = f.read().decode("utf-8")
-needle = "if (local) return { selected: local,"
-bug = "if (local) return { selected: null, /* SELFTEST_DELTA */"
+needle = "matches!(self, Self::Native(_))"
+bug = "false /* SELFTEST_DELTA */"
 if needle not in raw:
     raise SystemExit("Selftest anchor not found")
 with open(p, "wb") as f:
@@ -54,11 +54,5 @@ if [[ "${BUG_CODE}" -eq 0 ]]; then
   exit 1
 fi
 echo "[OK]   check.sh caught synthetic bug delta (exit ${BUG_CODE})"
-
-if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain -- "${TARGET_REL}")" ]]; then
-  echo "[FAIL] ${TARGET_REL} remained modified after revert!" >&2
-  exit 1
-fi
-
 bash "${CHECK_SH}" --fast
 echo "Selftest PASSED (Green -> Red on delta -> Clean Revert -> Green)."

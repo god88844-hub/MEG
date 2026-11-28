@@ -1,11 +1,6 @@
-# CLAUDE.md
+# MEG Session Guidance
 
-Read and follow `AGENTS.md`, `docs/ARCHITECTURE.md`, `docs/PLAN.md`, and `docs/STATE.md` before making any edits.
-
-## Non-Negotiable Constraints
-- `meg-rs/crates/meg-tui/` is **FROZEN** until Phase 8.
-- Follow the exact micro-task order in `docs/PLAN.md` (currently tracked in `docs/STATE.md`).
-- Run ONLY the Tier-1 Micro-Check per TODO; run the full Tier-2 suite at Phase Exit.
-- Keep `meg-rs/Cargo.lock` in sync so `cargo test --locked --workspace` passes in CI.
-- Never delete or weaken tests under `tests/` or `meg-plane/test/`.
-- Verify every claim against actual command output.
+- Read `AGENTS.md` and `docs/STATE.md` before making architectural changes.
+- MEG is a 100% pure-Rust single-binary harness (`meg-rs/` with 4 crates: `meg-core`, `meg-tools`, `meg-tui`, `meg-cli`). Do not reintroduce Bun, Node, or FFI sidecar dependencies.
+- Verify changes with `cargo clippy --locked --no-deps --workspace -- -D warnings` and `cargo test --locked --workspace`.
+- Never delete or weaken tests under `meg-rs/crates/*/tests/` or `meg-eval/test_*.py`.

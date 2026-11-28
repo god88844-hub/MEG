@@ -2,7 +2,7 @@
 
 - **Version:** `0.2.0`
 - **Active Architecture:** Pure-Rust Single Binary (`meg.exe` / `meg`) with `ServicePlane::native()` default (zero Bun/Node/DLL runtime dependency).
-- **Quality Gate:** `cargo clippy --locked --no-deps --workspace -- -D warnings` (0 warnings across all 5 crates), full Rust workspace test suite across Ubuntu, macOS, and Windows, plus Python `meg-eval` offline tests and protected-path test integrity guard.
+- **Quality Gate:** `cargo clippy --locked --no-deps --workspace -- -D warnings` (0 warnings across all 4 pure-Rust crates), full Rust workspace test suite across Ubuntu, macOS, and Windows, plus Python `meg-eval` offline tests and protected-path test integrity guard.
 
 ## Completed Phases
 
@@ -24,6 +24,8 @@
   - **10B:** Real Windows AppContainer (`CreateAppContainerProfile` + `SECURITY_CAPABILITIES` + workspace-scoped ACL grant + `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` + `BoundedPipeDrain`) with live outside-workspace kernel write-denial test.
   - **10C:** True OS PTY backing (`shell_session` `pty: true` via Windows ConPTY `CreatePseudoConsole` and Unix POSIX `posix_openpt`/`TIOCSCTTY`) with interactive `open`/`write`/`read`/`resize` and `isatty()` verification across all 3 OSes.
   - **10D:** Native `meg attach` daemon client (one-shot streaming + interactive REPL + loopback enforcement), fail-closed SHA-256 verification in `scripts/install.ps1` and `scripts/install.sh`, and reconciled `v0.2.0` documentation.
+
+- [x] **Phase 11 (100% Pure-Rust Repository Consolidation & CI Polish):** Relocated embedded builtin skills into `meg-rs/crates/meg-core/skills/`, deleted retired `meg-plane/` (Bun/TS), `meg-ffi`, `plane_client.rs`, and speculative `meg-eval/` research scripts (`evolve.py`, `rsi_guards.py`, `ablate.py`, `testsynth.py`), updated dev scripts to pure Rust, and upgraded CI/Release workflows to Node 24-native actions.
 
 ## Open Milestones
 

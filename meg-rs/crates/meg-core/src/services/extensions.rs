@@ -16,16 +16,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 const EMBEDDED_BUILTIN_SKILLS: &[(&str, &str)] = &[
-    ("compiler-debugging", include_str!("../../../../../meg-plane/skills/compiler-debugging/SKILL.md")),
-    ("diagnosing-bugs", include_str!("../../../../../meg-plane/skills/diagnosing-bugs/SKILL.md")),
-    ("git-recovery", include_str!("../../../../../meg-plane/skills/git-recovery/SKILL.md")),
-    ("pack-appdev", include_str!("../../../../../meg-plane/skills/pack-appdev/SKILL.md")),
-    ("pack-daily", include_str!("../../../../../meg-plane/skills/pack-daily/SKILL.md")),
-    ("pack-games", include_str!("../../../../../meg-plane/skills/pack-games/SKILL.md")),
-    ("pack-systems", include_str!("../../../../../meg-plane/skills/pack-systems/SKILL.md")),
-    ("pack-vibe", include_str!("../../../../../meg-plane/skills/pack-vibe/SKILL.md")),
-    ("pack-visual-motion", include_str!("../../../../../meg-plane/skills/pack-visual-motion/SKILL.md")),
-    ("tdd-discipline", include_str!("../../../../../meg-plane/skills/tdd-discipline/SKILL.md")),
+    ("compiler-debugging", include_str!("../../skills/compiler-debugging/SKILL.md")),
+    ("diagnosing-bugs", include_str!("../../skills/diagnosing-bugs/SKILL.md")),
+    ("git-recovery", include_str!("../../skills/git-recovery/SKILL.md")),
+    ("pack-appdev", include_str!("../../skills/pack-appdev/SKILL.md")),
+    ("pack-daily", include_str!("../../skills/pack-daily/SKILL.md")),
+    ("pack-games", include_str!("../../skills/pack-games/SKILL.md")),
+    ("pack-systems", include_str!("../../skills/pack-systems/SKILL.md")),
+    ("pack-vibe", include_str!("../../skills/pack-vibe/SKILL.md")),
+    ("pack-visual-motion", include_str!("../../skills/pack-visual-motion/SKILL.md")),
+    ("tdd-discipline", include_str!("../../skills/tdd-discipline/SKILL.md")),
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
