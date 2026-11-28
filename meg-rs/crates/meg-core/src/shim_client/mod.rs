@@ -16,7 +16,7 @@ use decoder::CompletionDecoder;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
-use wire::{build_anthropic_messages, build_openai_messages, mark_anthropic_history_cache_breakpoint};
+use wire::{build_anthropic_messages, build_gemini_contents, build_openai_messages, build_openai_responses_input, mark_anthropic_history_cache_breakpoint};
 
 /// A standard local endpoint; personal gateways require explicit configuration.
 pub fn default_base_url() -> String {
@@ -230,6 +230,9 @@ impl ShimClient {
             Some(key) if self.kind == crate::providers::ProviderKind::Anthropic => request
                 .header("x-api-key", key.expose())
                 .header("anthropic-version", "2023-06-01"),
+            Some(key) if self.kind == crate::providers::ProviderKind::Gemini => {
+                request.header("x-goog-api-key", key.expose())
+            }
             Some(key) => request.bearer_auth(key.expose()),
             None => request,
         }
@@ -292,6 +295,25 @@ impl ShimClient {
                 serde_json::from_slice(&bounded_body(response, 8 * 1024 * 1024).await?)?;
             value = json!({"data":tags["models"].as_array().into_iter().flatten().map(|m|json!({"id":m["name"]})).collect::<Vec<_>>()});
         }
+        if self.kind == crate::providers::ProviderKind::Gemini
+            && value["data"].as_array().is_none()
+        {
+            return Ok(value["models"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item["name"].as_str())
+                        .map(|n| n.strip_prefix("models/").unwrap_or(n))
+                        .filter(|id| {
+                            !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+                        })
+                        .take(10_000)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default());
+        }
         Ok(value["data"]
             .as_array()
             .map(|items| {
@@ -309,6 +331,94 @@ impl ShimClient {
     }
 
     fn build_request_body(&self, messages: &[crate::ChatMessage], use_native_tools: bool) -> Value {
+        if self.kind == crate::providers::ProviderKind::OpenAiResponses {
+            let system_text = messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let input_items = build_openai_responses_input(messages, use_native_tools);
+            let mut body = json!({
+                "model": self.model,
+                "input": input_items,
+                "stream": true
+            });
+            if !system_text.is_empty() {
+                body["instructions"] = Value::String(system_text);
+            }
+            if use_native_tools && !self.tools.is_empty() {
+                let active_tools = self.effective_tools();
+                let tools_json: Vec<Value> = active_tools
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "type": "function",
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        })
+                    })
+                    .collect();
+                body["tools"] = Value::Array(tools_json);
+            }
+            if let Some(effort) = &self.reasoning_effort {
+                body["reasoning"] = json!({
+                    "effort": effort,
+                    "summary": "auto"
+                });
+            }
+            return body;
+        }
+        if self.kind == crate::providers::ProviderKind::Gemini {
+            let system_text = messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let contents = build_gemini_contents(messages, use_native_tools);
+            let mut body = json!({
+                "contents": contents
+            });
+            if !system_text.is_empty() {
+                body["systemInstruction"] = json!({
+                    "parts": [{ "text": system_text }]
+                });
+            }
+            if use_native_tools && !self.tools.is_empty() {
+                let active_tools = self.effective_tools();
+                let decls: Vec<Value> = active_tools
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        })
+                    })
+                    .collect();
+                body["tools"] = json!([{ "functionDeclarations": decls }]);
+            }
+            if let Some(budget) = self
+                .reasoning_effort
+                .as_deref()
+                .and_then(|eff| match eff.to_ascii_lowercase().as_str() {
+                    "low" => Some(1024u64),
+                    "medium" => Some(4096),
+                    "high" | "xhigh" | "max" => Some(8192),
+                    _ => None,
+                })
+            {
+                body["generationConfig"] = json!({
+                    "thinkingConfig": {
+                        "includeThoughts": true,
+                        "thinkingBudget": budget
+                    }
+                });
+            }
+            return body;
+        }
         let anthropic = self.kind == crate::providers::ProviderKind::Anthropic;
         if anthropic {
             let system_text = messages
@@ -428,11 +538,14 @@ impl ShimClient {
         on_delta: &mut (dyn FnMut(Delta) + Send),
     ) -> Result<String> {
         use futures_util::StreamExt;
-        let anthropic = self.kind == crate::providers::ProviderKind::Anthropic;
-        let endpoint_path = if anthropic {
-            "/messages"
-        } else {
-            "/chat/completions"
+        let endpoint_path: String = match self.kind {
+            crate::providers::ProviderKind::Anthropic => "/messages".into(),
+            crate::providers::ProviderKind::OpenAiResponses => "/responses".into(),
+            crate::providers::ProviderKind::Gemini => format!(
+                "/models/{}:streamGenerateContent?alt=sse",
+                self.model.trim_start_matches("models/")
+            ),
+            _ => "/chat/completions".into(),
         };
 
         let mut attempt: u32 = 0;
@@ -445,7 +558,7 @@ impl ShimClient {
             let use_native_tools = self.native_tools_active();
             let body = self.build_request_body(messages, use_native_tools);
             let send_fut = self
-                .request(reqwest::Method::POST, endpoint_path)
+                .request(reqwest::Method::POST, &endpoint_path)
                 .json(&body)
                 .timeout(std::time::Duration::from_secs(180))
                 .send();

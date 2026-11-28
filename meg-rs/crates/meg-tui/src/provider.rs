@@ -94,7 +94,9 @@ impl ProviderDialog {
     pub fn new_connection(&mut self, kind: ProviderKind) {
         let (name, url) = match kind {
             ProviderKind::OpenAi => ("Custom API", ""),
+            ProviderKind::OpenAiResponses => ("OpenAI Responses", "https://api.openai.com/v1"),
             ProviderKind::Anthropic => ("Anthropic", "https://api.anthropic.com/v1"),
+            ProviderKind::Gemini => ("Google Gemini", "https://generativelanguage.googleapis.com/v1beta"),
             ProviderKind::Ollama => ("Local Ollama", "http://127.0.0.1:11434/v1"),
             ProviderKind::Shim => ("Local API", "http://127.0.0.1:1234/v1"),
         };
@@ -418,7 +420,9 @@ impl ProviderEditor {
         self.profile.kind = match self.profile.kind {
             ProviderKind::OpenAi => ProviderKind::Anthropic,
             ProviderKind::Anthropic => ProviderKind::Ollama,
-            ProviderKind::Ollama => ProviderKind::OpenAi,
+            ProviderKind::Ollama => ProviderKind::OpenAiResponses,
+            ProviderKind::OpenAiResponses => ProviderKind::Gemini,
+            ProviderKind::Gemini => ProviderKind::OpenAi,
             ProviderKind::Shim => ProviderKind::OpenAi,
         };
         self.profile.send_effort = false;

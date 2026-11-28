@@ -1,4 +1,4 @@
-use super::media::{anthropic_multimodal_content, openai_multimodal_content};
+use super::media::{anthropic_multimodal_content, gemini_multimodal_parts, openai_multimodal_content, openai_responses_multimodal_content};
 use super::{NativeToolCall, ROLE_ASSISTANT_TOOL_CALLS, ROLE_TOOL_RESULT, ROLE_USER_MULTIMODAL};
 use serde_json::{json, Value};
 
@@ -198,3 +198,162 @@ pub(super) fn mark_anthropic_history_cache_breakpoint(messages: &mut [Value]) {
     }
 }
 
+pub(super) fn build_openai_responses_input(
+    messages: &[crate::ChatMessage],
+    use_native_tools: bool,
+) -> Vec<Value> {
+    let mut out = Vec::with_capacity(messages.len());
+    for m in messages {
+        if m.role == "system" {
+            continue;
+        }
+        if m.role == ROLE_ASSISTANT_TOOL_CALLS {
+            if let Some((thought, calls)) = parse_assistant_calls_envelope(&m.content) {
+                if use_native_tools {
+                    if !thought.is_empty() {
+                        out.push(json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": thought
+                        }));
+                    }
+                    for c in calls {
+                        out.push(json!({
+                            "type": "function_call",
+                            "call_id": c.id,
+                            "name": c.tool,
+                            "arguments": serde_json::to_string(&c.args).unwrap_or_else(|_| "{}".into()),
+                        }));
+                    }
+                } else {
+                    out.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": json!({ "thought": thought, "batch": calls }).to_string(),
+                    }));
+                }
+                continue;
+            }
+        }
+        if m.role == ROLE_TOOL_RESULT {
+            if let Some((id, name, _ok, body)) = parse_tool_result_envelope(&m.content) {
+                if use_native_tools {
+                    out.push(json!({
+                        "type": "function_call_output",
+                        "call_id": id,
+                        "output": body,
+                    }));
+                } else {
+                    out.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": format!("Observation [{name}]:\n{body}"),
+                    }));
+                }
+                continue;
+            }
+        }
+        if m.role == ROLE_USER_MULTIMODAL {
+            out.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": openai_responses_multimodal_content(&m.content),
+            }));
+            continue;
+        }
+        out.push(json!({
+            "type": "message",
+            "role": m.role,
+            "content": m.content,
+        }));
+    }
+    out
+}
+
+
+pub(super) fn build_gemini_contents(
+    messages: &[crate::ChatMessage],
+    use_native_tools: bool,
+) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let m = &messages[i];
+        if m.role == "system" {
+            i += 1;
+            continue;
+        }
+        if m.role == ROLE_ASSISTANT_TOOL_CALLS {
+            if let Some((thought, calls)) = parse_assistant_calls_envelope(&m.content) {
+                if use_native_tools {
+                    let mut parts = Vec::new();
+                    if !thought.is_empty() {
+                        parts.push(json!({ "text": thought }));
+                    }
+                    for c in calls {
+                        parts.push(json!({
+                            "functionCall": {
+                                "name": c.tool,
+                                "args": c.args,
+                            }
+                        }));
+                    }
+                    out.push(json!({ "role": "model", "parts": parts }));
+                } else {
+                    out.push(json!({
+                        "role": "model",
+                        "parts": [{ "text": json!({ "thought": thought, "batch": calls }).to_string() }]
+                    }));
+                }
+                i += 1;
+                continue;
+            }
+        }
+        if m.role == ROLE_TOOL_RESULT {
+            let mut fn_parts = Vec::new();
+            let mut text_parts = Vec::new();
+            while i < messages.len() && messages[i].role == ROLE_TOOL_RESULT {
+                if let Some((_id, name, ok, body)) = parse_tool_result_envelope(&messages[i].content) {
+                    if use_native_tools {
+                        fn_parts.push(json!({
+                            "functionResponse": {
+                                "name": name,
+                                "response": {
+                                    "ok": ok,
+                                    "output": body,
+                                }
+                            }
+                        }));
+                    } else {
+                        text_parts.push(format!("[{name}] {body}"));
+                    }
+                }
+                i += 1;
+            }
+            if use_native_tools && !fn_parts.is_empty() {
+                out.push(json!({ "role": "user", "parts": fn_parts }));
+            } else if !text_parts.is_empty() {
+                out.push(json!({
+                    "role": "user",
+                    "parts": [{ "text": format!("Observations:\n{}", text_parts.join("\n")) }]
+                }));
+            }
+            continue;
+        }
+        if m.role == ROLE_USER_MULTIMODAL {
+            out.push(json!({
+                "role": "user",
+                "parts": gemini_multimodal_parts(&m.content),
+            }));
+            i += 1;
+            continue;
+        }
+        let role = if m.role == "assistant" { "model" } else { "user" };
+        out.push(json!({
+            "role": role,
+            "parts": [{ "text": m.content }],
+        }));
+        i += 1;
+    }
+    out
+}

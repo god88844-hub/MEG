@@ -56,6 +56,15 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         "sk-proj-"
     ),
     ProviderPreset {
+        id: "openai-responses",
+        name: "OpenAI Responses",
+        url: "https://api.openai.com/v1",
+        kind: ProviderKind::OpenAiResponses,
+        env: "OPENAI_API_KEY",
+        prefix: "",
+        local: false,
+    },
+    ProviderPreset {
         id: "anthropic",
         name: "Anthropic",
         url: "https://api.anthropic.com/v1",
@@ -78,6 +87,15 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         "GEMINI_API_KEY",
         "AIza"
     ),
+    ProviderPreset {
+        id: "gemini-native",
+        name: "Google Gemini (Native)",
+        url: "https://generativelanguage.googleapis.com/v1beta",
+        kind: ProviderKind::Gemini,
+        env: "GEMINI_API_KEY",
+        prefix: "",
+        local: false,
+    },
     compatible!(
         "groq",
         "Groq",

@@ -142,3 +142,39 @@ pub(super) fn anthropic_multimodal_content(raw_envelope: &str) -> Value {
     Value::Array(parts)
 }
 
+pub(super) fn openai_responses_multimodal_content(raw_envelope: &str) -> Value {
+    let Ok(env) = serde_json::from_str::<MultimodalEnvelope>(raw_envelope) else {
+        return Value::String(raw_envelope.to_string());
+    };
+    let mut parts = Vec::with_capacity(env.images.len() + 1);
+    if !env.text.is_empty() {
+        parts.push(json!({ "type": "input_text", "text": env.text }));
+    }
+    for img in env.images {
+        parts.push(json!({
+            "type": "input_image",
+            "image_url": format!("data:{};base64,{}", img.mime, img.data_base64)
+        }));
+    }
+    Value::Array(parts)
+}
+
+
+pub(super) fn gemini_multimodal_parts(raw_envelope: &str) -> Vec<Value> {
+    let Ok(env) = serde_json::from_str::<MultimodalEnvelope>(raw_envelope) else {
+        return vec![json!({ "text": raw_envelope })];
+    };
+    let mut parts = Vec::with_capacity(env.images.len() + 1);
+    if !env.text.is_empty() {
+        parts.push(json!({ "text": env.text }));
+    }
+    for img in env.images {
+        parts.push(json!({
+            "inlineData": {
+                "mimeType": img.mime,
+                "data": img.data_base64
+            }
+        }));
+    }
+    parts
+}

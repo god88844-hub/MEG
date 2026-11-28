@@ -146,6 +146,191 @@ mod protocol_regressions {
         );
     }
 
+
+    #[tokio::test]
+    async fn openai_responses_streams_reasoning_fragmented_tools_and_cached_usage() {
+        use wiremock::{
+            matchers::{header, method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "event: response.reasoning_summary_text.delta\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Plan check\"}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"fc_99\",\"name\":\"read_file\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\"}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"\\\"Cargo.toml\\\"}\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":120,\"output_tokens\":18,\"input_tokens_details\":{\"cached_tokens\":80}}}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(header("authorization", "Bearer sk-responses-test"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut client = ShimClient::with(format!("{}/v1", server.uri()), "o4-mini".into());
+        client.kind = crate::providers::ProviderKind::OpenAiResponses;
+        client.api_key = Some(crate::providers::Secret::new("sk-responses-test".into()));
+        client.reasoning_effort = Some("high".into());
+        client.tools = vec![ToolSpec {
+            name: "read_file".into(),
+            description: "Read a file".into(),
+            parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        }];
+
+        let messages = vec![
+            crate::ChatMessage { role: "system".into(), content: "Be concise".into() },
+            crate::ChatMessage { role: "user".into(), content: "Check Cargo.toml".into() },
+            encode_native_tool_calls(
+                "",
+                &[NativeToolCall {
+                    id: "fc_prev".into(),
+                    tool: "read_file".into(),
+                    args: json!({"path": "README.md"}),
+                }],
+            ),
+            encode_native_tool_result("fc_prev", "read_file", true, "# MEG"),
+        ];
+
+        let mut thinking = String::new();
+        let mut usage = None;
+        let out = client
+            .chat_stream(&messages, &mut |d| match d {
+                Delta::Thinking(t) => thinking.push_str(&t),
+                Delta::Usage { input, output, cached } => usage = Some((input, output, cached)),
+                _ => {}
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(thinking, "Plan check");
+        assert_eq!(usage, Some((120, 18, 80)));
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["_native"], true);
+        assert_eq!(parsed["batch"][0]["id"], "fc_99");
+        assert_eq!(parsed["batch"][0]["tool"], "read_file");
+        assert_eq!(parsed["batch"][0]["args"]["path"], "Cargo.toml");
+
+        let reqs = server.received_requests().await.unwrap();
+        let req_body: Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(req_body["instructions"], "Be concise");
+        assert_eq!(req_body["reasoning"]["effort"], "high");
+        assert_eq!(req_body["tools"][0]["type"], "function");
+        assert_eq!(req_body["tools"][0]["name"], "read_file");
+        assert!(req_body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["type"] == "function_call_output" && item["call_id"] == "fc_prev"));
+    }
+
+    #[tokio::test]
+    async fn gemini_native_uses_header_auth_streams_thoughts_tools_and_cached_usage() {
+        use wiremock::{
+            matchers::{header, method, path, query_param},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1beta/models"))
+            .and(header("x-goog-api-key", "AIza-offline-gemini-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [
+                    { "name": "models/gemini-2.5-pro" },
+                    { "name": "models/gemini-2.5-flash" }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let sse_body = concat!(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"thought\":true,\"text\":\"Thinking step\"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"read_file\",\"args\":{\"path\":\"src/lib.rs\"}}}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":95,\"candidatesTokenCount\":14,\"cachedContentTokenCount\":40}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-2.5-pro:streamGenerateContent"))
+            .and(query_param("alt", "sse"))
+            .and(header("x-goog-api-key", "AIza-offline-gemini-key"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut client = ShimClient::with(format!("{}/v1beta", server.uri()), "gemini-2.5-pro".into());
+        client.kind = crate::providers::ProviderKind::Gemini;
+        client.api_key = Some(crate::providers::Secret::new("AIza-offline-gemini-key".into()));
+        client.reasoning_effort = Some("medium".into());
+        client.tools = vec![ToolSpec {
+            name: "read_file".into(),
+            description: "Read file".into(),
+            parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        }];
+
+        let discovered = client.models().await.unwrap();
+        assert_eq!(discovered, vec!["gemini-2.5-pro", "gemini-2.5-flash"]);
+
+        let messages = vec![
+            crate::ChatMessage { role: "system".into(), content: "System rule".into() },
+            crate::ChatMessage { role: "user".into(), content: "Inspect lib".into() },
+            encode_native_tool_calls(
+                "",
+                &[NativeToolCall {
+                    id: "g_0".into(),
+                    tool: "read_file".into(),
+                    args: json!({"path": "README.md"}),
+                }],
+            ),
+            encode_native_tool_result("g_0", "read_file", true, "# MEG"),
+        ];
+
+        let mut thinking = String::new();
+        let mut usage = None;
+        let out = client
+            .chat_stream(&messages, &mut |d| match d {
+                Delta::Thinking(t) => thinking.push_str(&t),
+                Delta::Usage { input, output, cached } => usage = Some((input, output, cached)),
+                _ => {}
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(thinking, "Thinking step");
+        assert_eq!(usage, Some((95, 14, 40)));
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["_native"], true);
+        assert_eq!(parsed["batch"][0]["tool"], "read_file");
+        assert_eq!(parsed["batch"][0]["args"]["path"], "src/lib.rs");
+
+        let reqs = server.received_requests().await.unwrap();
+        let post_req = reqs.iter().find(|r| r.method == "POST").unwrap();
+        assert!(
+            !post_req.url.as_str().contains("key="),
+            "Gemini API key must never be placed in URL query string"
+        );
+        let req_body: Value = serde_json::from_slice(&post_req.body).unwrap();
+        assert_eq!(req_body["systemInstruction"]["parts"][0]["text"], "System rule");
+        assert_eq!(req_body["tools"][0]["functionDeclarations"][0]["name"], "read_file");
+        assert_eq!(req_body["generationConfig"]["thinkingConfig"]["thinkingBudget"], 4096);
+        assert!(req_body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["parts"][0]["functionResponse"]["name"] == "read_file"));
+    }
+
     #[tokio::test]
     async fn anthropic_uses_native_headers_body_and_cached_usage() {
         use wiremock::{

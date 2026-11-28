@@ -49,7 +49,9 @@ impl Drop for Secret {
 pub enum ProviderKind {
     #[default]
     OpenAi,
+    OpenAiResponses,
     Anthropic,
+    Gemini,
     Ollama,
     Shim,
 }
@@ -57,7 +59,9 @@ impl ProviderKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::OpenAi => "OpenAI compatible",
+            Self::OpenAiResponses => "OpenAI Responses API",
             Self::Anthropic => "Anthropic",
+            Self::Gemini => "Google Gemini (native)",
             Self::Ollama => "Ollama / local",
             Self::Shim => "Custom compatible",
         }

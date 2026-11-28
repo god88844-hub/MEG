@@ -76,6 +76,16 @@ pub(super) struct CompletionDecoder {
 
 impl CompletionDecoder {
     pub(super) fn value(&mut self, value: &Value, callback: &mut (dyn FnMut(Delta) + Send)) -> Result<()> {
+        if value["candidates"].is_array() || value["usageMetadata"].is_object() {
+            return self.gemini_value(value, callback);
+        }
+        if value["object"].as_str() == Some("response")
+            || value["type"]
+                .as_str()
+                .is_some_and(|t| t.starts_with("response."))
+        {
+            return self.openai_responses_value(value, callback);
+        }
         if value["type"].is_string() || value["content"].is_array() {
             return self.anthropic_value(value, callback);
         }
@@ -217,6 +227,214 @@ impl CompletionDecoder {
         }
         Ok(())
     }
+    pub(super) fn openai_responses_value(
+        &mut self,
+        value: &Value,
+        callback: &mut (dyn FnMut(Delta) + Send),
+    ) -> Result<()> {
+        let kind = value["type"].as_str().unwrap_or("");
+        anyhow::ensure!(
+            kind != "response.failed" && kind != "error",
+            "OpenAI Responses endpoint reported a streaming error"
+        );
+        match kind {
+            "response.output_text.delta" => {
+                if let Some(delta) = value["delta"].as_str() {
+                    self.splitter.push(delta, false, &mut self.full, callback);
+                }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning.delta" => {
+                if let Some(delta) = value["delta"].as_str() {
+                    callback(Delta::Thinking(delta.into()));
+                }
+            }
+            "response.output_item.added" => {
+                let item = &value["item"];
+                if item["type"].as_str() == Some("function_call") {
+                    let slot = value["output_index"]
+                        .as_u64()
+                        .unwrap_or(self.tools.len() as u64) as usize;
+                    let tool = self.tools.entry(slot).or_default();
+                    if let Some(id) = item["call_id"]
+                        .as_str()
+                        .or_else(|| item["id"].as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        tool.id = id.to_string();
+                    }
+                    if let Some(name) = item["name"].as_str() {
+                        tool.name = name.to_string();
+                    }
+                    if let Some(args) = item["arguments"].as_str().filter(|s| !s.is_empty()) {
+                        tool.arguments = args.to_string();
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                if let Some(delta) = value["delta"].as_str() {
+                    let slot = value["output_index"].as_u64().unwrap_or(0) as usize;
+                    self.tools.entry(slot).or_default().arguments.push_str(delta);
+                }
+            }
+            "response.function_call_arguments.done" => {
+                let slot = value["output_index"].as_u64().unwrap_or(0) as usize;
+                let tool = self.tools.entry(slot).or_default();
+                if tool.arguments.is_empty() {
+                    if let Some(args) = value["arguments"].as_str() {
+                        tool.arguments = args.to_string();
+                    }
+                }
+                if tool.name.is_empty() {
+                    if let Some(name) = value["name"].as_str() {
+                        tool.name = name.to_string();
+                    }
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                self.saw_terminal = true;
+                let resp = &value["response"];
+                if resp["usage"].is_object() {
+                    let u = &resp["usage"];
+                    self.usage = Some((
+                        u["input_tokens"].as_u64().unwrap_or(0),
+                        u["output_tokens"].as_u64().unwrap_or(0),
+                        u["input_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .unwrap_or(0),
+                    ));
+                }
+                if self.full.is_empty() && self.tools.is_empty() {
+                    self.ingest_responses_output_items(resp, callback);
+                }
+            }
+            _ if value["object"].as_str() == Some("response") => {
+                self.saw_terminal = true;
+                if value["usage"].is_object() {
+                    let u = &value["usage"];
+                    self.usage = Some((
+                        u["input_tokens"].as_u64().unwrap_or(0),
+                        u["output_tokens"].as_u64().unwrap_or(0),
+                        u["input_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .unwrap_or(0),
+                    ));
+                }
+                self.ingest_responses_output_items(value, callback);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn ingest_responses_output_items(
+        &mut self,
+        resp: &Value,
+        callback: &mut (dyn FnMut(Delta) + Send),
+    ) {
+        if let Some(items) = resp["output"].as_array() {
+            for (idx, item) in items.iter().enumerate() {
+                match item["type"].as_str() {
+                    Some("message") => {
+                        if let Some(parts) = item["content"].as_array() {
+                            for p in parts {
+                                if let Some(text) = p["text"].as_str() {
+                                    self.splitter.push(text, false, &mut self.full, callback);
+                                }
+                            }
+                        }
+                    }
+                    Some("reasoning") => {
+                        if let Some(summary) = item["summary"].as_array() {
+                            for s in summary {
+                                if let Some(text) = s["text"].as_str() {
+                                    callback(Delta::Thinking(text.into()));
+                                }
+                            }
+                        }
+                    }
+                    Some("function_call") => {
+                        let tool = self.tools.entry(idx).or_default();
+                        if let Some(id) = item["call_id"]
+                            .as_str()
+                            .or_else(|| item["id"].as_str())
+                        {
+                            tool.id = id.to_string();
+                        }
+                        if let Some(name) = item["name"].as_str() {
+                            tool.name = name.to_string();
+                        }
+                        if let Some(args) = item["arguments"].as_str() {
+                            tool.arguments = args.to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    pub(super) fn gemini_value(
+        &mut self,
+        value: &Value,
+        callback: &mut (dyn FnMut(Delta) + Send),
+    ) -> Result<()> {
+        if !value["error"].is_null() {
+            anyhow::bail!("Gemini endpoint reported a streaming error");
+        }
+        if value["usageMetadata"].is_object() {
+            let u = &value["usageMetadata"];
+            let old = self.usage.unwrap_or_default();
+            self.usage = Some((
+                u["promptTokenCount"].as_u64().unwrap_or(old.0),
+                u["candidatesTokenCount"].as_u64().unwrap_or(old.1),
+                u["cachedContentTokenCount"].as_u64().unwrap_or(old.2),
+            ));
+        }
+        if let Some(cand) = value["candidates"].as_array().and_then(|c| c.first()) {
+            if cand["finishReason"].is_string() {
+                self.saw_terminal = true;
+            }
+            if let Some(parts) = cand["content"]["parts"].as_array() {
+                for part in parts {
+                    if let Some(text) = part["text"].as_str() {
+                        if part["thought"].as_bool() == Some(true) {
+                            callback(Delta::Thinking(text.into()));
+                        } else {
+                            self.splitter.push(text, false, &mut self.full, callback);
+                        }
+                    }
+                    if let Some(fc) = part["functionCall"].as_object() {
+                        let slot = self.tools.len();
+                        let name = fc
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let id = fc
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("gemini_call_{slot}"));
+                        let args = fc
+                            .get("args")
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "{}".into());
+                        self.tools.insert(
+                            slot,
+                            FunctionCall {
+                                id,
+                                name,
+                                arguments: args,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn finish(mut self, callback: &mut (dyn FnMut(Delta) + Send)) -> Result<String> {
         self.splitter.push("", true, &mut self.full, callback);
         if let Some((input, output, cached)) = self.usage {
