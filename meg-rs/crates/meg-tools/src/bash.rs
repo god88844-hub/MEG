@@ -254,7 +254,7 @@ pub fn run_cancellable(
         } else {
             cmd_line.to_string()
         };
-        let res = crate::sandbox::run_windows_restricted_process(
+        let res = crate::sandbox::run_windows_strict_process(
             workspace,
             &effective_cmd,
             use_ps,
@@ -579,6 +579,8 @@ mod p1_08_tests {
             .expect_err("ask rule must fail closed without MEG_APPROVE_ASK=1");
         assert!(asked.to_string().contains("PERMISSION_ASK_REQUIRED"), "{asked}");
 
+        #[cfg(windows)]
+        crate::sandbox::delete_windows_appcontainer_profile(&ws);
         let _ = std::fs::remove_dir_all(&ws);
     }
 

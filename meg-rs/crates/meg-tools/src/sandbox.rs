@@ -537,7 +537,7 @@ fn to_wide_null(s: &str) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-fn build_wide_env_block(policy: &PermissionPolicy) -> Vec<u16> {
+fn build_wide_env_block(policy: &PermissionPolicy, temp_override: Option<&Path>) -> Vec<u16> {
     use std::collections::BTreeMap;
     let mut env_map: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in std::env::vars() {
@@ -545,6 +545,11 @@ fn build_wide_env_block(policy: &PermissionPolicy) -> Vec<u16> {
             continue;
         }
         env_map.insert(k, v);
+    }
+    if let Some(tmp_dir) = temp_override {
+        let tmp_s = tmp_dir.display().to_string();
+        env_map.insert("TEMP".into(), tmp_s.clone());
+        env_map.insert("TMP".into(), tmp_s);
     }
     env_map.insert("PYTHONDONTWRITEBYTECODE".into(), "1".into());
     env_map.insert("DEBIAN_FRONTEND".into(), "noninteractive".into());
@@ -619,7 +624,7 @@ pub(crate) fn run_windows_restricted_process(
     };
     let mut cmd_w = to_wide_null(&full_cmdline);
     let cwd_w = to_wide_null(&workspace.display().to_string());
-    let mut env_block = build_wide_env_block(policy);
+    let mut env_block = build_wide_env_block(policy, None);
 
     unsafe {
         let mut proc_token: HANDLE = std::ptr::null_mut();
@@ -771,6 +776,549 @@ pub(crate) fn run_windows_restricted_process(
     }
 }
 
+
+#[cfg(windows)]
+fn appcontainer_profile_name(workspace: &Path) -> String {
+    let canon = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let raw = canon.to_string_lossy().to_ascii_lowercase();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in raw.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("MEG.Sandbox.{h:016x}")
+}
+
+#[cfg(windows)]
+mod win_appcontainer {
+    use super::*;
+    use std::ffi::c_void;
+    use std::io::Read;
+    use std::os::windows::io::FromRawHandle;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    };
+
+    const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+    const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = 0x0002_0009;
+    const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+    const WIN_CAPABILITY_INTERNET_CLIENT_SID: u32 = 94;
+    const SE_FILE_OBJECT: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+    const GRANT_ACCESS: u32 = 1;
+    const SUB_CONTAINERS_AND_OBJECTS_INHERIT: u32 = 0x3;
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7u32 as i32;
+
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut c_void,
+        attributes: u32,
+    }
+
+    #[repr(C)]
+    struct SecurityCapabilities {
+        app_container_sid: *mut c_void,
+        capabilities: *mut SidAndAttributes,
+        capability_count: u32,
+        reserved: u32,
+    }
+
+    #[repr(C)]
+    struct StartupInfoExW {
+        startup_info: STARTUPINFOW,
+        lp_attribute_list: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct TrusteeW {
+        p_multiple_trustee: *mut c_void,
+        multiple_trustee_operation: u32,
+        trustee_form: u32,
+        trustee_type: u32,
+        ptstr_name: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct ExplicitAccessW {
+        grf_access_permissions: u32,
+        grf_access_mode: u32,
+        grf_inheritance: u32,
+        trustee: TrusteeW,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut c_void;
+        fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const u8) -> *const c_void;
+        fn FreeLibrary(h_lib_module: *mut c_void) -> i32;
+        fn LocalFree(h_mem: *mut c_void) -> *mut c_void;
+        fn InitializeProcThreadAttributeList(
+            lp_attribute_list: *mut c_void,
+            dw_attribute_count: u32,
+            dw_flags: u32,
+            lp_size: *mut usize,
+        ) -> i32;
+        fn UpdateProcThreadAttribute(
+            lp_attribute_list: *mut c_void,
+            dw_flags: u32,
+            attribute: usize,
+            lp_value: *mut c_void,
+            cb_size: usize,
+            lp_previous_value: *mut c_void,
+            lp_return_size: *mut usize,
+        ) -> i32;
+        fn DeleteProcThreadAttributeList(lp_attribute_list: *mut c_void);
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn FreeSid(p_sid: *mut c_void) -> *mut c_void;
+        fn CreateWellKnownSid(
+            well_known_sid_type: u32,
+            domain_sid: *mut c_void,
+            p_sid: *mut c_void,
+            cb_sid: *mut u32,
+        ) -> i32;
+        fn GetNamedSecurityInfoW(
+            p_object_name: *const u16,
+            object_type: u32,
+            security_info: u32,
+            ppsid_owner: *mut *mut c_void,
+            ppsid_group: *mut *mut c_void,
+            pp_dacl: *mut *mut c_void,
+            pp_sacl: *mut *mut c_void,
+            pp_security_descriptor: *mut *mut c_void,
+        ) -> u32;
+        fn SetEntriesInAclW(
+            c_count_of_explicit_entries: u32,
+            p_list_of_explicit_entries: *mut ExplicitAccessW,
+            old_acl: *mut c_void,
+            new_acl: *mut *mut c_void,
+        ) -> u32;
+        fn SetNamedSecurityInfoW(
+            p_object_name: *mut u16,
+            object_type: u32,
+            security_info: u32,
+            psid_owner: *mut c_void,
+            psid_group: *mut c_void,
+            p_dacl: *mut c_void,
+            p_sacl: *mut c_void,
+        ) -> u32;
+    }
+
+    type CreateAppContainerProfileFn = unsafe extern "system" fn(
+        *const u16,
+        *const u16,
+        *const u16,
+        *const SidAndAttributes,
+        u32,
+        *mut *mut c_void,
+    ) -> i32;
+    type DeriveAppContainerSidFn =
+        unsafe extern "system" fn(*const u16, *mut *mut c_void) -> i32;
+    type DeleteAppContainerProfileFn = unsafe extern "system" fn(*const u16) -> i32;
+
+    struct UserenvApi {
+        lib: *mut c_void,
+        create_profile: CreateAppContainerProfileFn,
+        derive_sid: DeriveAppContainerSidFn,
+        delete_profile: DeleteAppContainerProfileFn,
+    }
+
+    impl UserenvApi {
+        unsafe fn load() -> Result<Self> {
+            let name = to_wide_null("userenv.dll");
+            let lib = LoadLibraryW(name.as_ptr());
+            if lib.is_null() {
+                bail!("LoadLibraryW(userenv.dll) failed");
+            }
+            let p_create = GetProcAddress(lib, c"CreateAppContainerProfile".as_ptr().cast());
+            let p_derive =
+                GetProcAddress(lib, c"DeriveAppContainerSidFromAppContainerName".as_ptr().cast());
+            let p_delete = GetProcAddress(lib, c"DeleteAppContainerProfile".as_ptr().cast());
+            if p_create.is_null() || p_derive.is_null() || p_delete.is_null() {
+                FreeLibrary(lib);
+                bail!("AppContainer APIs unavailable in userenv.dll");
+            }
+            Ok(Self {
+                lib,
+                create_profile: std::mem::transmute::<*const c_void, CreateAppContainerProfileFn>(
+                    p_create,
+                ),
+                derive_sid: std::mem::transmute::<*const c_void, DeriveAppContainerSidFn>(p_derive),
+                delete_profile: std::mem::transmute::<*const c_void, DeleteAppContainerProfileFn>(
+                    p_delete,
+                ),
+            })
+        }
+    }
+
+    impl Drop for UserenvApi {
+        fn drop(&mut self) {
+            unsafe {
+                FreeLibrary(self.lib);
+            }
+        }
+    }
+
+    unsafe fn grant_workspace_acl(workspace: &Path, app_sid: *mut c_void) -> Result<()> {
+        let mut ws_w = to_wide_null(&workspace.display().to_string());
+        let mut old_dacl: *mut c_void = std::ptr::null_mut();
+        let mut sd: *mut c_void = std::ptr::null_mut();
+        let err = GetNamedSecurityInfoW(
+            ws_w.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut old_dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        );
+        if err != 0 {
+            bail!("GetNamedSecurityInfoW(workspace) failed with error {err}");
+        }
+        let mut ea = ExplicitAccessW {
+            grf_access_permissions: FILE_ALL_ACCESS,
+            grf_access_mode: GRANT_ACCESS,
+            grf_inheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            trustee: TrusteeW {
+                p_multiple_trustee: std::ptr::null_mut(),
+                multiple_trustee_operation: 0,
+                trustee_form: 0, // TRUSTEE_IS_SID
+                trustee_type: 0,
+                ptstr_name: app_sid,
+            },
+        };
+        let mut new_dacl: *mut c_void = std::ptr::null_mut();
+        let acl_err = SetEntriesInAclW(1, &mut ea, old_dacl, &mut new_dacl);
+        if acl_err != 0 {
+            if !sd.is_null() {
+                LocalFree(sd);
+            }
+            bail!("SetEntriesInAclW(workspace) failed with error {acl_err}");
+        }
+        let set_err = SetNamedSecurityInfoW(
+            ws_w.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        );
+        if !new_dacl.is_null() {
+            LocalFree(new_dacl);
+        }
+        if !sd.is_null() {
+            LocalFree(sd);
+        }
+        if set_err != 0 {
+            bail!("SetNamedSecurityInfoW(workspace) failed with error {set_err}");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn delete_profile(workspace: &Path) {
+        let name_w = to_wide_null(&appcontainer_profile_name(workspace));
+        unsafe {
+            if let Ok(api) = UserenvApi::load() {
+                let _ = (api.delete_profile)(name_w.as_ptr());
+            }
+        }
+    }
+
+    pub(crate) fn run(
+        workspace: &Path,
+        cmd_line: &str,
+        use_powershell: bool,
+        policy: &PermissionPolicy,
+        timeout_secs: u64,
+        cancel: &std::sync::atomic::AtomicBool,
+        job_handle: HANDLE,
+    ) -> Result<RestrictedWindowsOutput> {
+        let full_cmdline = if use_powershell {
+            let escaped = cmd_line.replace('"', "\\\"");
+            format!("powershell.exe -NoProfile -NonInteractive -Command \"{escaped}\"")
+        } else {
+            format!("cmd.exe /S /C \"{cmd_line}\"")
+        };
+        let mut cmd_w = to_wide_null(&full_cmdline);
+        let cwd_w = to_wide_null(&workspace.display().to_string());
+        let mut env_block = build_wide_env_block(policy, Some(workspace));
+
+        let profile_name = appcontainer_profile_name(workspace);
+        let name_w = to_wide_null(&profile_name);
+        let desc_w = to_wide_null("MEG workspace sandbox AppContainer");
+
+        unsafe {
+            let api = UserenvApi::load()?;
+            let mut app_sid: *mut c_void = std::ptr::null_mut();
+            let hr = (api.create_profile)(
+                name_w.as_ptr(),
+                name_w.as_ptr(),
+                desc_w.as_ptr(),
+                std::ptr::null(),
+                0,
+                &mut app_sid,
+            );
+            if hr == HRESULT_ALREADY_EXISTS {
+                let hr2 = (api.derive_sid)(name_w.as_ptr(), &mut app_sid);
+                if hr2 < 0 || app_sid.is_null() {
+                    bail!("DeriveAppContainerSidFromAppContainerName failed: 0x{:08x}", hr2 as u32);
+                }
+            } else if hr < 0 || app_sid.is_null() {
+                bail!("CreateAppContainerProfile failed: 0x{:08x}", hr as u32);
+            }
+
+            let acl_res = grant_workspace_acl(workspace, app_sid);
+            if let Err(e) = acl_res {
+                FreeSid(app_sid);
+                return Err(e);
+            }
+
+            let mut net_sid_buf = [0u8; 68];
+            let mut cap_list: Vec<SidAndAttributes> = Vec::new();
+            if policy.allow_network {
+                let mut cb = net_sid_buf.len() as u32;
+                if CreateWellKnownSid(
+                    WIN_CAPABILITY_INTERNET_CLIENT_SID,
+                    std::ptr::null_mut(),
+                    net_sid_buf.as_mut_ptr() as *mut c_void,
+                    &mut cb,
+                ) != 0
+                {
+                    cap_list.push(SidAndAttributes {
+                        sid: net_sid_buf.as_mut_ptr() as *mut c_void,
+                        attributes: SE_GROUP_ENABLED,
+                    });
+                }
+            }
+
+            let mut sec_caps = SecurityCapabilities {
+                app_container_sid: app_sid,
+                capabilities: if cap_list.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    cap_list.as_mut_ptr()
+                },
+                capability_count: cap_list.len() as u32,
+                reserved: 0,
+            };
+
+            let mut attr_size: usize = 0;
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
+            if attr_size == 0 {
+                FreeSid(app_sid);
+                bail!("InitializeProcThreadAttributeList returned zero size");
+            }
+            let mut attr_buf: Vec<u64> = vec![0u64; attr_size.div_ceil(8)];
+            let attr_ptr = attr_buf.as_mut_ptr() as *mut c_void;
+            if InitializeProcThreadAttributeList(attr_ptr, 1, 0, &mut attr_size) == 0 {
+                FreeSid(app_sid);
+                bail!(
+                    "InitializeProcThreadAttributeList failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            if UpdateProcThreadAttribute(
+                attr_ptr,
+                0,
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                &mut sec_caps as *mut _ as *mut c_void,
+                std::mem::size_of::<SecurityCapabilities>(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                let err = std::io::Error::last_os_error();
+                DeleteProcThreadAttributeList(attr_ptr);
+                FreeSid(app_sid);
+                bail!("UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed: {err}");
+            }
+
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: std::ptr::null_mut(),
+                bInheritHandle: 1,
+            };
+            let mut out_rd: HANDLE = std::ptr::null_mut();
+            let mut out_wr: HANDLE = std::ptr::null_mut();
+            let mut err_rd: HANDLE = std::ptr::null_mut();
+            let mut err_wr: HANDLE = std::ptr::null_mut();
+            if CreatePipe(&mut out_rd, &mut out_wr, &sa, 0) == 0 {
+                DeleteProcThreadAttributeList(attr_ptr);
+                FreeSid(app_sid);
+                bail!("CreatePipe(stdout) failed");
+            }
+            if CreatePipe(&mut err_rd, &mut err_wr, &sa, 0) == 0 {
+                CloseHandle(out_rd);
+                CloseHandle(out_wr);
+                DeleteProcThreadAttributeList(attr_ptr);
+                FreeSid(app_sid);
+                bail!("CreatePipe(stderr) failed");
+            }
+            let _ = SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0);
+            let _ = SetHandleInformation(err_rd, HANDLE_FLAG_INHERIT, 0);
+
+            let mut siex: StartupInfoExW = std::mem::zeroed();
+            siex.startup_info.cb = std::mem::size_of::<StartupInfoExW>() as u32;
+            siex.startup_info.dwFlags = STARTF_USESTDHANDLES;
+            siex.startup_info.hStdInput = INVALID_HANDLE_VALUE;
+            siex.startup_info.hStdOutput = out_wr;
+            siex.startup_info.hStdError = err_wr;
+            siex.lp_attribute_list = attr_ptr;
+
+            let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+            let flags = EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_SUSPENDED
+                | CREATE_NEW_PROCESS_GROUP
+                | CREATE_NO_WINDOW
+                | CREATE_UNICODE_ENVIRONMENT;
+            let created = CreateProcessW(
+                std::ptr::null(),
+                cmd_w.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                flags,
+                env_block.as_mut_ptr() as *mut c_void,
+                cwd_w.as_ptr(),
+                &siex.startup_info,
+                &mut pi,
+            );
+
+            DeleteProcThreadAttributeList(attr_ptr);
+            FreeSid(app_sid);
+            CloseHandle(out_wr);
+            CloseHandle(err_wr);
+
+            if created == 0 {
+                let err = std::io::Error::last_os_error();
+                CloseHandle(out_rd);
+                CloseHandle(err_rd);
+                bail!("CreateProcessW(AppContainer) failed: {err}");
+            }
+
+            if AssignProcessToJobObject(job_handle, pi.hProcess) == 0 {
+                let err = std::io::Error::last_os_error();
+                TerminateProcess(pi.hProcess, 1);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                CloseHandle(out_rd);
+                CloseHandle(err_rd);
+                bail!("AssignProcessToJobObject(AppContainer) failed: {err}");
+            }
+
+            ResumeThread(pi.hThread);
+            CloseHandle(pi.hThread);
+
+            let mut out_file = std::fs::File::from_raw_handle(out_rd as _);
+            let mut err_file = std::fs::File::from_raw_handle(err_rd as _);
+            let out_thread = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = out_file.by_ref().take(64 * 1024).read_to_end(&mut buf);
+                String::from_utf8_lossy(&buf).into_owned()
+            });
+            let err_thread = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = err_file.by_ref().take(64 * 1024).read_to_end(&mut buf);
+                String::from_utf8_lossy(&buf).into_owned()
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+            let mut interrupted = None;
+            loop {
+                let wait = WaitForSingleObject(pi.hProcess, 25);
+                if wait == 0 {
+                    break;
+                }
+                if cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                    interrupted = Some(if cancel.load(Ordering::SeqCst) {
+                        "Run cancelled".to_string()
+                    } else {
+                        format!("command timed out after {timeout_secs}s")
+                    });
+                    TerminateProcess(pi.hProcess, 1);
+                    let _ = WaitForSingleObject(pi.hProcess, 2_000);
+                    break;
+                }
+            }
+            let mut exit_code: u32 = 1;
+            let _ = GetExitCodeProcess(pi.hProcess, &mut exit_code);
+            CloseHandle(pi.hProcess);
+
+            let stdout = out_thread.join().unwrap_or_default();
+            let stderr = err_thread.join().unwrap_or_default();
+            Ok(RestrictedWindowsOutput {
+                exit_code: exit_code as i32,
+                stdout,
+                stderr,
+                interrupted,
+            })
+        }
+    }
+}
+
+/// Spawn a Windows `MEG_SANDBOX=strict` child under real AppContainer kernel FS/network
+/// isolation (with workspace-scoped ACL grant + Job Object limits), falling back to
+/// `CreateRestrictedToken` only if the host session disallows AppContainer profiles
+/// (unless `MEG_WINDOWS_REQUIRE_APPCONTAINER=1` is set).
+#[cfg(windows)]
+pub(crate) fn run_windows_strict_process(
+    workspace: &Path,
+    cmd_line: &str,
+    use_powershell: bool,
+    policy: &PermissionPolicy,
+    timeout_secs: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+    job_handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<RestrictedWindowsOutput> {
+    let require_ac = std::env::var("MEG_WINDOWS_REQUIRE_APPCONTAINER")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE"));
+    match win_appcontainer::run(
+        workspace,
+        cmd_line,
+        use_powershell,
+        policy,
+        timeout_secs,
+        cancel,
+        job_handle,
+    ) {
+        Ok(out) => Ok(out),
+        Err(ac_err) if !require_ac => run_windows_restricted_process(
+            workspace,
+            cmd_line,
+            use_powershell,
+            policy,
+            timeout_secs,
+            cancel,
+            job_handle,
+        )
+        .map_err(|rt_err| anyhow::anyhow!("AppContainer failed ({ac_err}); restricted-token fallback failed ({rt_err})")),
+        Err(ac_err) => Err(ac_err),
+    }
+}
+
+#[cfg(windows)]
+pub fn delete_windows_appcontainer_profile(workspace: &Path) {
+    win_appcontainer::delete_profile(workspace);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,5 +1427,87 @@ mod tests {
         assert!(strict.max_active_processes < auto.max_active_processes);
         assert!(strict.max_job_memory_bytes <= auto.max_job_memory_bytes);
         assert!(strict.apply_ui_limits);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_appcontainer_enforces_workspace_fs_boundary() {
+        let base = std::env::temp_dir().join(format!(
+            "meg-ac-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let mut policy = PermissionPolicy::default();
+        policy.sandbox = SandboxMode::Strict;
+        policy.allow_network = false;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        unsafe {
+            let job = windows_sys::Win32::System::JobObjects::CreateJobObjectW(
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            assert!(!job.is_null(), "CreateJobObjectW failed");
+            apply_windows_job_ui_restrictions(job).unwrap();
+
+            // 1. Inside-workspace write MUST succeed inside AppContainer
+            let inside_res = win_appcontainer::run(
+                &ws,
+                "echo ok > inside.txt",
+                false,
+                &policy,
+                15,
+                &cancel,
+                job,
+            );
+            // 2. Outside-workspace write MUST be blocked by Windows kernel ACLs
+            let escaped = outside.join("escaped.txt");
+            let outside_cmd = format!("echo bad > \"{}\"", escaped.display());
+            let outside_res = win_appcontainer::run(
+                &ws,
+                &outside_cmd,
+                false,
+                &policy,
+                15,
+                &cancel,
+                job,
+            );
+
+            windows_sys::Win32::Foundation::CloseHandle(job);
+
+            let inside_out = inside_res.expect("AppContainer spawn inside workspace must succeed");
+            assert_eq!(
+                inside_out.exit_code, 0,
+                "in-workspace write failed: stdout={} stderr={}",
+                inside_out.stdout, inside_out.stderr
+            );
+            assert!(
+                ws.join("inside.txt").is_file(),
+                "expected inside.txt to be created in workspace"
+            );
+
+            let outside_out = outside_res.expect("AppContainer outside-write probe must execute");
+            assert_ne!(
+                outside_out.exit_code, 0,
+                "AppContainer MUST deny writing outside workspace! stdout={} stderr={}",
+                outside_out.stdout, outside_out.stderr
+            );
+            assert!(
+                !escaped.exists(),
+                "AppContainer leaked write outside workspace: {}",
+                escaped.display()
+            );
+        }
+
+        delete_windows_appcontainer_profile(&ws);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
