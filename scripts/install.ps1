@@ -16,7 +16,8 @@ $tmpBin = Join-Path $env:TEMP "meg-$tag.exe"
 Write-Host "Downloading MEG $tag ($asset)..." -ForegroundColor Cyan
 try {
     Invoke-WebRequest -Uri $binUrl -OutFile $tmpBin -UseBasicParsing
-    $sums = (Invoke-WebRequest -Uri $sumUrl -UseBasicParsing).Content
+    $rawSums = (Invoke-WebRequest -Uri $sumUrl -UseBasicParsing).Content
+    $sums = if ($rawSums -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($rawSums) } else { [string]$rawSums }
     if (-not $sums) {
         throw "SHA256SUMS.txt was empty; refusing unverified install"
     }
