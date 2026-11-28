@@ -559,24 +559,334 @@ pub mod vault {
 #[cfg(not(windows))]
 pub mod vault {
     use super::*;
-    pub fn get_scoped(_: &str, _: Option<&str>) -> Result<Option<Secret>> {
-        Ok(None)
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+
+    fn vault_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
     }
-    pub fn set_scoped(id: &str, _: Option<&str>, key: &Secret) -> Result<()> {
-        set(id, key)
+
+    fn target(id: &str, scope: Option<&str>) -> Result<String> {
+        anyhow::ensure!(
+            !id.is_empty()
+                && id.len() <= 80
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')),
+            "Invalid credential identifier"
+        );
+        let name = if let Some(scope) = scope {
+            anyhow::ensure!(
+                scope.len() <= 2048 && !scope.chars().any(char::is_control),
+                "Invalid credential namespace"
+            );
+            format!("MEG/config/{scope}/provider/{id}")
+        } else {
+            format!("MEG/provider/{id}")
+        };
+        Ok(name)
     }
-    pub fn remove_scoped(_: &str, _: Option<&str>) -> Result<()> {
+
+    fn force_file_backend() -> bool {
+        std::env::var("MEG_VAULT_BACKEND")
+            .ok()
+            .is_some_and(|v| v.eq_ignore_ascii_case("file"))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn escape_security_arg(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for ch in s.chars() {
+            match ch {
+                '\\' | '"' => {
+                    out.push('\\');
+                    out.push(ch);
+                }
+                _ => out.push(ch),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    #[cfg(target_os = "macos")]
+    fn os_get(service: &str) -> Option<Secret> {
+        if force_file_backend() || !Path::new("/usr/bin/security").is_file() {
+            return None;
+        }
+        let out = Command::new("/usr/bin/security")
+            .args(["find-generic-password", "-a", "MEG", "-s", service, "-w"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let val = String::from_utf8(out.stdout).ok()?;
+        let trimmed = val.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() || trimmed.len() > 2048 {
+            return None;
+        }
+        Some(Secret::new(trimmed.to_string()))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn os_set(service: &str, key: &Secret) -> bool {
+        if force_file_backend() || !Path::new("/usr/bin/security").is_file() {
+            return false;
+        }
+        let Ok(mut child) = Command::new("/usr/bin/security")
+            .arg("-i")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+        else {
+            return false;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let line = format!(
+                "add-generic-password -U -a MEG -s {} -w {}\n",
+                escape_security_arg(service),
+                escape_security_arg(key.expose())
+            );
+            if stdin.write_all(line.as_bytes()).is_err() {
+                let _ = child.kill();
+                return false;
+            }
+        }
+        let Ok(out) = child.wait_with_output() else {
+            return false;
+        };
+        if !out.status.success() || !out.stderr.is_empty() {
+            return false;
+        }
+        os_get(service).is_some_and(|stored| stored.expose() == key.expose())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn os_remove(service: &str) {
+        if force_file_backend() || !Path::new("/usr/bin/security").is_file() {
+            return;
+        }
+        let _ = Command::new("/usr/bin/security")
+            .args(["delete-generic-password", "-a", "MEG", "-s", service])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn has_secret_service() -> bool {
+        !force_file_backend() && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn os_get(service: &str) -> Option<Secret> {
+        if !has_secret_service() {
+            return None;
+        }
+        let out = Command::new("secret-tool")
+            .args(["lookup", "service", service, "account", "MEG"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let val = String::from_utf8(out.stdout).ok()?;
+        let trimmed = val.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() || trimmed.len() > 2048 {
+            return None;
+        }
+        Some(Secret::new(trimmed.to_string()))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn os_set(service: &str, key: &Secret) -> bool {
+        if !has_secret_service() {
+            return false;
+        }
+        let Ok(mut child) = Command::new("secret-tool")
+            .args([
+                "store",
+                "--label=MEG Provider Key",
+                "service",
+                service,
+                "account",
+                "MEG",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            if stdin.write_all(key.expose().as_bytes()).is_err() {
+                let _ = child.kill();
+                return false;
+            }
+        }
+        child.wait().map(|s| s.success()).unwrap_or(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn os_remove(service: &str) {
+        if !has_secret_service() {
+            return;
+        }
+        let _ = Command::new("secret-tool")
+            .args(["clear", "service", service, "account", "MEG"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn os_get(_: &str) -> Option<Secret> {
+        None
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn os_set(_: &str, _: &Secret) -> bool {
+        false
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn os_remove(_: &str) {}
+
+    fn vault_file_path() -> PathBuf {
+        config_dir().join("vault.json")
+    }
+
+    fn read_file_vault() -> Result<BTreeMap<String, String>> {
+        let path = vault_file_path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) => return Err(e.into()),
+        };
+        anyhow::ensure!(
+            !meta.file_type().is_symlink(),
+            "Refusing to read symlinked vault file"
+        );
+        anyhow::ensure!(meta.len() <= 512 * 1024, "Vault file exceeds 512 KiB");
+        let bytes = std::fs::read(&path)?;
+        Ok(serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    fn write_file_vault(map: &BTreeMap<String, String>) -> Result<()> {
+        let path = vault_file_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            anyhow::ensure!(
+                !meta.file_type().is_symlink(),
+                "Refusing to overwrite symlinked vault file"
+            );
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = path.with_file_name(format!(".vault.{}.{}.tmp", std::process::id(), nanos));
+        let payload = serde_json::to_vec_pretty(map)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        file.write_all(&payload)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
-    pub fn get(_: &str) -> Result<Option<Secret>> {
+
+    pub fn get(id: &str) -> Result<Option<Secret>> {
+        get_scoped(id, None)
+    }
+
+    pub fn get_scoped(id: &str, scope: Option<&str>) -> Result<Option<Secret>> {
+        let service = target(id, scope)?;
+        if let Some(secret) = os_get(&service) {
+            return Ok(Some(secret));
+        }
+        let _guard = vault_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let map = read_file_vault()?;
+        if let Some(val) = map.get(&service) {
+            anyhow::ensure!(val.len() <= 2048, "Stored credential exceeds 2048 bytes");
+            return Ok(Some(Secret::new(val.clone())));
+        }
         Ok(None)
     }
-    pub fn set(_: &str, _: &Secret) -> Result<()> {
-        anyhow::bail!(
-            "Persistent keys require the OS credential store; configure key_env on this platform"
-        )
+
+    pub fn set(id: &str, key: &Secret) -> Result<()> {
+        set_scoped(id, None, key)
     }
-    pub fn remove(_: &str) -> Result<()> {
+
+    pub fn set_scoped(id: &str, scope: Option<&str>, key: &Secret) -> Result<()> {
+        if key.is_empty() {
+            return remove_scoped(id, scope);
+        }
+        anyhow::ensure!(
+            key.expose().len() <= 2048 && !key.expose().chars().any(char::is_control),
+            "API key must be a single line, up to 2048 bytes"
+        );
+        let service = target(id, scope)?;
+        if os_set(&service, key) {
+            let _guard = vault_lock().lock().unwrap_or_else(|e| e.into_inner());
+            if let Ok(mut map) = read_file_vault() {
+                if map.remove(&service).is_some() {
+                    let _ = write_file_vault(&map);
+                }
+            }
+            return Ok(());
+        }
+        let _guard = vault_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = read_file_vault()?;
+        map.insert(service, key.expose().to_string());
+        write_file_vault(&map)
+    }
+
+    pub fn remove(id: &str) -> Result<()> {
+        remove_scoped(id, None)
+    }
+
+    pub fn remove_scoped(id: &str, scope: Option<&str>) -> Result<()> {
+        let service = target(id, scope)?;
+        os_remove(&service);
+        let _guard = vault_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = read_file_vault()?;
+        if map.remove(&service).is_some() {
+            write_file_vault(&map)?;
+        }
         Ok(())
     }
 }
@@ -666,6 +976,23 @@ mod tests {
             "OpenRouter"
         );
         assert!(detect_key_provider("sk-ambiguous-fixture").is_none());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn unix_vault_round_trip_enforces_0600_and_cleans_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let id = uuid::Uuid::new_v4().to_string();
+        let key = Secret::new("offline-unix-vault-fixture".into());
+        vault::set(&id, &key).unwrap();
+        let fetched = vault::get(&id).unwrap().expect("stored key must round-trip");
+        assert_eq!(fetched.expose(), key.expose());
+        let vault_file = config_dir().join("vault.json");
+        if vault_file.is_file() {
+            let mode = std::fs::metadata(&vault_file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "fallback vault.json must be strictly 0600");
+        }
+        vault::remove(&id).unwrap();
+        assert!(vault::get(&id).unwrap().is_none());
     }
     #[cfg(windows)]
     #[test]

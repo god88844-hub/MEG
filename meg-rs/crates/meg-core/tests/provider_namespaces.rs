@@ -1,4 +1,3 @@
-#[cfg(windows)]
 #[test]
 fn alternate_configs_cannot_read_replace_or_delete_each_others_keys() {
     use meg_core::providers::{
