@@ -11,6 +11,7 @@ mod cli;
 mod engine;
 mod loop_cmd;
 mod runner;
+mod serve;
 mod tui_launch;
 
 #[cfg(test)]
@@ -23,6 +24,7 @@ use crate::bridge::run_ui_bridge;
 use crate::cli::{CliCommand, parse_cli_args, parse_loop_options, parse_run_options, print_usage};
 use crate::loop_cmd::run_loop_headless;
 use crate::runner::{run_goal_headless, run_worker};
+use crate::serve::run_serve;
 use crate::tui_launch::launch_tui;
 
 #[tokio::main]
@@ -70,6 +72,20 @@ async fn main() -> Result<()> {
             }
             anyhow::ensure!(ws.is_dir(), "Workspace must be a directory");
             run_ui_bridge(&ws).await?;
+            Ok(())
+        }
+        CliCommand::Serve => {
+            let mut ws = workspace;
+            if let Some(dir) = args.iter().position(|a| a == "-C" || a == "--cd").and_then(|pos| args.get(pos + 1)) {
+                ws = std::path::PathBuf::from(dir).canonicalize()?;
+            }
+            anyhow::ensure!(ws.is_dir(), "Workspace must be a directory");
+            let port: u16 = if let Some(p_str) = args.iter().position(|a| a == "--port" || a == "-p").and_then(|pos| args.get(pos + 1)) {
+                p_str.parse::<u16>().map_err(|_| anyhow::anyhow!("Invalid --port '{p_str}'"))?
+            } else {
+                0
+            };
+            run_serve(&ws, port).await?;
             Ok(())
         }
         CliCommand::Help => {
