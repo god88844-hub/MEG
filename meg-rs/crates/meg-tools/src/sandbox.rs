@@ -520,6 +520,54 @@ pub fn probe_windows_restricted_token() -> Result<()> {
 /// Result of running a Windows command under a real `CreateRestrictedToken` primary token
 /// attached to a resource + UI-restricted Job Object before the main thread resumes.
 #[cfg(windows)]
+struct BoundedPipeDrain {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(windows)]
+impl BoundedPipeDrain {
+    fn spawn(raw_handle: windows_sys::Win32::Foundation::HANDLE) -> Self {
+        use std::io::Read;
+        use std::os::windows::io::FromRawHandle;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let b = buf.clone();
+        let d = done.clone();
+        let mut file = unsafe { std::fs::File::from_raw_handle(raw_handle as _) };
+        std::thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop {
+                match file.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut guard = b.lock().unwrap_or_else(|e| e.into_inner());
+                        let rem = (64 * 1024usize).saturating_sub(guard.len());
+                        if rem > 0 {
+                            guard.extend_from_slice(&tmp[..n.min(rem)]);
+                        }
+                    }
+                }
+            }
+            d.store(true, Ordering::Release);
+        });
+        Self { buf, done }
+    }
+
+    fn finish(self, max_wait: std::time::Duration) -> String {
+        use std::sync::atomic::Ordering;
+        let deadline = std::time::Instant::now() + max_wait;
+        while !self.done.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let guard = self.buf.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&guard).into_owned()
+    }
+}
+
+#[cfg(windows)]
 pub(crate) struct RestrictedWindowsOutput {
     pub exit_code: i32,
     pub stdout: String,
@@ -596,8 +644,6 @@ pub(crate) fn run_windows_restricted_process(
     cancel: &std::sync::atomic::AtomicBool,
     job_handle: windows_sys::Win32::Foundation::HANDLE,
 ) -> Result<RestrictedWindowsOutput> {
-    use std::io::Read;
-    use std::os::windows::io::FromRawHandle;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{
@@ -730,18 +776,8 @@ pub(crate) fn run_windows_restricted_process(
         ResumeThread(pi.hThread);
         CloseHandle(pi.hThread);
 
-        let mut out_file = std::fs::File::from_raw_handle(out_rd as _);
-        let mut err_file = std::fs::File::from_raw_handle(err_rd as _);
-        let out_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = out_file.by_ref().take(64 * 1024).read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
-        });
-        let err_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = err_file.by_ref().take(64 * 1024).read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
-        });
+        let out_drain = BoundedPipeDrain::spawn(out_rd);
+        let err_drain = BoundedPipeDrain::spawn(err_rd);
 
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
         let mut interrupted = None;
@@ -765,8 +801,8 @@ pub(crate) fn run_windows_restricted_process(
         let _ = GetExitCodeProcess(pi.hProcess, &mut exit_code);
         CloseHandle(pi.hProcess);
 
-        let stdout = out_thread.join().unwrap_or_default();
-        let stderr = err_thread.join().unwrap_or_default();
+        let stdout = out_drain.finish(Duration::from_millis(400));
+        let stderr = err_drain.finish(Duration::from_millis(400));
         Ok(RestrictedWindowsOutput {
             exit_code: exit_code as i32,
             stdout,
@@ -795,12 +831,10 @@ fn appcontainer_profile_name(workspace: &Path) -> String {
 mod win_appcontainer {
     use super::*;
     use std::ffi::c_void;
-    use std::io::Read;
-    use std::os::windows::io::FromRawHandle;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
@@ -812,6 +846,7 @@ mod win_appcontainer {
     };
 
     const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+    const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
     const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = 0x0002_0009;
     const SE_GROUP_ENABLED: u32 = 0x0000_0004;
     const WIN_CAPABILITY_INTERNET_CLIENT_SID: u32 = 94;
@@ -1119,37 +1154,6 @@ mod win_appcontainer {
                 reserved: 0,
             };
 
-            let mut attr_size: usize = 0;
-            InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut attr_size);
-            if attr_size == 0 {
-                FreeSid(app_sid);
-                bail!("InitializeProcThreadAttributeList returned zero size");
-            }
-            let mut attr_buf: Vec<u64> = vec![0u64; attr_size.div_ceil(8)];
-            let attr_ptr = attr_buf.as_mut_ptr() as *mut c_void;
-            if InitializeProcThreadAttributeList(attr_ptr, 1, 0, &mut attr_size) == 0 {
-                FreeSid(app_sid);
-                bail!(
-                    "InitializeProcThreadAttributeList failed: {}",
-                    std::io::Error::last_os_error()
-                );
-            }
-            if UpdateProcThreadAttribute(
-                attr_ptr,
-                0,
-                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-                &mut sec_caps as *mut _ as *mut c_void,
-                std::mem::size_of::<SecurityCapabilities>(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            ) == 0
-            {
-                let err = std::io::Error::last_os_error();
-                DeleteProcThreadAttributeList(attr_ptr);
-                FreeSid(app_sid);
-                bail!("UpdateProcThreadAttribute(SECURITY_CAPABILITIES) failed: {err}");
-            }
-
             let sa = SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: std::ptr::null_mut(),
@@ -1160,24 +1164,73 @@ mod win_appcontainer {
             let mut err_rd: HANDLE = std::ptr::null_mut();
             let mut err_wr: HANDLE = std::ptr::null_mut();
             if CreatePipe(&mut out_rd, &mut out_wr, &sa, 0) == 0 {
-                DeleteProcThreadAttributeList(attr_ptr);
                 FreeSid(app_sid);
                 bail!("CreatePipe(stdout) failed");
             }
             if CreatePipe(&mut err_rd, &mut err_wr, &sa, 0) == 0 {
                 CloseHandle(out_rd);
                 CloseHandle(out_wr);
-                DeleteProcThreadAttributeList(attr_ptr);
                 FreeSid(app_sid);
                 bail!("CreatePipe(stderr) failed");
             }
             let _ = SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0);
             let _ = SetHandleInformation(err_rd, HANDLE_FLAG_INHERIT, 0);
 
+            let mut inherit_handles: [HANDLE; 2] = [out_wr, err_wr];
+            let mut attr_size: usize = 0;
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut attr_size);
+            if attr_size == 0 {
+                CloseHandle(out_rd);
+                CloseHandle(out_wr);
+                CloseHandle(err_rd);
+                CloseHandle(err_wr);
+                FreeSid(app_sid);
+                bail!("InitializeProcThreadAttributeList returned zero size");
+            }
+            let mut attr_buf: Vec<u64> = vec![0u64; attr_size.div_ceil(8)];
+            let attr_ptr = attr_buf.as_mut_ptr() as *mut c_void;
+            if InitializeProcThreadAttributeList(attr_ptr, 2, 0, &mut attr_size) == 0 {
+                let err = std::io::Error::last_os_error();
+                CloseHandle(out_rd);
+                CloseHandle(out_wr);
+                CloseHandle(err_rd);
+                CloseHandle(err_wr);
+                FreeSid(app_sid);
+                bail!("InitializeProcThreadAttributeList failed: {err}");
+            }
+            if UpdateProcThreadAttribute(
+                attr_ptr,
+                0,
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                &mut sec_caps as *mut _ as *mut c_void,
+                std::mem::size_of::<SecurityCapabilities>(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) == 0
+                || UpdateProcThreadAttribute(
+                    attr_ptr,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    inherit_handles.as_mut_ptr() as *mut c_void,
+                    std::mem::size_of_val(&inherit_handles),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ) == 0
+            {
+                let err = std::io::Error::last_os_error();
+                DeleteProcThreadAttributeList(attr_ptr);
+                CloseHandle(out_rd);
+                CloseHandle(out_wr);
+                CloseHandle(err_rd);
+                CloseHandle(err_wr);
+                FreeSid(app_sid);
+                bail!("UpdateProcThreadAttribute failed: {err}");
+            }
+
             let mut siex: StartupInfoExW = std::mem::zeroed();
             siex.startup_info.cb = std::mem::size_of::<StartupInfoExW>() as u32;
             siex.startup_info.dwFlags = STARTF_USESTDHANDLES;
-            siex.startup_info.hStdInput = INVALID_HANDLE_VALUE;
+            siex.startup_info.hStdInput = std::ptr::null_mut();
             siex.startup_info.hStdOutput = out_wr;
             siex.startup_info.hStdError = err_wr;
             siex.lp_attribute_list = attr_ptr;
@@ -1226,18 +1279,8 @@ mod win_appcontainer {
             ResumeThread(pi.hThread);
             CloseHandle(pi.hThread);
 
-            let mut out_file = std::fs::File::from_raw_handle(out_rd as _);
-            let mut err_file = std::fs::File::from_raw_handle(err_rd as _);
-            let out_thread = std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = out_file.by_ref().take(64 * 1024).read_to_end(&mut buf);
-                String::from_utf8_lossy(&buf).into_owned()
-            });
-            let err_thread = std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = err_file.by_ref().take(64 * 1024).read_to_end(&mut buf);
-                String::from_utf8_lossy(&buf).into_owned()
-            });
+            let out_drain = BoundedPipeDrain::spawn(out_rd);
+            let err_drain = BoundedPipeDrain::spawn(err_rd);
 
             let deadline = Instant::now() + Duration::from_secs(timeout_secs);
             let mut interrupted = None;
@@ -1261,8 +1304,8 @@ mod win_appcontainer {
             let _ = GetExitCodeProcess(pi.hProcess, &mut exit_code);
             CloseHandle(pi.hProcess);
 
-            let stdout = out_thread.join().unwrap_or_default();
-            let stderr = err_thread.join().unwrap_or_default();
+            let stdout = out_drain.finish(Duration::from_millis(400));
+            let stderr = err_drain.finish(Duration::from_millis(400));
             Ok(RestrictedWindowsOutput {
                 exit_code: exit_code as i32,
                 stdout,

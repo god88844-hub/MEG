@@ -268,9 +268,14 @@ fn shell_session_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "action": { "type": "string", "enum": ["exec", "status", "reset", "close"], "description": "Session action (default 'exec')." },
+            "action": { "type": "string", "enum": ["exec", "open", "write", "read", "resize", "status", "reset", "close"], "description": "Session action (default 'exec')." },
             "session_id": { "type": "string", "description": "Optional session name (default 'default')." },
-            "command": { "type": "string", "description": "Shell command to run in the persistent session when action='exec'." },
+            "pty": { "type": "boolean", "description": "Allocate a real OS pseudo-terminal (Windows ConPTY / Unix POSIX PTY)." },
+            "command": { "type": "string", "description": "Shell command to run in the persistent session." },
+            "input": { "type": "string", "description": "Raw interactive text/keystrokes to send when action='write'." },
+            "cols": { "type": "integer", "minimum": 20, "maximum": 400, "description": "PTY columns (default 120)." },
+            "rows": { "type": "integer", "minimum": 5, "maximum": 200, "description": "PTY rows (default 30)." },
+            "wait_ms": { "type": "integer", "minimum": 0, "maximum": 5000, "description": "Milliseconds to collect PTY output on open/write/read." },
             "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 600 }
         }
     })

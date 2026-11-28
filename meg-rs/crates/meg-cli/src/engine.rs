@@ -267,7 +267,7 @@ impl LoopEngine for ShimEngine {
                     }
                 }
             } else if matches!(name.as_str(), "bash" | "shell_session") && !unlock {
-                if let Some(cmd) = args.get("command").or_else(|| args.get("cmd")).and_then(|v| v.as_str()) {
+                if let Some(cmd) = args.get("command").or_else(|| args.get("cmd")).or_else(|| args.get("input")).and_then(|v| v.as_str()) {
                     let g = guard.lock().unwrap();
                     if let Some(blocked) = g.check_bash(cmd) {
                         return Ok(meg_tools::ToolResult { ok: false, output: blocked });
